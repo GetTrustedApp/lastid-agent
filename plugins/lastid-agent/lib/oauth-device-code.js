@@ -31,6 +31,8 @@
  * via `LASTID_IDP_URL` for dev / staging.
  */
 
+import { createHash } from 'node:crypto';
+
 const IDP_BASE_URL = process.env.LASTID_IDP_URL ?? 'https://idp.lastid.co';
 
 export async function runProvisioningFlow({ sdk, projectPath }) {
@@ -231,7 +233,6 @@ async function jwkThumbprint(jwk) {
 
 function hashProjectPath(p) {
   // 16-char hex prefix of SHA-256 — short, stable, non-reversible.
-  const { createHash } = require('node:crypto');
   return createHash('sha256').update(p).digest('hex').slice(0, 16);
 }
 
