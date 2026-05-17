@@ -2,18 +2,26 @@
  * Agent-link client.
  *
  * Calls the IdP's public `/v1/verify/agent-link/initiate` endpoint,
- * renders the returned presentation-request URI as a QR code in the
- * terminal, polls `/v1/verify/agent-link/poll/:link_id` until the
- * operator has scanned with their LastID wallet, and decodes the
- * subject DID from the returned SD-JWT presentation. Zero OAuth
- * registration — the IdP shim accepts unauthenticated initiate calls,
- * rate-limited by IP.
+ * renders the returned presentation-request URI as a QR code, polls
+ * `/v1/verify/agent-link/poll/:link_id` until the operator has scanned
+ * with their LastID wallet, and decodes the subject DID from the
+ * returned SD-JWT presentation. Zero OAuth registration — the IdP shim
+ * accepts unauthenticated initiate calls, rate-limited by IP.
  *
- * Used by the agent provisioning CLI when no `--parent-human-did` is
- * supplied, so plugin users never have to look up or paste a DID.
+ * QR delivery: writes a PNG to a temp file and opens it in the host's
+ * default image viewer (macOS Preview, Linux xdg-open, Windows start)
+ * so the operator sees a clean, full-size QR even when the launching
+ * terminal hides or truncates output. A small ASCII QR is also written
+ * to stdout as a fallback, plus the `lastid://` deep link in plain
+ * text for taps on the device that holds LastID.
  */
-import qrcode from 'qrcode-terminal';
+import qrcodeTerminal from 'qrcode-terminal';
+import QRCode from 'qrcode';
 import { setTimeout as delay } from 'node:timers/promises';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 
 // Default to dev while the agent-link routes are pre-production. Flip
 // to `https://human.lastid.co` once the IdP changes ship to prod.
@@ -53,9 +61,51 @@ function toWalletDeepLink(requestUri) {
 }
 
 /**
- * Drive the agent-link flow end-to-end. Prints a QR code + deep link
- * to stdout, polls until the wallet presents the LastID.Base credential,
- * and returns `{ subjectDid }`. Throws on timeout / denial / expiry.
+ * Try to open `path` with the host's default file/URL opener. Fire and
+ * forget — on failure we just skip; the terminal QR + deep link still
+ * work as fallback paths.
+ */
+function openWithDefault(path) {
+  const candidates =
+    process.platform === 'darwin'
+      ? [['open', [path]]]
+      : process.platform === 'win32'
+        ? [['cmd', ['/c', 'start', '""', path]]]
+        : [
+            ['xdg-open', [path]],
+            ['gio', ['open', path]],
+          ];
+  for (const [cmd, args] of candidates) {
+    try {
+      const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+      child.on('error', () => {});
+      child.unref();
+      return true;
+    } catch {
+      // try next candidate
+    }
+  }
+  return false;
+}
+
+async function renderQrPng(uri) {
+  const dir = mkdtempSync(join(tmpdir(), 'lastid-agent-qr-'));
+  const path = join(dir, 'lastid-agent-link.png');
+  const buf = await QRCode.toBuffer(uri, {
+    type: 'png',
+    margin: 2,
+    width: 480,
+    errorCorrectionLevel: 'M',
+  });
+  writeFileSync(path, buf);
+  return path;
+}
+
+/**
+ * Drive the agent-link flow end-to-end. Renders a QR (opens PNG in
+ * default viewer + writes ASCII to stdout), polls until the wallet
+ * presents the LastID.Base credential, and returns `{ subjectDid }`.
+ * Throws on timeout / denial / expiry.
  */
 export async function linkHumanDid({
   idpUrl,
@@ -84,17 +134,32 @@ export async function linkHumanDid({
     onPrompt({ requestUri, deepLink, linkId, expiresIn });
   } else {
     console.log('');
-    console.log('Scan this QR with your LastID app, or tap the deep link on phone:');
+    console.log('━━━ Link your LastID ━━━');
+    console.log('');
+    console.log(`Deep link (tap on phone):  ${deepLink}`);
+    console.log(`Expires in:                ${expiresIn}s`);
+    console.log('');
+    let pngPath = null;
+    try {
+      pngPath = await renderQrPng(requestUri);
+      const opened = openWithDefault(pngPath);
+      if (opened) {
+        console.log(`QR opened in default viewer: ${pngPath}`);
+      } else {
+        console.log(`QR saved to: ${pngPath}`);
+      }
+    } catch (err) {
+      console.log(`(could not render QR PNG: ${err.message ?? err})`);
+    }
+    console.log('');
+    console.log('Or scan this QR from the terminal:');
     console.log('');
     await new Promise((resolve) => {
-      qrcode.generate(requestUri, { small: true }, (out) => {
+      qrcodeTerminal.generate(requestUri, { small: true }, (out) => {
         console.log(out);
         resolve();
       });
     });
-    console.log(`Deep link: ${deepLink}`);
-    console.log(`(Link expires in ${expiresIn}s)`);
-    console.log('');
     console.log('Waiting for wallet…');
   }
 
