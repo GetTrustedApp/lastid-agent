@@ -27,5 +27,5 @@ node ${CLAUDE_PLUGIN_ROOT}/bin/lastid-agent.js status
 
 Advanced flags:
 - `--parent-human-did did:lastid:z…` — skip the QR step if you already know your DID (or set `LASTID_PARENT_HUMAN_DID`).
-- `--idp <url>` — override the IdP base URL (default: `https://human.lastid.co`).
+- `--idp <url>` — override the IdP base URL (default: `https://human.dev.lastid.co` while the agent flow is pre-prod).
 - `--force` — overwrite an existing keychain entry.

@@ -22,7 +22,10 @@
 import { generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const DEFAULT_IDP = 'https://human.lastid.co';
+// Default to dev while LastID.Agent.Base issuance is pre-production.
+// Flip to `https://human.lastid.co` once the agent flow ships to prod.
+// Override per-host with `--idp <url>` or `LASTID_IDP_URL`.
+const DEFAULT_IDP = 'https://human.dev.lastid.co';
 
 function b64url(bytes) {
   return Buffer.from(bytes)

@@ -166,7 +166,7 @@ async function main() {
       console.log(
         '  --parent-human-did did:lastid:z…  Optional. Defaults to QR-scan link flow.',
       );
-      console.log('  --idp <url>                       Default: https://human.lastid.co');
+      console.log('  --idp <url>                       Default: https://human.dev.lastid.co (pre-prod)');
       console.log('  --runtime <name>                  Default: lastid-agent-cli');
       console.log('  --project-hint <hex>              Optional SHA-256 prefix');
       console.log('  --scope <slug>                    Default: main');

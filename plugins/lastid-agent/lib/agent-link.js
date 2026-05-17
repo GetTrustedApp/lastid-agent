@@ -15,7 +15,10 @@
 import qrcode from 'qrcode-terminal';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const DEFAULT_IDP = 'https://human.lastid.co';
+// Default to dev while the agent-link routes are pre-production. Flip
+// to `https://human.lastid.co` once the IdP changes ship to prod.
+// Override per-host with `--idp <url>` or `LASTID_IDP_URL`.
+const DEFAULT_IDP = 'https://human.dev.lastid.co';
 
 function b64urlDecode(seg) {
   const padded = seg + '='.repeat((4 - (seg.length % 4)) % 4);
