@@ -1,0 +1,56 @@
+{
+  "name": "lastid-agent",
+  "displayName": "LastID Agent",
+  "version": "0.1.0",
+  "description": "Cryptographic identity for AI agents — issued by the human's LastID, verifiable anywhere LastID credentials are accepted.",
+  "author": "LastID",
+  "homepage": "https://lastid.co",
+  "repository": "https://github.com/LastID/lastid-agent-plugin",
+  "license": "Apache-2.0",
+  "hooks": {
+    "SessionStart": "hooks/session-start.js",
+    "PreToolUse": "hooks/pre-tool-use.js",
+    "BeforeStop": "hooks/before-stop.js"
+  },
+  "tools": [
+    {
+      "name": "lastid_memory_set",
+      "handler": "tools/memory.js#set",
+      "description": "Persist a value under a key in the agent's encrypted memory. Optional scope ('global' or 'project:<hash>'); defaults to current project. Optional TTL in seconds."
+    },
+    {
+      "name": "lastid_memory_get",
+      "handler": "tools/memory.js#get",
+      "description": "Read a value the agent has previously persisted. Returns null when the key isn't present in the requested scope."
+    },
+    {
+      "name": "lastid_memory_list",
+      "handler": "tools/memory.js#list",
+      "description": "List keys present in the agent's memory under the given scope. Optional prefix filter."
+    },
+    {
+      "name": "lastid_memory_delete",
+      "handler": "tools/memory.js#delete",
+      "description": "Delete a key (and its value) from the agent's memory."
+    },
+    {
+      "name": "lastid_message_send",
+      "handler": "tools/message.js#send",
+      "description": "Send an MLS-encrypted message to another LastID identity (human or agent). The recipient is named by DID. Returns the wire message id."
+    },
+    {
+      "name": "lastid_message_receive",
+      "handler": "tools/message.js#receive",
+      "description": "Fetch incoming messages addressed to this agent since the last read cursor."
+    },
+    {
+      "name": "lastid_sign",
+      "handler": "tools/sign.js#sign",
+      "description": "Sign an arbitrary payload under the agent's identity, scoped to a named action (e.g., 'audit', 'transfer', 'attest'). Returns the signature plus the VC thumbprint that bound it."
+    }
+  ],
+  "permissions": {
+    "keychain": ["lastid.co/agent-vc", "lastid.co/agent-seed"],
+    "network": ["https://idp.lastid.co", "https://*.lastid.co"]
+  }
+}

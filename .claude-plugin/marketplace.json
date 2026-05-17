@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "lastid-agent",
+  "description": "LastID Agent — cryptographic identity for AI agents. Provisions a verifiable credential issued by your LastID so any agent runtime can prove it's acting on your behalf.",
+  "owner": {
+    "name": "LastID",
+    "email": "team@lastid.co"
+  },
+  "plugins": [
+    {
+      "name": "lastid-agent",
+      "version": "0.1.1",
+      "description": "Provisions a LastID-issued agent credential the first time a Claude Code session starts on a host. Surfaces a one-time approval flow to the operator's LastID wallet; persists the issued SD-JWT VC to the host keychain. Future sessions skip provisioning and run authenticated.",
+      "category": "identity",
+      "source": "./plugins/lastid-agent",
+      "homepage": "https://lastid.co"
+    }
+  ]
+}

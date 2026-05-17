@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.local
+
+# Native libs are committed per-platform in native/, but build outputs
+# from a local cross-compile shouldn't pollute the tree.
+build/
+*.dylib.dSYM
+target/

@@ -1,0 +1,21 @@
+{
+  "name": "lastid-agent",
+  "description": "Provisions a LastID-issued agent credential on first session start. Approved by the operator in their LastID wallet; the issued SD-JWT VC + Ed25519 seed are persisted to the host keychain. Steady-state sessions skip provisioning.",
+  "version": "0.1.1",
+  "author": {
+    "name": "LastID",
+    "url": "https://lastid.co"
+  },
+  "category": "identity",
+  "keywords": [
+    "identity",
+    "verifiable-credentials",
+    "did",
+    "agent",
+    "oid4vci",
+    "lastid"
+  ],
+  "repository": "https://github.com/GetTrustedApp/lastid-agent",
+  "license": "Apache-2.0",
+  "homepage": "https://lastid.co"
+}

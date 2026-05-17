@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "lastid-agent": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/lastid-agent.js", "serve"],
+      "type": "stdio"
+    }
+  }
+}
