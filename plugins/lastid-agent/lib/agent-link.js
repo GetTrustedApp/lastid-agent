@@ -34,26 +34,71 @@ function b64urlDecode(seg) {
 }
 
 /**
- * Decode the subject DID from an SD-JWT VC presentation. The wallet
- * may return the raw issuer-signed JWT, an SD-JWT (issuer JWT + tilde
- * disclosures + optional KB-JWT), or a verifiable-presentation envelope.
- * In all SD-JWT shapes the issuer JWT is the first `.`-separated
- * segment of whatever sits before the first `~`.
+ * Decode the subject DID from a single compact SD-JWT VC string. The
+ * issuer JWT is the first `.`-separated segment of whatever sits
+ * before the first `~` (disclosures / KB-JWT separator).
  */
-function decodeSubjectDidFromVpToken(vpToken) {
-  if (!vpToken || typeof vpToken !== 'string') {
-    throw new Error('vp_token missing from poll response');
-  }
-  const issuerJwt = vpToken.split('~')[0];
+function decodeSdJwtVcClaims(compact) {
+  const issuerJwt = compact.split('~')[0];
   const parts = issuerJwt.split('.');
   if (parts.length < 2) {
-    throw new Error('vp_token does not look like a JWT');
+    throw new Error('vp_token element does not look like a JWT');
   }
   const payload = JSON.parse(b64urlDecode(parts[1]).toString('utf-8'));
-  if (typeof payload.sub !== 'string' || payload.sub.length === 0) {
+  return payload;
+}
+
+/**
+ * Decode the subject DID from an OpenID4VP `vp_token`. The IdP returns
+ * a string for single-credential presentations and a JSON array for
+ * multi-credential presentations (per OID4VP). We pick the LastID.Base
+ * credential when an array is returned — that's the identity-grade
+ * credential whose `sub` is the operator's canonical DID; other
+ * credential types (Persona, VerifiedEmail, etc.) bind to the same
+ * subject so a fallback to the first element is also safe.
+ */
+function decodeSubjectDidFromVpToken(vpToken) {
+  if (!vpToken) {
+    throw new Error('vp_token missing from poll response');
+  }
+
+  const candidates = Array.isArray(vpToken) ? vpToken : [vpToken];
+  if (candidates.length === 0) {
+    throw new Error('vp_token array is empty');
+  }
+
+  let chosen = null;
+  let chosenPayload = null;
+  for (const compact of candidates) {
+    if (typeof compact !== 'string') continue;
+    let payload;
+    try {
+      payload = decodeSdJwtVcClaims(compact);
+    } catch {
+      continue;
+    }
+    if (payload.vct === 'LastID.Base') {
+      chosen = compact;
+      chosenPayload = payload;
+      break;
+    }
+    if (!chosen) {
+      chosen = compact;
+      chosenPayload = payload;
+    }
+  }
+
+  if (!chosen || !chosenPayload) {
+    throw new Error('no decodable SD-JWT VC found in vp_token');
+  }
+  if (typeof chosenPayload.sub !== 'string' || chosenPayload.sub.length === 0) {
     throw new Error('presentation has no sub (subject DID)');
   }
-  return { subjectDid: payload.sub, iss: payload.iss, vct: payload.vct };
+  return {
+    subjectDid: chosenPayload.sub,
+    iss: chosenPayload.iss,
+    vct: chosenPayload.vct,
+  };
 }
 
 function toWalletDeepLink(requestUri) {
