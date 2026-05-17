@@ -73,16 +73,16 @@ async function cmdProvision(flags) {
     parentHumanDid,
     runtimeName: flags.runtime ?? 'lastid-agent-cli',
     projectHint: flags['project-hint'] ?? env.LASTID_PROJECT_HINT,
-    onUserCode: ({ userCode, verificationUri, agentDid, expiresIn }) => {
+    onUserCode: ({ userCode, agentDid, expiresIn }) => {
       console.log('');
-      console.log(`Agent DID:        ${agentDid}`);
-      console.log(`Verification URL: ${verificationUri}`);
-      console.log(`User code:        ${userCode}`);
-      console.log(`Expires in:       ${expiresIn}s`);
+      console.log(`Agent DID:  ${agentDid}`);
+      console.log(`User code:  ${userCode}`);
+      console.log(`Expires in: ${expiresIn}s`);
       console.log('');
-      console.log('Open the verification URL on the device that holds your LastID,');
-      console.log('approve in your wallet (with biometric + master password), and');
-      console.log('keep this process running until issuance completes.');
+      console.log('Check your LastID wallet — the approval screen pops automatically');
+      console.log('on any device the wallet is open on (phone or desktop). Cross-check');
+      console.log('the user code above matches the one shown in the wallet, approve');
+      console.log('with biometric + master password, and keep this process running.');
     },
   });
 

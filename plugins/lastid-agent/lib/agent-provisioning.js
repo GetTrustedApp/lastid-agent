@@ -228,8 +228,10 @@ export async function claimCredential({
 /**
  * Top-level orchestrator: keypair → initiate → wait for operator →
  * poll → claim.
- * `onUserCode` is invoked synchronously with `{ userCode, verificationUri }`
- * so the caller can print/QR/render however it wants.
+ * `onUserCode` is invoked synchronously with `{ userCode, agentDid,
+ * expiresIn }` so the caller can print/QR/render however it wants.
+ * No `verificationUri` — the wallet picks up the request over the
+ * existing WebSocket fan-out and auto-pops the approval screen.
  */
 export async function provisionAgent({
   idpUrl,
@@ -251,7 +253,6 @@ export async function provisionAgent({
   if (typeof onUserCode === 'function') {
     onUserCode({
       userCode: initiate.user_code,
-      verificationUri: initiate.verification_uri,
       agentDid: initiate.agent_did,
       expiresIn: initiate.expires_in,
     });
