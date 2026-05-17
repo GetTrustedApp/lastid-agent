@@ -26,6 +26,7 @@ const repoRoot = resolve(__dirname, '..');
 const FILES = [
   resolve(repoRoot, '.claude-plugin/marketplace.json'),
   resolve(repoRoot, 'plugins/lastid-agent/.claude-plugin/plugin.json'),
+  resolve(repoRoot, 'plugins/lastid-agent/package.json'),
   resolve(repoRoot, 'package.json'),
 ];
 
