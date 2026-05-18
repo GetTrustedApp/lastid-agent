@@ -73,9 +73,8 @@ async function cmdProvision(flags) {
     parentHumanDid,
     runtimeName: flags.runtime ?? 'lastid-agent-cli',
     projectHint: flags['project-hint'] ?? env.LASTID_PROJECT_HINT,
-    onUserCode: ({ userCode, agentDid, expiresIn }) => {
+    onUserCode: ({ userCode, expiresIn }) => {
       console.log('');
-      console.log(`Agent DID:  ${agentDid}`);
       console.log(`User code:  ${userCode}`);
       console.log(`Expires in: ${expiresIn}s`);
       console.log('');
@@ -83,15 +82,20 @@ async function cmdProvision(flags) {
       console.log('on any device the wallet is open on (phone or desktop). Cross-check');
       console.log('the user code above matches the one shown in the wallet, approve');
       console.log('with biometric + master password, and keep this process running.');
+      console.log('');
+      console.log('Your wallet derives this agent\'s identity from your BIP85 tree.');
+      console.log('The agent\'s DID will be derived from the slot it allocates and');
+      console.log('shown below once approval completes.');
     },
   });
 
   await persistAgentVc(provisioned, scope);
   console.log('');
   console.log('✅ Agent provisioned and persisted to keychain.');
-  console.log(`   scope:     ${scope}`);
-  console.log(`   agent_did: ${provisioned.agentDid}`);
-  console.log(`   vc length: ${provisioned.vcCompact.length} chars`);
+  console.log(`   scope:      ${scope}`);
+  console.log(`   slot:       ${provisioned.slotIndex}`);
+  console.log(`   agent_did:  ${provisioned.agentDid}`);
+  console.log(`   vc length:  ${provisioned.vcCompact.length} chars`);
 }
 
 async function cmdShow(flags) {
@@ -101,8 +105,10 @@ async function cmdShow(flags) {
     console.error(`no agent provisioned for scope=${scope}`);
     exit(1);
   }
-  console.log(`scope: ${scope}`);
-  console.log(`vc:    ${loaded.vcCompact}`);
+  console.log(`scope:     ${scope}`);
+  console.log(`slot:      ${loaded.slotIndex ?? '(unknown)'}`);
+  console.log(`agent_did: ${loaded.agentDid ?? '(unknown)'}`);
+  console.log(`vc:        ${loaded.vcCompact}`);
 }
 
 /**
@@ -117,6 +123,7 @@ async function cmdStatus(flags) {
     ? {
         provisioned: true,
         scope,
+        slot_index: loaded.slotIndex,
         agent_did: loaded.agentDid,
         vc_length: loaded.vcCompact?.length ?? 0,
       }
@@ -124,7 +131,9 @@ async function cmdStatus(flags) {
   if (flags.json) {
     console.log(JSON.stringify(report));
   } else if (report.provisioned) {
-    console.log(`provisioned (scope=${scope}) agent_did=${report.agent_did}`);
+    console.log(
+      `provisioned (scope=${scope} slot=${report.slot_index ?? '?'}) agent_did=${report.agent_did ?? '?'}`,
+    );
   } else {
     console.log(`not_provisioned (scope=${scope})`);
   }
