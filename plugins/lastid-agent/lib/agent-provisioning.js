@@ -453,6 +453,11 @@ export async function claimCredential({
   const credentialUrl = `${credentialIssuer}/v1/oid4vci/credential`;
   const body = {
     format: 'vc+sd-jwt',
+    // IdP expects a types array (W3C VC `type` field shape). Include
+    // both the generic VerifiableCredential and the specific agent type
+    // so the IdP picks the right issuer strategy. `vct` is also sent
+    // for SD-JWT VC compliance.
+    types: ['VerifiableCredential', 'LastID.Agent.Base'],
     vct: 'LastID.Agent.Base',
     proof: {
       proof_type: 'jwt',
