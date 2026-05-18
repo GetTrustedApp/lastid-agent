@@ -33,18 +33,19 @@ const MCP_TIMEOUT_MS = 30000;
 const REHANDSHAKE_BEFORE_EXPIRY_SEC = 60;
 
 /**
- * macOS shared app-group container the sandboxed desktop wallet
- * writes to. Mirrors `_macAppGroupId` in
- * `lastid-desktop/lib/services/agent_mcp/port_discovery.dart`.
+ * Bundle id of the LastID Desktop wallet on macOS. Used to read the
+ * discovery file the (sandboxed) wallet drops into its container.
+ * Stable identifier — bumped to match the wallet's CFBundleIdentifier.
  */
-const MAC_APP_GROUP_ID = 'group.co.lastid.GetTrusted';
+const MAC_BUNDLE_ID = 'co.lastid.lastidDesktop';
 
 /**
- * Resolve the platform-appropriate discovery-file paths. Returns
- * an ordered list — the plugin tries each until one parses. On
- * macOS the sandboxed desktop wallet writes into its app-group
- * container; older / non-sandboxed builds may still write into
- * `~/Library/Application Support/LastID/`, so we look at both.
+ * Resolve the platform-appropriate discovery-file paths. Returns an
+ * ordered list — the plugin tries each until one parses. On macOS
+ * the sandboxed wallet writes into its own container path, which is
+ * readable by any user-account process. We also keep the
+ * non-sandboxed `~/Library/Application Support/LastID/` location as
+ * a fallback for dev builds.
  */
 function resolveDiscoveryPaths() {
   switch (platform()) {
@@ -53,8 +54,12 @@ function resolveDiscoveryPaths() {
         join(
           homedir(),
           'Library',
-          'Group Containers',
-          MAC_APP_GROUP_ID,
+          'Containers',
+          MAC_BUNDLE_ID,
+          'Data',
+          'Library',
+          'Application Support',
+          MAC_BUNDLE_ID,
           'LastID',
           'agent-mcp.json',
         ),

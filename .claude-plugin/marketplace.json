@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "lastid-agent",
-      "version": "0.1.12",
+      "version": "0.1.13",
       "description": "Provisions a LastID-issued agent credential the first time a Claude Code session starts on a host. Surfaces a one-time approval flow to the operator's LastID wallet; persists the issued SD-JWT VC to the host keychain. Future sessions skip provisioning and run authenticated.",
       "category": "identity",
       "source": "./plugins/lastid-agent",
