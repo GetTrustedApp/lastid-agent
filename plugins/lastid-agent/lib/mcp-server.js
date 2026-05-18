@@ -14,6 +14,10 @@
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
 import { loadAgentVc } from './keychain.js';
 
 const SERVER_INFO = {
@@ -95,8 +99,8 @@ async function buildServer({ scope }) {
   const server = new Server(SERVER_INFO, {
     capabilities: { tools: {} },
   });
-  server.setRequestHandler({ method: 'tools/list' }, async () => buildToolList());
-  server.setRequestHandler({ method: 'tools/call' }, async (request) => {
+  server.setRequestHandler(ListToolsRequestSchema, async () => buildToolList());
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params ?? {};
     return handleToolCall(name, args ?? {}, { scope });
   });
