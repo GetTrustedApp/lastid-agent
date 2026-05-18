@@ -1,16 +1,17 @@
 /**
  * LastID Agent MCP server.
  *
- * Exposes the agent's identity + (later) memory/sign/message tools over
- * the Model Context Protocol. Speaks stdio by default (Claude Code,
- * Codex CLI, OpenAI Agents SDK stdio mode). With `--http <host:port>`
- * it listens on Streamable HTTP for ChatGPT Custom Connector and the
- * Responses API hosted-MCP path.
+ * Single MCP surface the agent runtime sees. Owns the always-
+ * available identity tools (e.g. `lastid_whoami`) and, when the
+ * LastID Desktop wallet is running on the same host, transparently
+ * merges in the desktop-published tool set (`vault_list` today;
+ * vault_use / http_fetch / spawn_sub_agent later) so the agent only
+ * has to think about tools, not transports.
  *
- * The first iteration surfaces a single tool, `lastid_whoami`, which
- * reports the agent's DID + capability summary. The full
- * memory/sign/message surface composes onto this same server as
- * separate `server.tool(...)` registrations.
+ * Discovery is best-effort: if no desktop is running, the agent
+ * simply sees the local tools. The merge is computed on each
+ * tools/list call so the desktop coming up later just starts
+ * surfacing more tools without restarting the agent runtime.
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -18,6 +19,8 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import { DesktopMcpClient } from './desktop-mcp-client.js';
+import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
 import { loadAgentVc } from './keychain.js';
 
 const SERVER_INFO = {
@@ -40,27 +43,24 @@ function decodeVcClaims(vcCompact) {
   }
 }
 
-function buildToolList() {
-  return {
-    tools: [
-      {
-        name: 'lastid_whoami',
-        description:
-          'Return the agent identity provisioned for this host: agent DID, parent human DID, capabilities, expiry. Returns { provisioned: false } when no agent credential is present.',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-          additionalProperties: false,
-        },
-      },
-    ],
-  };
-}
+const PLUGIN_TOOLS = [
+  {
+    name: 'lastid_whoami',
+    description:
+      'Return the agent identity provisioned for this host: agent DID, parent human DID, capabilities, expiry. Returns { provisioned: false } when no agent credential is present.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+];
 
-async function handleToolCall(name, _args, { scope }) {
+const PLUGIN_TOOL_NAMES = new Set(PLUGIN_TOOLS.map((t) => t.name));
+
+async function handlePluginTool(name, _args, { scope, loadedAgent }) {
   if (name === 'lastid_whoami') {
-    const loaded = await loadAgentVc(scope);
-    if (!loaded) {
+    if (!loadedAgent) {
       return {
         content: [
           {
@@ -70,7 +70,7 @@ async function handleToolCall(name, _args, { scope }) {
         ],
       };
     }
-    const claims = decodeVcClaims(loaded.vcCompact) ?? {};
+    const claims = decodeVcClaims(loadedAgent.vcCompact) ?? {};
     return {
       content: [
         {
@@ -79,7 +79,7 @@ async function handleToolCall(name, _args, { scope }) {
             {
               provisioned: true,
               scope,
-              agent_did: claims.sub ?? loaded.agentDid ?? null,
+              agent_did: claims.sub ?? loadedAgent.agentDid ?? null,
               parent_human_did: claims.parent_human_did ?? null,
               capabilities: claims.capabilities ?? [],
               may_delegate: claims.may_delegate ?? false,
@@ -92,18 +92,106 @@ async function handleToolCall(name, _args, { scope }) {
       ],
     };
   }
-  throw new Error(`unknown tool: ${name}`);
+  throw new Error(`unknown plugin tool: ${name}`);
+}
+
+/**
+ * Best-effort: build a DesktopMcpClient if the host has an agent
+ * VC + slot seed AND a wallet is reachable. Returns null on any
+ * failure (the plugin still serves its own tools).
+ */
+async function tryConnectDesktop({ loadedAgent }) {
+  if (!loadedAgent) return null;
+  let signingKey;
+  try {
+    ({ signingKey } = deriveAgentEd25519Keypair(loadedAgent.slotSeed));
+  } catch (err) {
+    process.stderr.write(
+      `[lastid-agent] desktop bridge: keypair derivation failed: ${err.message}\n`,
+    );
+    return null;
+  }
+  const client = new DesktopMcpClient({
+    agentDid: loadedAgent.agentDid,
+    vcCompact: loadedAgent.vcCompact,
+    signingKey,
+  });
+  const ok = await client.connect();
+  return ok ? client : null;
 }
 
 async function buildServer({ scope }) {
   const server = new Server(SERVER_INFO, {
     capabilities: { tools: {} },
   });
-  server.setRequestHandler(ListToolsRequestSchema, async () => buildToolList());
+
+  // Cached state. Connect once at build time; tools/list re-attempts
+  // the desktop connection only when no client is currently held
+  // (handles "wallet came up mid-session"). tools/call leans on the
+  // client's own re-handshake on 401 / expiry.
+  let loadedAgent = await loadAgentVc(scope);
+  let desktopClient = await tryConnectDesktop({ loadedAgent });
+
+  const reloadAgentIfStale = async () => {
+    // Re-read keychain only when we don't have one yet. Once the
+    // agent is provisioned the bundle doesn't change in-process.
+    if (!loadedAgent) {
+      loadedAgent = await loadAgentVc(scope);
+    }
+  };
+
+  const ensureDesktop = async () => {
+    if (desktopClient) return desktopClient;
+    await reloadAgentIfStale();
+    desktopClient = await tryConnectDesktop({ loadedAgent });
+    return desktopClient;
+  };
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const client = await ensureDesktop();
+    const remote = client?.remoteTools() ?? [];
+    // De-dupe by name in case the desktop ever exposes a plugin
+    // tool name; plugin tools win.
+    const remoteFiltered = remote.filter((t) => !PLUGIN_TOOL_NAMES.has(t.name));
+    return { tools: [...PLUGIN_TOOLS, ...remoteFiltered] };
+  });
+
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params ?? {};
-    return handleToolCall(name, args ?? {}, { scope });
+    await reloadAgentIfStale();
+    if (PLUGIN_TOOL_NAMES.has(name)) {
+      return handlePluginTool(name, args ?? {}, { scope, loadedAgent });
+    }
+    const client = await ensureDesktop();
+    if (client && client.ownsTool(name)) {
+      try {
+        return await client.callTool(name, args ?? {});
+      } catch (err) {
+        // Drop the cached client so the next call rediscovers — the
+        // wallet may have shut down between calls.
+        desktopClient = null;
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  error: 'desktop_tool_failed',
+                  tool: name,
+                  message: err.message,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+    throw new Error(`unknown tool: ${name}`);
   });
+
   return server;
 }
 
