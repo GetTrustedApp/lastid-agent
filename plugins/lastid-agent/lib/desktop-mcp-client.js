@@ -33,52 +33,83 @@ const MCP_TIMEOUT_MS = 30000;
 const REHANDSHAKE_BEFORE_EXPIRY_SEC = 60;
 
 /**
- * Resolve the platform-appropriate discovery-file path. Mirrors
+ * macOS shared app-group container the sandboxed desktop wallet
+ * writes to. Mirrors `_macAppGroupId` in
  * `lastid-desktop/lib/services/agent_mcp/port_discovery.dart`.
  */
-function resolveDiscoveryPath() {
+const MAC_APP_GROUP_ID = 'group.co.lastid.GetTrusted';
+
+/**
+ * Resolve the platform-appropriate discovery-file paths. Returns
+ * an ordered list — the plugin tries each until one parses. On
+ * macOS the sandboxed desktop wallet writes into its app-group
+ * container; older / non-sandboxed builds may still write into
+ * `~/Library/Application Support/LastID/`, so we look at both.
+ */
+function resolveDiscoveryPaths() {
   switch (platform()) {
     case 'darwin':
-      return join(
-        homedir(),
-        'Library',
-        'Application Support',
-        'LastID',
-        'agent-mcp.json',
-      );
+      return [
+        join(
+          homedir(),
+          'Library',
+          'Group Containers',
+          MAC_APP_GROUP_ID,
+          'LastID',
+          'agent-mcp.json',
+        ),
+        join(
+          homedir(),
+          'Library',
+          'Application Support',
+          'LastID',
+          'agent-mcp.json',
+        ),
+      ];
     case 'linux':
-      return join(
-        process.env.XDG_DATA_HOME ?? join(homedir(), '.local', 'share'),
-        'LastID',
-        'agent-mcp.json',
-      );
+      return [
+        join(
+          process.env.XDG_DATA_HOME ?? join(homedir(), '.local', 'share'),
+          'LastID',
+          'agent-mcp.json',
+        ),
+      ];
     case 'win32':
-      return join(
-        process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'),
-        'LastID',
-        'agent-mcp.json',
-      );
+      return [
+        join(
+          process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'),
+          'LastID',
+          'agent-mcp.json',
+        ),
+      ];
     default:
-      return join(homedir(), '.lastid', 'agent-mcp.json');
+      return [join(homedir(), '.lastid', 'agent-mcp.json')];
   }
 }
 
 async function readDiscovery() {
-  try {
-    const text = await readFile(resolveDiscoveryPath(), 'utf-8');
-    const json = JSON.parse(text);
-    if (typeof json.port !== 'number' || typeof json.server_fingerprint !== 'string') {
-      return null;
+  for (const path of resolveDiscoveryPaths()) {
+    try {
+      const text = await readFile(path, 'utf-8');
+      const json = JSON.parse(text);
+      if (
+        typeof json.port !== 'number' ||
+        typeof json.server_fingerprint !== 'string'
+      ) {
+        continue;
+      }
+      return {
+        port: json.port,
+        fingerprint: json.server_fingerprint,
+        protocolVersion: json.protocol_version ?? null,
+        pid: json.pid ?? null,
+        sourcePath: path,
+      };
+    } catch {
+      // Try the next candidate path.
     }
-    return {
-      port: json.port,
-      fingerprint: json.server_fingerprint,
-      protocolVersion: json.protocol_version ?? null,
-      pid: json.pid ?? null,
-    };
-  } catch {
-    return null;
   }
+  return null;
 }
 
 async function fetchWithTimeout(url, init, timeoutMs) {
