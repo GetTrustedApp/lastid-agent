@@ -95,6 +95,15 @@ export function capabilityIsSubsetOf(child_json: any, parent_json: any): boolean
 export function capabilityPermits(capability_json: any, resource: string, action: string): boolean;
 
 /**
+ * Compute the synthetic share_id the desktop uses for an
+ * (agent_did, item_id) pair. Plugin uses this when POSTing
+ * /v1/agent-use-approvals so the IdP row's share_id matches what
+ * the desktop will check on retry — no JS-side string-template
+ * drift between the two sides. Single source: `lastid_vc::decision_jws::compute_share_id`.
+ */
+export function computeShareId(agent_did: string, item_id: string): string;
+
+/**
  * Derive a 32-byte slot seed from a 32-byte `ai_agent_seed`.
  */
 export function deriveAgentSlotSeed(ai_agent_seed: Uint8Array, slot_index: number): Uint8Array;
@@ -196,6 +205,25 @@ export function verifyAgentVcOuter(jws_compact: string, idp_pubkey_jwk: any, now
  * exp, agent_pubkey_jwk_thumb).
  */
 export function verifyAgentVcWithHumanAuthorization(jws_compact: string, idp_pubkey_jwk: any, human_delegation_pubkey_jwk: any, now: bigint): VerifiedAgentVcJs;
+
+/**
+ * Verify an operator-signed decision JWS against the operator's
+ * `delegation_authority` P-256 pubkey, then check the claims bind
+ * to the expected (approval_id, parent_human_did, agent_did,
+ * share_id) tuple. Returns the parsed claims on success; throws
+ * with a precise reason on any failure (bad sig, wrong typ,
+ * expired, future, bind mismatch).
+ *
+ * This is the plugin-side defense-in-depth check: even though the
+ * desktop will re-verify the JWS authoritatively, having the
+ * plugin verify before forwarding catches a poisoned IdP response
+ * at the earliest possible point.
+ *
+ * `expected_parent_human_did` and `expected_agent_did` are
+ * recommended to be passed as Option in JS as either a string or
+ * `null` / undefined to skip that bind check; same for share_id.
+ */
+export function verifyDecisionJws(jws_compact: string, operator_jwk_x_b64u: string, operator_jwk_y_b64u: string, now_epoch_sec: bigint, expected_approval_id?: string | null, expected_parent_human_did?: string | null, expected_agent_did?: string | null, expected_share_id?: string | null): any;
 
 /**
  * Verify a raw Ed25519 signature. Returns true on valid, false on

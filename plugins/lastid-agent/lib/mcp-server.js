@@ -23,6 +23,10 @@ import { DesktopMcpClient } from './desktop-mcp-client.js';
 import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
 import { loadAgentVc } from './keychain.js';
 import { decodeVcClaims } from './vc-claims.js';
+import {
+  parseApprovalRequiredResult,
+  runApprovalLoop,
+} from './use-approval-loop.js';
 
 const SERVER_INFO = {
   name: 'lastid-agent',
@@ -87,7 +91,7 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
  * failure (the plugin still serves its own tools).
  */
 async function tryConnectDesktop({ loadedAgent }) {
-  if (!loadedAgent) return null;
+  if (!loadedAgent) return { client: null, signingSeed: null };
   let signingKey;
   let signingSeed;
   try {
@@ -96,7 +100,7 @@ async function tryConnectDesktop({ loadedAgent }) {
     process.stderr.write(
       `[lastid-agent] desktop bridge: keypair derivation failed: ${err.message}\n`,
     );
-    return null;
+    return { client: null, signingSeed: null };
   }
   const client = new DesktopMcpClient({
     agentDid: loadedAgent.agentDid,
@@ -105,7 +109,7 @@ async function tryConnectDesktop({ loadedAgent }) {
     signingSeed,
   });
   const ok = await client.connect();
-  return ok ? client : null;
+  return { client: ok ? client : null, signingSeed };
 }
 
 async function buildServer({ scope }) {
@@ -116,9 +120,13 @@ async function buildServer({ scope }) {
   // Cached state. Connect once at build time; tools/list re-attempts
   // the desktop connection only when no client is currently held
   // (handles "wallet came up mid-session"). tools/call leans on the
-  // client's own re-handshake on 401 / expiry.
+  // client's own re-handshake on 401 / expiry. signingSeed is held
+  // alongside the client so the use-approval orchestrator can sign
+  // DPoP JWTs against /v1/agent-use-approvals without re-deriving.
   let loadedAgent = await loadAgentVc(scope);
-  let desktopClient = await tryConnectDesktop({ loadedAgent });
+  let desktopConn = await tryConnectDesktop({ loadedAgent });
+  let desktopClient = desktopConn.client;
+  let signingSeed = desktopConn.signingSeed;
 
   const reloadAgentIfStale = async () => {
     // Re-read keychain only when we don't have one yet. Once the
@@ -131,7 +139,9 @@ async function buildServer({ scope }) {
   const ensureDesktop = async () => {
     if (desktopClient) return desktopClient;
     await reloadAgentIfStale();
-    desktopClient = await tryConnectDesktop({ loadedAgent });
+    desktopConn = await tryConnectDesktop({ loadedAgent });
+    desktopClient = desktopConn.client;
+    signingSeed = desktopConn.signingSeed;
     return desktopClient;
   };
 
@@ -153,7 +163,57 @@ async function buildServer({ scope }) {
     const client = await ensureDesktop();
     if (client && client.ownsTool(name)) {
       try {
-        return await client.callTool(name, args ?? {});
+        const initial = await client.callTool(name, args ?? {});
+        // Policy plane: when vault_use returns a structured
+        // `policy_approval_required`, drive the cross-device approval
+        // round-trip transparently so the LLM caller sees one tool
+        // result (either the handle or a structured denial).
+        if (name === 'vault_use' && loadedAgent && signingSeed) {
+          const approvalBody = parseApprovalRequiredResult(initial);
+          if (approvalBody) {
+            const outcome = await runApprovalLoop({
+              approvalBody,
+              originalArgs: args ?? {},
+              agentDid: loadedAgent.agentDid,
+              vcCompact: loadedAgent.vcCompact,
+              signingSeed,
+            });
+            if (outcome.retryArgs) {
+              return await client.callTool(name, outcome.retryArgs);
+            }
+            if (outcome.expired) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: JSON.stringify(
+                      {
+                        error: 'policy_approval_expired',
+                        reason_detail:
+                          'operator did not decide within the pending window',
+                      },
+                      null,
+                      2,
+                    ),
+                  },
+                ],
+                isError: true,
+              };
+            }
+            if (outcome.denied) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: JSON.stringify(outcome.body, null, 2),
+                  },
+                ],
+                isError: true,
+              };
+            }
+          }
+        }
+        return initial;
       } catch (err) {
         // Drop the cached client so the next call rediscovers — the
         // wallet may have shut down between calls.

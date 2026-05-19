@@ -359,6 +359,34 @@ function capabilityPermits(capability_json, resource, action) {
 exports.capabilityPermits = capabilityPermits;
 
 /**
+ * Compute the synthetic share_id the desktop uses for an
+ * (agent_did, item_id) pair. Plugin uses this when POSTing
+ * /v1/agent-use-approvals so the IdP row's share_id matches what
+ * the desktop will check on retry — no JS-side string-template
+ * drift between the two sides. Single source: `lastid_vc::decision_jws::compute_share_id`.
+ * @param {string} agent_did
+ * @param {string} item_id
+ * @returns {string}
+ */
+function computeShareId(agent_did, item_id) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passStringToWasm0(agent_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(item_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.computeShareId(ptr0, len0, ptr1, len1);
+        deferred3_0 = ret[0];
+        deferred3_1 = ret[1];
+        return getStringFromWasm0(ret[0], ret[1]);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+exports.computeShareId = computeShareId;
+
+/**
  * Derive a 32-byte slot seed from a 32-byte `ai_agent_seed`.
  * @param {Uint8Array} ai_agent_seed
  * @param {number} slot_index
@@ -651,6 +679,55 @@ function verifyAgentVcWithHumanAuthorization(jws_compact, idp_pubkey_jwk, human_
     return VerifiedAgentVcJs.__wrap(ret[0]);
 }
 exports.verifyAgentVcWithHumanAuthorization = verifyAgentVcWithHumanAuthorization;
+
+/**
+ * Verify an operator-signed decision JWS against the operator's
+ * `delegation_authority` P-256 pubkey, then check the claims bind
+ * to the expected (approval_id, parent_human_did, agent_did,
+ * share_id) tuple. Returns the parsed claims on success; throws
+ * with a precise reason on any failure (bad sig, wrong typ,
+ * expired, future, bind mismatch).
+ *
+ * This is the plugin-side defense-in-depth check: even though the
+ * desktop will re-verify the JWS authoritatively, having the
+ * plugin verify before forwarding catches a poisoned IdP response
+ * at the earliest possible point.
+ *
+ * `expected_parent_human_did` and `expected_agent_did` are
+ * recommended to be passed as Option in JS as either a string or
+ * `null` / undefined to skip that bind check; same for share_id.
+ * @param {string} jws_compact
+ * @param {string} operator_jwk_x_b64u
+ * @param {string} operator_jwk_y_b64u
+ * @param {bigint} now_epoch_sec
+ * @param {string | null} [expected_approval_id]
+ * @param {string | null} [expected_parent_human_did]
+ * @param {string | null} [expected_agent_did]
+ * @param {string | null} [expected_share_id]
+ * @returns {any}
+ */
+function verifyDecisionJws(jws_compact, operator_jwk_x_b64u, operator_jwk_y_b64u, now_epoch_sec, expected_approval_id, expected_parent_human_did, expected_agent_did, expected_share_id) {
+    const ptr0 = passStringToWasm0(jws_compact, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(operator_jwk_x_b64u, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(operator_jwk_y_b64u, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    var ptr3 = isLikeNone(expected_approval_id) ? 0 : passStringToWasm0(expected_approval_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    var ptr4 = isLikeNone(expected_parent_human_did) ? 0 : passStringToWasm0(expected_parent_human_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len4 = WASM_VECTOR_LEN;
+    var ptr5 = isLikeNone(expected_agent_did) ? 0 : passStringToWasm0(expected_agent_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    var ptr6 = isLikeNone(expected_share_id) ? 0 : passStringToWasm0(expected_share_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len6 = WASM_VECTOR_LEN;
+    const ret = wasm.verifyDecisionJws(ptr0, len0, ptr1, len1, ptr2, len2, now_epoch_sec, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+exports.verifyDecisionJws = verifyDecisionJws;
 
 /**
  * Verify a raw Ed25519 signature. Returns true on valid, false on

@@ -72,6 +72,38 @@ export async function initializeSdkBindings() {
       return wasm.verifySessionFingerprint(fingerprint);
     },
 
+    // ── Approval-decision JWS (operator-signed soft-deny outcome) ──
+    // Single source of truth lives in lastid-vc/src/decision_jws.rs.
+    // The plugin verifies before forwarding to the desktop as a
+    // defense-in-depth check (desktop re-verifies authoritatively).
+    verifyDecisionJws({
+      jwsCompact,
+      operatorJwkXB64u,
+      operatorJwkYB64u,
+      nowEpochSec,
+      expectedApprovalId = null,
+      expectedParentHumanDid = null,
+      expectedAgentDid = null,
+      expectedShareId = null,
+    }) {
+      return wasm.verifyDecisionJws(
+        jwsCompact,
+        operatorJwkXB64u,
+        operatorJwkYB64u,
+        BigInt(nowEpochSec),
+        expectedApprovalId,
+        expectedParentHumanDid,
+        expectedAgentDid,
+        expectedShareId,
+      );
+    },
+    // Canonical (agent_did, item_id) → share_id mapping for the
+    // policy-plane approval flow. The IdP, plugin, and desktop all
+    // call into this so the bind check on retry never spuriously fails.
+    computeShareId({ agentDid, itemId }) {
+      return wasm.computeShareId(agentDid, itemId);
+    },
+
     // ── OID4VCI proof JWT (EdDSA, agent-side) ──────────────────────
     async mintOid4vciProofJwt(keypair, opts) {
       const signingKey = keypair.signingKeyBytes ?? keypair.signing_key_bytes;
