@@ -1,6 +1,6 @@
 {
   "name": "@lastid/agent",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "LastID Agent plugin: cryptographic identity for AI agents. Installs into Claude Code (marketplace) and OpenAI runtimes (MCP). Provisioning is approved one-time in the operator's LastID wallet via QR scan — no DID typing.",
   "license": "Apache-2.0",
   "type": "module",
