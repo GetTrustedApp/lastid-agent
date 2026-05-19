@@ -22,7 +22,6 @@
  * it returns the handle or a structured denial.
  */
 
-import { mintAgentPopJwt } from './sdk-bindings.js';
 import { initializeSdkBindings } from './sdk-bindings.js';
 
 const IDP_BASE_URL = process.env.LASTID_IDP_URL ?? 'https://human.dev.lastid.co';
@@ -61,29 +60,18 @@ export function parseApprovalRequiredResult(result) {
  */
 async function createApprovalRow({
   request,
-  agentDid,
   vcCompact,
-  signingSeed,
 }) {
-  if (!signingSeed) {
+  if (!vcCompact) {
     throw new Error(
-      'use-approval: no signingSeed available — agent must be provisioned',
+      'use-approval: no agent VC available — agent must be provisioned',
     );
   }
   const url = `${IDP_BASE_URL}/v1/agent-use-approvals`;
-  const popJwt = await mintAgentPopJwt(
-    { signingKeyBytes: new Uint8Array(signingSeed) },
-    {
-      agentDid,
-      method: 'POST',
-      uri: url,
-    },
-  );
   const res = await fetch(url, {
     method: 'POST',
     headers: {
-      Authorization: `DPoP ${popJwt}`,
-      'X-LastID-Agent-VC': vcCompact,
+      Authorization: `Bearer ${vcCompact}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(request),
@@ -102,28 +90,17 @@ async function createApprovalRow({
  */
 async function pollApprovalRow({
   approvalId,
-  agentDid,
   vcCompact,
-  signingSeed,
   intervalMs = POLL_INTERVAL_MS,
   timeoutMs = PENDING_TTL_MS,
 }) {
   const deadlineMs = Date.now() + timeoutMs;
   const url = `${IDP_BASE_URL}/v1/agent-use-approvals/${encodeURIComponent(approvalId)}`;
   while (Date.now() < deadlineMs) {
-    const popJwt = await mintAgentPopJwt(
-      { signingKeyBytes: new Uint8Array(signingSeed) },
-      {
-        agentDid,
-        method: 'GET',
-        uri: url,
-      },
-    );
     const res = await fetch(url, {
       method: 'GET',
       headers: {
-        Authorization: `DPoP ${popJwt}`,
-        'X-LastID-Agent-VC': vcCompact,
+        Authorization: `Bearer ${vcCompact}`,
       },
     });
     if (res.status === 404) {
@@ -163,9 +140,7 @@ export async function runApprovalLoop({
   try {
     created = await createApprovalRow({
       request,
-      agentDid,
       vcCompact,
-      signingSeed,
     });
   } catch (err) {
     return {
@@ -182,9 +157,7 @@ export async function runApprovalLoop({
   try {
     row = await pollApprovalRow({
       approvalId,
-      agentDid,
       vcCompact,
-      signingSeed,
     });
   } catch (err) {
     if (err.message?.includes('did not decide')) {
