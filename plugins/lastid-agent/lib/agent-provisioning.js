@@ -289,7 +289,21 @@ function aesGcmDecrypt(key, nonce, ciphertextAndTag) {
  * HKDF-SHA512 with info `lastid/agent-keypair/v1` produces the 32-byte
  * Ed25519 signing seed.
  *
- * Returns { signingKey: KeyObject, publicJwk: { kty, crv, x } }.
+ * Returns `{ signingKey, publicJwk, signingSeed }`:
+ *   - signingKey:  Node KeyObject (used by `node:crypto` paths — DPoP,
+ *                  OID4VCI proof JWT minting).
+ *   - publicJwk:   `{ kty, crv, x }` (used to derive `did:lastid:agent:`).
+ *   - signingSeed: Raw 32-byte Buffer (used by the wasm side — wasm
+ *                  exports take raw seeds, not KeyObjects). The
+ *                  SessionFingerprint signer needs this; everything
+ *                  else can ignore it.
+ *
+ * The seed is intentionally NOT zeroized here — the caller now owns
+ * its lifetime. Callers that only need the KeyObject path should
+ * destructure just `{ signingKey, publicJwk }` and let the seed buffer
+ * GC normally. Callers that need wasm signing (DesktopMcpClient,
+ * sub-agent enrollment) keep the buffer for as long as the session
+ * lasts and discard at session teardown.
  */
 export function deriveAgentEd25519Keypair(slotSeed) {
   if (!Buffer.isBuffer(slotSeed) || slotSeed.length !== 32) {
@@ -318,8 +332,6 @@ export function deriveAgentEd25519Keypair(slotSeed) {
   });
   const publicKey = createPublicKey(signingKey);
   const pubJwk = publicKey.export({ format: 'jwk' });
-  // Zeroize the seed buffer — its job is done.
-  signingSeed.fill(0);
   return {
     signingKey,
     publicJwk: {
@@ -327,6 +339,7 @@ export function deriveAgentEd25519Keypair(slotSeed) {
       crv: pubJwk.crv,
       x: pubJwk.x,
     },
+    signingSeed,
   };
 }
 

@@ -62,6 +62,16 @@ export async function initializeSdkBindings() {
       return wasm.verifyEd25519(pubkeyBytes, payload, signature);
     },
 
+    // ── SessionFingerprint (agent-signed env claim) ────────────────
+    // The wasm side canonicalizes via serde_json_canonicalizer (single
+    // source of canonical bytes — no JS reimplementation, no drift).
+    signSessionFingerprint(signingKeyBytes, fingerprint) {
+      return wasm.signSessionFingerprint(signingKeyBytes, fingerprint);
+    },
+    verifySessionFingerprint(fingerprint) {
+      return wasm.verifySessionFingerprint(fingerprint);
+    },
+
     // ── OID4VCI proof JWT (EdDSA, agent-side) ──────────────────────
     async mintOid4vciProofJwt(keypair, opts) {
       const signingKey = keypair.signingKeyBytes ?? keypair.signing_key_bytes;

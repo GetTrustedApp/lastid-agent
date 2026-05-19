@@ -26,6 +26,8 @@ import { readFile } from 'node:fs/promises';
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 import { mintDpopJwt } from './dpop.js';
+import { buildUnsignedSessionFingerprint } from './session-fingerprint.js';
+import { initializeSdkBindings } from './sdk-bindings.js';
 
 const HEALTH_TIMEOUT_MS = 1500;
 const SESSION_TIMEOUT_MS = 8000;
@@ -132,10 +134,15 @@ async function fetchWithTimeout(url, init, timeoutMs) {
  * cached remote tool descriptors. Re-handshakes lazily on demand.
  */
 export class DesktopMcpClient {
-  constructor({ agentDid, vcCompact, signingKey }) {
+  constructor({ agentDid, vcCompact, signingKey, signingSeed = null, cwd = process.cwd() }) {
     this.agentDid = agentDid;
     this.vcCompact = vcCompact;
     this.signingKey = signingKey;
+    // Raw 32-byte Ed25519 seed for the wasm side. Optional — when
+    // absent the SessionFingerprint step is skipped (desktop will
+    // accept the session but scope-bound shares will deny on use).
+    this.signingSeed = signingSeed;
+    this.cwd = cwd;
     this._discovery = null;
     this._session = null;
     this._remoteTools = [];
@@ -184,6 +191,28 @@ export class DesktopMcpClient {
       httpUri: url,
       signingKey: this.signingKey,
     });
+    const body = { vc: this.vcCompact };
+    // SessionFingerprint is best-effort. When we can't sign one (no
+    // raw seed available, or the wasm call throws on some platform),
+    // we still hand-shake — the desktop accepts a missing fingerprint
+    // and any scope-bound shares simply deny on use. That's the
+    // correct fail-safe: it never opens access wider than the
+    // operator authorized.
+    if (this.signingSeed) {
+      try {
+        const unsigned = buildUnsignedSessionFingerprint({
+          agentDid: this.agentDid,
+          cwd: this.cwd,
+        });
+        const sdk = await initializeSdkBindings();
+        const signed = sdk.signSessionFingerprint(this.signingSeed, unsigned);
+        body.session_fingerprint = signed;
+      } catch (err) {
+        process.stderr.write(
+          `[lastid-agent] session_fingerprint sign failed (continuing without): ${err.message}\n`,
+        );
+      }
+    }
     try {
       const res = await fetchWithTimeout(
         url,
@@ -193,7 +222,7 @@ export class DesktopMcpClient {
             'content-type': 'application/json',
             'DPoP': dpop,
           },
-          body: JSON.stringify({ vc: this.vcCompact }),
+          body: JSON.stringify(body),
         },
         SESSION_TIMEOUT_MS,
       );

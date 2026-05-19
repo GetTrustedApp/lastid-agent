@@ -567,6 +567,50 @@ function signEd25519(signing_key_bytes, payload) {
 exports.signEd25519 = signEd25519;
 
 /**
+ * Sign a SessionFingerprint with the agent's Ed25519 signing key.
+ * Plugin path: SessionStart hook builds the unsigned fingerprint
+ * (session_id, agent_did, project, timestamps, optional
+ * parent_session_id), passes it here, gets back the same object
+ * with `signature` filled. The plugin then ships the signed
+ * object in the body of `POST /session` on the desktop MCP
+ * server.
+ *
+ * Input JS object shape (snake_case fields, matching the Rust
+ * struct):
+ *
+ * ```ignore
+ * {
+ *   session_id: "uuid",
+ *   agent_did: "did:lastid:agent:z...",
+ *   project: {
+ *     cwd_hash: "...",
+ *     host_machine_id: "...",
+ *     git_remote: "..." | null,
+ *     head_commit_sha: "..." | null,
+ *     package_root_hash: "..." | null,
+ *   },
+ *   started_at_ms: 1700000000000,
+ *   signed_at_ms: 1700000000500,
+ *   parent_session_id: null,
+ *   signature: ""
+ * }
+ * ```
+ * @param {Uint8Array} signing_key_bytes
+ * @param {any} fingerprint
+ * @returns {any}
+ */
+function signSessionFingerprint(signing_key_bytes, fingerprint) {
+    const ptr0 = passArray8ToWasm0(signing_key_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.signSessionFingerprint(ptr0, len0, fingerprint);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
+}
+exports.signSessionFingerprint = signSessionFingerprint;
+
+/**
  * Verify the outer SD-JWT VC signature only against the IdP's
  * P-256 verifying key. JWK shape: `{ kty:"EC", crv:"P-256",
  * x:"<b64url>", y:"<b64url>" }`.
@@ -680,11 +724,33 @@ function verifyPopJwt(jwt, expected_method, expected_uri, expected_access_token,
 }
 exports.verifyPopJwt = verifyPopJwt;
 
+/**
+ * Verify a SessionFingerprint by reconstructing the Ed25519
+ * verifying key from its `agent_did` field. Returns `true` on
+ * valid; throws (a `JsError` with a precise reason) on any
+ * failure. Useful on the desktop side and for integration tests
+ * inside the plugin.
+ * @param {any} fingerprint
+ * @returns {boolean}
+ */
+function verifySessionFingerprint(fingerprint) {
+    const ret = wasm.verifySessionFingerprint(fingerprint);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0] !== 0;
+}
+exports.verifySessionFingerprint = verifySessionFingerprint;
+
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
         __wbg_Error_2e59b1b37a9a34c3: function(arg0, arg1) {
             const ret = Error(getStringFromWasm0(arg0, arg1));
+            return ret;
+        },
+        __wbg_Number_e6ffdb596c888833: function(arg0) {
+            const ret = Number(arg0);
             return ret;
         },
         __wbg_String_8564e559799eccda: function(arg0, arg1) {

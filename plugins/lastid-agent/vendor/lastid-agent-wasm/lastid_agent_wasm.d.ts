@@ -151,6 +151,38 @@ export function parseAgentDid(did: string): Uint8Array;
 export function signEd25519(signing_key_bytes: Uint8Array, payload: Uint8Array): Uint8Array;
 
 /**
+ * Sign a SessionFingerprint with the agent's Ed25519 signing key.
+ * Plugin path: SessionStart hook builds the unsigned fingerprint
+ * (session_id, agent_did, project, timestamps, optional
+ * parent_session_id), passes it here, gets back the same object
+ * with `signature` filled. The plugin then ships the signed
+ * object in the body of `POST /session` on the desktop MCP
+ * server.
+ *
+ * Input JS object shape (snake_case fields, matching the Rust
+ * struct):
+ *
+ * ```ignore
+ * {
+ *   session_id: "uuid",
+ *   agent_did: "did:lastid:agent:z...",
+ *   project: {
+ *     cwd_hash: "...",
+ *     host_machine_id: "...",
+ *     git_remote: "..." | null,
+ *     head_commit_sha: "..." | null,
+ *     package_root_hash: "..." | null,
+ *   },
+ *   started_at_ms: 1700000000000,
+ *   signed_at_ms: 1700000000500,
+ *   parent_session_id: null,
+ *   signature: ""
+ * }
+ * ```
+ */
+export function signSessionFingerprint(signing_key_bytes: Uint8Array, fingerprint: any): any;
+
+/**
  * Verify the outer SD-JWT VC signature only against the IdP's
  * P-256 verifying key. JWK shape: `{ kty:"EC", crv:"P-256",
  * x:"<b64url>", y:"<b64url>" }`.
@@ -184,3 +216,12 @@ export function verifyHumanAuthorization(jws_compact: string, human_pubkey_jwk: 
  * claim (which IS the agent's DID — no network resolution).
  */
 export function verifyPopJwt(jwt: string, expected_method: string, expected_uri: string, expected_access_token: string | null | undefined, now: bigint, max_age_seconds: number): VerifiedPopJs;
+
+/**
+ * Verify a SessionFingerprint by reconstructing the Ed25519
+ * verifying key from its `agent_did` field. Returns `true` on
+ * valid; throws (a `JsError` with a precise reason) on any
+ * failure. Useful on the desktop side and for integration tests
+ * inside the plugin.
+ */
+export function verifySessionFingerprint(fingerprint: any): boolean;

@@ -89,8 +89,9 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
 async function tryConnectDesktop({ loadedAgent }) {
   if (!loadedAgent) return null;
   let signingKey;
+  let signingSeed;
   try {
-    ({ signingKey } = deriveAgentEd25519Keypair(loadedAgent.slotSeed));
+    ({ signingKey, signingSeed } = deriveAgentEd25519Keypair(loadedAgent.slotSeed));
   } catch (err) {
     process.stderr.write(
       `[lastid-agent] desktop bridge: keypair derivation failed: ${err.message}\n`,
@@ -101,6 +102,7 @@ async function tryConnectDesktop({ loadedAgent }) {
     agentDid: loadedAgent.agentDid,
     vcCompact: loadedAgent.vcCompact,
     signingKey,
+    signingSeed,
   });
   const ok = await client.connect();
   return ok ? client : null;

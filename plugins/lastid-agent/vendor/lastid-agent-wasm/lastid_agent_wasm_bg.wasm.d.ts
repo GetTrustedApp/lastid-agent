@@ -23,6 +23,7 @@ export const mintOid4vciProofJwtEdDsa: (a: number, b: number, c: number, d: numb
 export const mintPopJwt: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: bigint) => [number, number, number, number];
 export const parseAgentDid: (a: number, b: number) => [number, number, number, number];
 export const signEd25519: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+export const signSessionFingerprint: (a: number, b: number, c: any) => [number, number, number];
 export const verifiedagentvcjs_claims: (a: number) => any;
 export const verifiedagentvcjs_humanAuthorizationVerified: (a: number) => number;
 export const verifiedhumanauthorizationjs_claims: (a: number) => any;
@@ -36,6 +37,7 @@ export const verifyAgentVcWithHumanAuthorization: (a: number, b: number, c: any,
 export const verifyEd25519: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
 export const verifyHumanAuthorization: (a: number, b: number, c: any, d: bigint) => [number, number, number];
 export const verifyPopJwt: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: number) => [number, number, number];
+export const verifySessionFingerprint: (a: any) => [number, number, number];
 export const __wbindgen_malloc: (a: number, b: number) => number;
 export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
 export const __wbindgen_exn_store: (a: number) => void;
