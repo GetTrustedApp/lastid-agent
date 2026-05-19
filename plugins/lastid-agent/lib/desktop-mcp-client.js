@@ -227,15 +227,18 @@ export class DesktopMcpClient {
         SESSION_TIMEOUT_MS,
       );
       if (!res.ok) return this._teardown();
-      const body = await res.json();
-      if (typeof body.session_token !== 'string') return this._teardown();
+      const sessionResponse = await res.json();
+      if (typeof sessionResponse.session_token !== 'string') return this._teardown();
       this._session = {
-        token: body.session_token,
-        expiresAtEpochSec: body.expires_at_epoch_sec ?? 0,
-        agentDid: body.agent_did ?? this.agentDid,
-        mayDelegate: body.may_delegate === true,
+        token: sessionResponse.session_token,
+        expiresAtEpochSec: sessionResponse.expires_at_epoch_sec ?? 0,
+        agentDid: sessionResponse.agent_did ?? this.agentDid,
+        mayDelegate: sessionResponse.may_delegate === true,
       };
-    } catch {
+    } catch (err) {
+      process.stderr.write(
+        `[lastid-agent] session handshake failed: ${err.message}\n`,
+      );
       return this._teardown();
     }
     // Discover remote tools.
