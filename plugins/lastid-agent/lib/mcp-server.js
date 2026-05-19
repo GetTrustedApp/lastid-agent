@@ -22,26 +22,12 @@ import {
 import { DesktopMcpClient } from './desktop-mcp-client.js';
 import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
 import { loadAgentVc } from './keychain.js';
+import { decodeVcClaims } from './vc-claims.js';
 
 const SERVER_INFO = {
   name: 'lastid-agent',
   version: '0.1.0',
 };
-
-function decodeVcClaims(vcCompact) {
-  if (!vcCompact || typeof vcCompact !== 'string') return null;
-  const parts = vcCompact.split('~')[0]?.split('.');
-  if (!parts || parts.length < 2) return null;
-  try {
-    return JSON.parse(
-      Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString(
-        'utf-8',
-      ),
-    );
-  } catch {
-    return null;
-  }
-}
 
 const PLUGIN_TOOLS = [
   {

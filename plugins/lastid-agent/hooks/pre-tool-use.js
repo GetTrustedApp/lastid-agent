@@ -2,98 +2,142 @@
 /**
  * PreToolUse hook.
  *
- * Intercepts every tool invocation. The relevant case for the LastID
- * Agent plugin is when the runtime calls the built-in `Task` tool to
- * spawn a sub-agent: we want to provision that sub-agent with its own
- * `LastID.Agent.Base` VC, capabilities-bounded by the parent's grant.
+ * Fires before every tool invocation. We only care about `Task` — the
+ * built-in tool the runtime uses to spawn sub-agents. For everything
+ * else this hook exits silently with no body, which Claude Code treats
+ * as "no opinion, continue".
  *
- * Flow:
- *   1. Detect Task tool invocation.
- *   2. If parent agent's VC carries `may_delegate=true`, build a
- *      sub-agent offer request (slug, capabilities_subset, exp).
- *   3. POST to the IdP's `/v1/oid4vci/agent-offer/sub` endpoint with
- *      the parent's DPoP-PoP JWT.
- *   4. Receive a credential offer URI, claim it via OID4VCI with a
- *      newly-derived sub-agent Ed25519 keypair.
- *   5. Persist the sub-agent's (seed, VC) to a keychain entry keyed by
- *      the sub-agent's class slug.
- *   6. Hand the sub-agent's identity to the spawned runtime instance.
+ * Today's behaviour for Task: emit an `additionalContext` block to the
+ * spawned sub-agent that names its parent and tells it the sub-agent
+ * is currently running **uncredentialed** in the LastID sense — the
+ * harness does not yet auto-issue sub-agent VCs (that path needs the
+ * lastid-agent-ffi crate to land so Node can derive the sub keypair
+ * via HKDF and DPoP-sign the parent's OID4VCI proof).
  *
- * If the parent does not have `may_delegate`, the sub-agent runs
- * UNCREDENTIALED — no LastID identity, no memory access. The runtime
- * is told this fact so it can decide whether to proceed.
+ * The plumbing for the real flow lives in:
+ *   - lib/oauth-device-code.js → requestSubAgentOffer / claimVcFromOffer
+ *   - lib/sdk-bindings.js → deriveSubAgentKeypair (stubbed until FFI ships)
+ *
+ * Once those are live, replace the stub branch below with an actual
+ * enrollment: derive sub seed, request sub-offer, claim VC, persist to
+ * keychain under the sub-agent's class slug, emit context to the new
+ * runtime.
  */
 
-import { loadAgentVc, persistSubAgentVc } from '../lib/keychain.js';
-import { requestSubAgentOffer, claimVcFromOffer } from '../lib/oauth-device-code.js';
-import { initializeSdkBindings } from '../lib/sdk-bindings.js';
+import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-/**
- * Hook entry. `context.toolName` and `context.toolInput` tell us what
- * the runtime is about to do. We only intercept `Task`.
- */
-export default async function preToolUse(context) {
-  if (context?.toolName !== 'Task') {
-    return { allow: true };
-  }
+const input = readStdin();
+let event = {};
+try {
+  event = JSON.parse(input);
+} catch {
+  // Malformed stdin → bail without blocking. The runtime continues
+  // normally; the hook just has no opinion.
+  process.exit(0);
+}
 
-  const parent = await loadAgentVc();
-  if (!parent) {
-    // Parent isn't provisioned (shouldn't happen if session-start ran),
-    // so we can't issue a sub-credential. Allow the Task but flag.
-    return { allow: true, note: 'parent agent has no LastID identity; sub-agent will run uncredentialed' };
-  }
-  if (!parent.claims.may_delegate) {
-    return { allow: true, note: 'parent VC has may_delegate=false; sub-agent will run uncredentialed' };
-  }
+const toolName = event?.tool_name ?? event?.toolName;
+if (toolName !== 'Task') {
+  process.exit(0);
+}
 
-  const sdk = await initializeSdkBindings();
-  const classSlug = deriveClassSlug(context.toolInput);
-  const subCapabilities = deriveSubCapabilities(parent.claims.capabilities, context.toolInput);
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
 
-  const subKeypair = await sdk.deriveSubAgentKeypair({
-    parentSeed: parent.seed,
-    classSlug,
-    index: 0,
-  });
+// Probe the parent's identity so we can name it in the sub-agent's
+// briefing. status --json is cheap (keychain read).
+const status = readStatus(cliPath);
+if (!status?.provisioned) {
+  // Parent isn't provisioned. Nothing to brief; allow silently.
+  process.exit(0);
+}
 
-  const offerUri = await requestSubAgentOffer({
-    parentVcCompact: parent.vcCompact,
-    parentKeypair: parent.keypair,
-    subAgentClass: classSlug,
-    subAgentPubkeyJwk: subKeypair.jwk,
-    capabilitiesSubset: subCapabilities,
-    exp: parent.claims.exp,
-  });
+const toolInput = event?.tool_input ?? event?.toolInput ?? {};
+const classSlug = String(toolInput?.subagent_type ?? 'general')
+  .toLowerCase()
+  .replace(/[^a-z0-9._:-]+/g, '-');
 
-  const sub = await claimVcFromOffer({ offerUri, agentKeypair: subKeypair });
-  await persistSubAgentVc(classSlug, sub);
+const note = buildSubAgentNote({
+  parentDid: status.agent_did,
+  parentHumanDid: status.parent_human_did,
+  classSlug,
+  parentMayDelegate: status.may_delegate === true,
+});
 
-  return {
-    allow: true,
-    contextOverride: {
-      subAgentDid: sub.claims.sub,
-      subAgentVcThumbprint: sub.thumbprint,
+process.stderr.write(
+  `[lastid-agent] Task spawn observed (class=${classSlug}, parent=${status.agent_did}); sub-agent auto-enrollment is pending FFI bindings\n`,
+);
+
+console.log(
+  JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      additionalContext: note,
     },
-  };
+  }),
+);
+process.exit(0);
+
+// ---
+
+function readStdin() {
+  try {
+    return readFileSync(0, 'utf-8');
+  } catch {
+    return '';
+  }
 }
 
-function deriveClassSlug(toolInput) {
-  // Best-effort: Claude Code's Task tool takes a `subagent_type` arg.
-  // We slugify it; fall back to 'general' if unset or unrecognized.
-  const raw = toolInput?.subagent_type ?? 'general';
-  return String(raw).toLowerCase().replace(/[^a-z0-9._:-]+/g, '-');
+function readStatus(cliPath) {
+  const result = spawnSync('node', [cliPath, 'status', '--json'], {
+    encoding: 'utf-8',
+    timeout: 5_000,
+  });
+  if (result.error || result.status !== 0) return null;
+  try {
+    return JSON.parse(result.stdout || '{}');
+  } catch {
+    return null;
+  }
 }
 
-function deriveSubCapabilities(parentCaps, _toolInput) {
-  // Conservative default: sub-agents inherit parent's capabilities
-  // minus delegation authority and minus any wildcard write/sign
-  // capabilities. Refinements live in lib/capability-policy.js (TBD).
-  return parentCaps
-    .filter((c) => c.actions.some((a) => a === 'read' || a === 'list'))
-    .map((c) => ({
-      resource: c.resource,
-      actions: c.actions.filter((a) => a !== 'spawn'),
-      constraints: c.constraints ?? [],
-    }));
+function buildSubAgentNote({ parentDid, parentHumanDid, classSlug, parentMayDelegate }) {
+  const provenance = [
+    'You are a sub-agent. Provenance:',
+    `- Parent agent: ${parentDid}`,
+    `- Parent human: ${parentHumanDid ?? '(unknown)'}`,
+    `- Sub-agent class: ${classSlug}`,
+  ].join('\n');
+
+  if (!parentMayDelegate) {
+    return [
+      '# LastID Agent — sub-agent context',
+      '',
+      provenance,
+      '',
+      'Your parent agent has `may_delegate: false`. The LastID harness',
+      'cannot issue you a VC. You have no agent DID, no vault access,',
+      'and no audit chain in this run. Any credential-touching work',
+      'must be done by the parent — surface back to the operator.',
+    ].join('\n');
+  }
+
+  return [
+    '# LastID Agent — sub-agent context',
+    '',
+    provenance,
+    '',
+    'Sub-agent auto-enrollment via the IdP is not active in this',
+    'plugin build yet. You are running without your own LastID',
+    'credential — no agent DID of your own, no separate vault access,',
+    'no independent audit chain. You inherit the parent\'s working',
+    'context only.',
+    '',
+    'If you need to touch credentials, defer to the parent agent and',
+    'return the task. Do NOT attempt to access the parent\'s vault',
+    'directly; you have no handle.',
+  ].join('\n');
 }

@@ -18,6 +18,7 @@ import { provisionAgent } from '../lib/agent-provisioning.js';
 import { persistAgentVc, loadAgentVc } from '../lib/keychain.js';
 import { linkHumanDid } from '../lib/agent-link.js';
 import { runMcpServer } from '../lib/mcp-server.js';
+import { decodeVcClaims } from '../lib/vc-claims.js';
 
 function parseFlags(args) {
   const out = { _: [] };
@@ -119,12 +120,21 @@ async function cmdShow(flags) {
 async function cmdStatus(flags) {
   const scope = flags.scope ?? 'main';
   const loaded = await loadAgentVc(scope);
+  const claims = loaded ? decodeVcClaims(loaded.vcCompact) ?? {} : {};
   const report = loaded
     ? {
         provisioned: true,
         scope,
         slot_index: loaded.slotIndex,
-        agent_did: loaded.agentDid,
+        agent_did: claims.sub ?? loaded.agentDid ?? null,
+        parent_human_did: claims.parent_human_did ?? null,
+        parent_agent_did: claims.parent_agent_did ?? null,
+        sub_agent_class: claims.sub_agent_class ?? null,
+        capabilities: claims.capabilities ?? [],
+        may_delegate: claims.may_delegate ?? false,
+        iat: claims.iat ?? null,
+        exp: claims.exp ?? null,
+        audit_endpoint: claims.audit_endpoint ?? null,
         vc_length: loaded.vcCompact?.length ?? 0,
       }
     : { provisioned: false, scope };
