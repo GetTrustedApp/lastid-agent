@@ -25,7 +25,7 @@
 import { mintAgentPopJwt } from './sdk-bindings.js';
 import { initializeSdkBindings } from './sdk-bindings.js';
 
-const IDP_BASE_URL = process.env.LASTID_IDP_URL ?? 'https://idp.lastid.co';
+const IDP_BASE_URL = process.env.LASTID_IDP_URL ?? 'https://human.dev.lastid.co';
 const POLL_INTERVAL_MS = 3000;
 const PENDING_TTL_MS = 5 * 60 * 1000;
 
