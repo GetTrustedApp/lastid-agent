@@ -197,6 +197,56 @@ async function cmdMemoryRetrieve(flags) {
   }
 }
 
+/**
+ * `lastid-agent policy-check --tool <name> --input <str>` — called
+ * by the PreToolUse hook on every tool invocation. POSTs to the
+ * desktop's /policy/check endpoint, prints the decision JSON on
+ * stdout. Fail-open on any error so a desktop outage doesn't brick
+ * every tool call: the hook treats parse failure as "no opinion".
+ */
+async function cmdPolicyCheck(flags) {
+  const tool = typeof flags.tool === 'string' ? flags.tool : '';
+  const input = typeof flags.input === 'string' ? flags.input : '';
+  if (tool.trim().length === 0) {
+    process.stderr.write('policy-check: --tool required\n');
+    process.exit(2);
+  }
+  const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
+  const { loadAgentVc } = await import('./keychain.js');
+  const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
+  const loaded = await loadAgentVc(flags.scope ?? 'main');
+  if (!loaded) {
+    // Not provisioned — fail open. The plugin acts only on
+    // explicitly-authored rules; without an agent there is no
+    // way to look them up.
+    process.exit(0);
+  }
+  const { signingKey, signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
+  const client = new DesktopMcpClient({
+    agentDid: loaded.agentDid,
+    vcCompact: loaded.vcCompact,
+    signingKey,
+    signingSeed,
+  });
+  const ok = await client.connect().catch(() => false);
+  if (!ok) {
+    process.exit(0);
+  }
+  try {
+    const res = await client.postJson('/policy/check', {
+      tool,
+      input,
+      agent_dids: [loaded.agentDid],
+    });
+    if (res) {
+      process.stdout.write(JSON.stringify(res));
+    }
+  } catch (e) {
+    process.stderr.write(`policy-check: ${e?.message ?? e}\n`);
+    process.exit(1);
+  }
+}
+
 async function main() {
   const [, , cmd, ...rest] = argv;
   const flags = parseFlags(rest);
@@ -218,6 +268,9 @@ async function main() {
       break;
     case 'memory-retrieve':
       await cmdMemoryRetrieve(flags);
+      break;
+    case 'policy-check':
+      await cmdPolicyCheck(flags);
       break;
     case 'help':
     case '--help':

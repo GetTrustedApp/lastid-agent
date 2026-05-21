@@ -2,26 +2,28 @@
 /**
  * PreToolUse hook.
  *
- * Fires before every tool invocation. We only care about `Task` — the
- * built-in tool the runtime uses to spawn sub-agents. For everything
- * else this hook exits silently with no body, which Claude Code treats
- * as "no opinion, continue".
+ * Runs before every tool invocation. Two responsibilities:
  *
- * Today's behaviour for Task: emit an `additionalContext` block to the
- * spawned sub-agent that names its parent and tells it the sub-agent
- * is currently running **uncredentialed** in the LastID sense — the
- * harness does not yet auto-issue sub-agent VCs (that path needs the
- * lastid-agent-ffi crate to land so Node can derive the sub keypair
- * via HKDF and DPoP-sign the parent's OID4VCI proof).
+ * 1. **Policy enforcement (M7 policy-as-memory).** For EVERY tool call,
+ *    posts `{ tool, input }` to the desktop MCP's `/policy/check`
+ *    endpoint. The desktop walks the operator's Rule-kind memories
+ *    and returns allow / deny / warn. On deny, we emit the
+ *    `permissionDecision: "deny"` envelope so Claude Code refuses
+ *    the tool call BEFORE it runs. On warn, we emit an
+ *    `additionalContext` reminder and let the call proceed.
  *
- * The plumbing for the real flow lives in:
- *   - lib/oauth-device-code.js → requestSubAgentOffer / claimVcFromOffer
- *   - lib/sdk-bindings.js → deriveSubAgentKeypair (stubbed until FFI ships)
+ * 2. **Sub-agent briefing (Task tool only).** Emits a context block
+ *    to the spawned sub-agent that names its parent and explains
+ *    the harness's current sub-agent-enrollment posture.
  *
- * Once those are live, replace the stub branch below with an actual
- * enrollment: derive sub seed, request sub-offer, claim VC, persist to
- * keychain under the sub-agent's class slug, emit context to the new
- * runtime.
+ * Time budget: 15s total per the hooks.json declaration. Policy
+ * check is a localhost HTTP round-trip (~5–20ms). On any error /
+ * unreachable desktop we fail OPEN — the tool call proceeds. The
+ * tradeoff: a one-time policy outage shouldn't brick every tool;
+ * a malicious offline branch can't bypass enforcement either
+ * because the operator's bedrock memory still ships in the
+ * UserPromptSubmit packet, which the agent has been instructed to
+ * follow.
  */
 
 import { readFileSync } from 'node:fs';
@@ -29,33 +31,74 @@ import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
+
 const input = readStdin();
 let event = {};
 try {
   event = JSON.parse(input);
 } catch {
-  // Malformed stdin → bail without blocking. The runtime continues
-  // normally; the hook just has no opinion.
   process.exit(0);
 }
 
-const toolName = event?.tool_name ?? event?.toolName;
+const toolName = event?.tool_name ?? event?.toolName ?? '';
+const toolInput = event?.tool_input ?? event?.toolInput ?? {};
+
+// ─── 1. Policy check ───────────────────────────────────────────────
+
+// Skip if the tool name is unknown — nothing to check against.
+if (toolName) {
+  const decision = runPolicyCheck(toolName, toolInput);
+  if (decision?.allow === false && decision?.matched) {
+    const m = decision.matched;
+    if (m.severity === 'deny') {
+      // Hard deny — refuse the tool call. The agent sees the reason
+      // and the memory id; can surface to the operator.
+      console.log(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason:
+              `Blocked by operator-authored memory [${m.memory_id}]: ${m.reason} ` +
+              `(rule matched pattern "${m.pattern}" on tool ${m.tool})`,
+          },
+        }),
+      );
+      process.exit(0);
+    }
+    if (m.severity === 'warn') {
+      // Soft warn — emit an additionalContext reminder to the agent
+      // and fall through to the existing logic. The agent should
+      // see the reminder before deciding to proceed.
+      console.log(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            additionalContext:
+              `⚠ Operator policy warning [${m.memory_id}]: ${m.reason} ` +
+              `(rule matched pattern "${m.pattern}" on tool ${m.tool}). ` +
+              `Proceed only if you have a clear reason; cite the memory id.`,
+          },
+        }),
+      );
+      // Continue to the Task-specific branch below. Don't exit yet.
+    }
+  }
+}
+
+// ─── 2. Sub-agent briefing (Task only) ─────────────────────────────
+
 if (toolName !== 'Task') {
   process.exit(0);
 }
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
-
-// Probe the parent's identity so we can name it in the sub-agent's
-// briefing. status --json is cheap (keychain read).
 const status = readStatus(cliPath);
 if (!status?.provisioned) {
-  // Parent isn't provisioned. Nothing to brief; allow silently.
   process.exit(0);
 }
 
-const toolInput = event?.tool_input ?? event?.toolInput ?? {};
 const classSlug = String(toolInput?.subagent_type ?? 'general')
   .toLowerCase()
   .replace(/[^a-z0-9._:-]+/g, '-');
@@ -68,7 +111,8 @@ const note = buildSubAgentNote({
 });
 
 process.stderr.write(
-  `[lastid-agent] Task spawn observed (class=${classSlug}, parent=${status.agent_did}); sub-agent auto-enrollment is pending FFI bindings\n`,
+  `[lastid-agent] Task spawn observed (class=${classSlug}, parent=${status.agent_did}); ` +
+    `sub-agent auto-enrollment is pending FFI bindings\n`,
 );
 
 console.log(
@@ -89,6 +133,50 @@ function readStdin() {
   } catch {
     return '';
   }
+}
+
+function runPolicyCheck(tool, toolInputObj) {
+  // Best-effort serialise of the tool input. For Bash it's
+  // `command` + maybe `description`; we join everything string-y
+  // so any string field can match the pattern.
+  const inputStr = stringifyToolInput(toolInputObj);
+  const result = spawnSync(
+    'node',
+    [cliPath, 'policy-check', '--tool', tool, '--input', inputStr],
+    {
+      encoding: 'utf-8',
+      timeout: 5_000,
+      input: '',
+    },
+  );
+  if (result.error || result.status !== 0) {
+    // Fail open. Stderr noise is logged.
+    if (result.stderr) {
+      process.stderr.write(`[lastid-agent] policy-check failed: ${result.stderr}\n`);
+    }
+    return null;
+  }
+  try {
+    return JSON.parse(result.stdout || '{}');
+  } catch {
+    return null;
+  }
+}
+
+function stringifyToolInput(obj) {
+  if (!obj || typeof obj !== 'object') return String(obj ?? '');
+  // Flatten one level of string-typed values. Avoids serialising
+  // the entire object (file_text on Write can be huge) but keeps
+  // command-like fields visible to the matcher.
+  const parts = [];
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === 'string') {
+      parts.push(`${k}=${v}`);
+    } else if (typeof v === 'number' || typeof v === 'boolean') {
+      parts.push(`${k}=${v}`);
+    }
+  }
+  return parts.join('\n');
 }
 
 function readStatus(cliPath) {
