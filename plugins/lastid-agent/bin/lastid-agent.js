@@ -29,10 +29,22 @@ if (!existsSync(sentinel)) {
   process.stderr.write(
     '[lastid-agent] installing dependencies (one-time, ~10s)…\n',
   );
+  // CRITICAL: route npm's stdout to OUR stderr, not stdout.
+  // Hooks (memory-retrieve, policy-check) parse stdout as JSON;
+  // npm's "added N packages" lines would corrupt the parse and
+  // the hook falls through its catch into fail-open (which is how
+  // git stash slipped past the PreToolUse policy check on the very
+  // first run after a clean install). `--silent` quiets most
+  // chatter but the npm wrapper still prints summary lines. Belt-
+  // and-suspenders: redirect at the stdio level so nothing npm
+  // emits can land on our stdout, period.
   const result = spawnSync(
     'npm',
     ['install', '--omit=dev', '--no-audit', '--no-fund', '--silent'],
-    { cwd: pluginRoot, stdio: 'inherit' },
+    {
+      cwd: pluginRoot,
+      stdio: ['ignore', process.stderr, process.stderr],
+    },
   );
   if (result.status !== 0) {
     process.stderr.write(

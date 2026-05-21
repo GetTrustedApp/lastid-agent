@@ -156,9 +156,28 @@ function runPolicyCheck(tool, toolInputObj) {
     }
     return null;
   }
+  return parseJsonTolerant(result.stdout || '');
+}
+
+// Robust JSON parse — finds the first `{` and parses from there.
+// First-run dependency install on the bin shim used to leak npm
+// output to stdout, prepending noise to our JSON and silently
+// failing the parse (which caused git stash to slip past the
+// PreToolUse policy check on the very first run after a clean
+// install). The root cause is fixed in bin/lastid-agent.js
+// (npm stdio routed to stderr), but defensive parsing here keeps
+// the hook safe against any future contamination.
+function parseJsonTolerant(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const start = raw.indexOf('{');
+  if (start === -1) return null;
+  const candidate = raw.slice(start).trim();
   try {
-    return JSON.parse(result.stdout || '{}');
-  } catch {
+    return JSON.parse(candidate);
+  } catch (e) {
+    process.stderr.write(
+      `[lastid-agent] policy-check JSON parse failed (raw len=${raw.length}): ${e?.message ?? e}\n`,
+    );
     return null;
   }
 }
