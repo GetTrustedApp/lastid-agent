@@ -13,7 +13,6 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Task",
         "hooks": [
           {
             "type": "command",
