@@ -18,7 +18,14 @@ const CONFIG_DIR = join(homedir(), '.lastid-agent');
 const CONFIG_PATH = join(CONFIG_DIR, 'config.json');
 
 const DEFAULTS = Object.freeze({
-  idpEndpoint: 'https://human.dev.lastid.co',
+  // Production IdP by default. Override per-install via the
+  // config.json (`idpEndpoint` field), per-invocation via the CLI's
+  // `--idp <url>` flag, or per-process via the `LASTID_IDP_URL` env
+  // var. The persisted IdP from the keychain (set at provision
+  // time) takes precedence over all three so a dev-provisioned
+  // agent always talks to dev even on a host where prod is the
+  // ambient default.
+  idpEndpoint: 'https://human.lastid.co',
   clientId: '',
   callbackUrl: 'lastid-agent://callback',
   registeredAt: null,

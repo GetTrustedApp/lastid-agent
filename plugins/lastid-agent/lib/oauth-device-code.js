@@ -27,14 +27,14 @@
  *      Pure OID4VCI claim flow: parse offer → token exchange → request
  *      credential.
  *
- * All HTTP calls go to `https://human.dev.lastid.co` by default (the
- * pre-prod IdP); override via `LASTID_IDP_URL` for prod
- * (`https://human.lastid.co`).
+ * All HTTP calls go to `https://human.lastid.co` (production) by
+ * default; override via `LASTID_IDP_URL` for dev
+ * (`https://human.dev.lastid.co`) or any other instance.
  */
 
 import { createHash } from 'node:crypto';
 
-const IDP_BASE_URL = process.env.LASTID_IDP_URL ?? 'https://human.dev.lastid.co';
+const IDP_BASE_URL = process.env.LASTID_IDP_URL ?? 'https://human.lastid.co';
 
 export async function runProvisioningFlow({ sdk, projectPath }) {
   // Step 1: derive a fresh agent slot. The SDK picks the next free

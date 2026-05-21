@@ -49,8 +49,12 @@ import {
 } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 
-// Default to dev while LastID.Agent.Base issuance is pre-production.
-const DEFAULT_IDP = 'https://human.dev.lastid.co';
+// Production IdP by default. Override per-host via the
+// `LASTID_IDP_URL` env var or per-invocation via the CLI's
+// `--idp <url>` flag. The IdP a freshly-provisioned agent binds
+// to gets persisted to the keychain so subsequent sessions of
+// that agent route to the same env automatically.
+const DEFAULT_IDP = 'https://human.lastid.co';
 
 // LIDE envelope wire-format constants (must match
 // `lastid-envelope/src/format.rs`).

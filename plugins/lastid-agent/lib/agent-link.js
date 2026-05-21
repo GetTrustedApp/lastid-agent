@@ -23,10 +23,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 
-// Default to dev while the agent-link routes are pre-production. Flip
-// to `https://human.lastid.co` once the IdP changes ship to prod.
-// Override per-host with `--idp <url>` or `LASTID_IDP_URL`.
-const DEFAULT_IDP = 'https://human.dev.lastid.co';
+// Production IdP by default. Override per-invocation with
+// `--idp <url>`, per-host with `LASTID_IDP_URL`, or per-agent
+// via the persisted IdP captured at provision time and stored in
+// the keychain alongside the VC.
+const DEFAULT_IDP = 'https://human.lastid.co';
 
 function b64urlDecode(seg) {
   const padded = seg + '='.repeat((4 - (seg.length % 4)) % 4);

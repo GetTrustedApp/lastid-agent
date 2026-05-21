@@ -50,7 +50,15 @@ async function cmdProvision(flags) {
     exit(3);
   }
 
-  const idpUrl = flags.idp ?? env.LASTID_IDP_URL;
+  // Resolve which IdP to bind this agent to:
+  //   1. `--idp <url>` flag (explicit, wins)
+  //   2. `LASTID_IDP_URL` env (per-host override)
+  //   3. `https://human.lastid.co` (production default)
+  // The chosen URL is persisted to the keychain on successful
+  // provision so every subsequent session of THIS agent routes
+  // to the same env automatically — no need to re-pass the flag.
+  const idpUrl =
+    flags.idp ?? env.LASTID_IDP_URL ?? 'https://human.lastid.co';
 
   // Discover the operator's LastID DID. Pre-supplied flag or env var
   // wins (useful for scripting / CI). Otherwise drive the agent-link
@@ -90,12 +98,16 @@ async function cmdProvision(flags) {
     },
   });
 
+  // Stamp the chosen IdP onto the provisioned bundle so the
+  // keychain records which env this agent is bound to.
+  provisioned.idpUrl = idpUrl;
   await persistAgentVc(provisioned, scope);
   console.log('');
   console.log('✅ Agent provisioned and persisted to keychain.');
   console.log(`   scope:      ${scope}`);
   console.log(`   slot:       ${provisioned.slotIndex}`);
   console.log(`   agent_did:  ${provisioned.agentDid}`);
+  console.log(`   idp_url:    ${idpUrl}`);
   console.log(`   vc length:  ${provisioned.vcCompact.length} chars`);
 }
 
@@ -109,6 +121,7 @@ async function cmdShow(flags) {
   console.log(`scope:     ${scope}`);
   console.log(`slot:      ${loaded.slotIndex ?? '(unknown)'}`);
   console.log(`agent_did: ${loaded.agentDid ?? '(unknown)'}`);
+  console.log(`idp_url:   ${loaded.idpUrl ?? '(not recorded — pre-env-bind agent)'}`);
   console.log(`vc:        ${loaded.vcCompact}`);
 }
 
@@ -136,13 +149,17 @@ async function cmdStatus(flags) {
         exp: claims.exp ?? null,
         audit_endpoint: claims.audit_endpoint ?? null,
         vc_length: loaded.vcCompact?.length ?? 0,
+        idp_url: loaded.idpUrl ?? null,
       }
     : { provisioned: false, scope };
   if (flags.json) {
     console.log(JSON.stringify(report));
   } else if (report.provisioned) {
+    const envHint = report.idp_url
+      ? ` idp=${report.idp_url.replace(/^https?:\/\//, '')}`
+      : ' idp=(not recorded)';
     console.log(
-      `provisioned (scope=${scope} slot=${report.slot_index ?? '?'}) agent_did=${report.agent_did ?? '?'}`,
+      `provisioned (scope=${scope} slot=${report.slot_index ?? '?'}${envHint}) agent_did=${report.agent_did ?? '?'}`,
     );
   } else {
     console.log(`not_provisioned (scope=${scope})`);
@@ -289,7 +306,7 @@ async function main() {
       console.log(
         '  --parent-human-did did:lastid:z…  Optional. Defaults to QR-scan link flow.',
       );
-      console.log('  --idp <url>                       Default: https://human.dev.lastid.co (pre-prod)');
+      console.log('  --idp <url>                       Default: https://human.lastid.co (production). Use https://human.dev.lastid.co for dev.');
       console.log('  --runtime <name>                  Default: lastid-agent-cli');
       console.log('  --project-hint <hex>              Optional SHA-256 prefix');
       console.log('  --scope <slug>                    Default: main');
