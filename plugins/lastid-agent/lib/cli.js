@@ -149,6 +149,54 @@ async function cmdStatus(flags) {
   }
 }
 
+/**
+ * `lastid-agent memory-retrieve --prompt "..."` — called by the
+ * UserPromptSubmit hook. Discovers the desktop, handshakes a
+ * session, POSTs to /memory/retrieve, prints `packet_markdown` on
+ * stdout (empty when no memories). Errors print to stderr and
+ * exit non-zero so the hook can soft-fail without injecting.
+ */
+async function cmdMemoryRetrieve(flags) {
+  const prompt =
+    typeof flags.prompt === 'string' ? flags.prompt : '';
+  if (prompt.trim().length === 0) {
+    process.stderr.write('memory-retrieve: --prompt required\n');
+    process.exit(2);
+  }
+  const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
+  const { loadAgentVc } = await import('./keychain.js');
+  const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
+  const loaded = await loadAgentVc(flags.scope ?? 'main');
+  if (!loaded) {
+    // Not provisioned — no memories possible.
+    process.exit(0);
+  }
+  const { signingKey, signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
+  const client = new DesktopMcpClient({
+    agentDid: loaded.agentDid,
+    vcCompact: loaded.vcCompact,
+    signingKey,
+    signingSeed,
+  });
+  const ok = await client.connect().catch(() => false);
+  if (!ok) {
+    // Desktop unavailable — soft-fail with no output.
+    process.exit(0);
+  }
+  try {
+    const res = await client.postJson('/memory/retrieve', {
+      prompt,
+      agent_dids: [loaded.agentDid],
+    });
+    if (res && typeof res.packet_markdown === 'string') {
+      process.stdout.write(res.packet_markdown);
+    }
+  } catch (e) {
+    process.stderr.write(`memory-retrieve: ${e?.message ?? e}\n`);
+    process.exit(1);
+  }
+}
+
 async function main() {
   const [, , cmd, ...rest] = argv;
   const flags = parseFlags(rest);
@@ -167,6 +215,9 @@ async function main() {
         scope: flags.scope ?? 'main',
         http: typeof flags.http === 'string' ? flags.http : flags.http === true ? ':8787' : null,
       });
+      break;
+    case 'memory-retrieve':
+      await cmdMemoryRetrieve(flags);
       break;
     case 'help':
     case '--help':

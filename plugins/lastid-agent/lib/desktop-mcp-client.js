@@ -306,6 +306,47 @@ export class DesktopMcpClient {
     return res?.result;
   }
 
+  /**
+   * Generic JSON POST to an authenticated desktop endpoint other
+   * than /mcp (which uses _rpc). Used by the memory retrieval hook
+   * to call /memory/retrieve. Reuses the session token + DPoP
+   * pattern. Re-handshakes if the session is near expiry.
+   */
+  async postJson(path, body) {
+    if (!this._session) {
+      const ok = await this.connect();
+      if (!ok) throw new Error('desktop MCP unavailable');
+    }
+    if (this._sessionNearExpiry()) {
+      const ok = await this._handshake();
+      if (!ok) throw new Error('desktop MCP re-handshake failed');
+    }
+    const url = `${this.baseUrl()}${path}`;
+    const dpop = mintDpopJwt({
+      agentDid: this.agentDid,
+      httpMethod: 'POST',
+      httpUri: url,
+      signingKey: this.signingKey,
+    });
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'authorization': `Bearer ${this._session?.token ?? ''}`,
+          'DPoP': dpop,
+        },
+        body: JSON.stringify(body ?? {}),
+      },
+      MCP_TIMEOUT_MS,
+    );
+    if (!res.ok) {
+      throw new Error(`POST ${path} → ${res.status}`);
+    }
+    return await res.json();
+  }
+
   _sessionNearExpiry() {
     if (!this._session) return true;
     const nowSec = Math.floor(Date.now() / 1000);
