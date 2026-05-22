@@ -85,7 +85,67 @@ if (toolName) {
       );
       // Continue to the Task-specific branch below. Don't exit yet.
     }
+    if (m.severity === 'rewrite' && m.replacement) {
+      // Silent redirect — substring-replace pattern → replacement in
+      // the tool input, return `updatedInput` so Claude Code
+      // executes the modified command. Agent never sees the
+      // unwrapped form. Used to route risky invocations through a
+      // safer wrapper (`npm install` → `sfw npm install` via Socket
+      // Firewall; `curl` → `curl --proto =https`; etc.).
+      //
+      // For v1 we only rewrite Bash.command and Bash.description.
+      // Extending to other tools (Edit, Write, etc.) just means
+      // adding their string fields to this list.
+      const updated = rewriteToolInput(toolInput, m.pattern, m.replacement);
+      if (updated) {
+        console.log(
+          JSON.stringify({
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              permissionDecision: 'allow',
+              permissionDecisionReason:
+                `Rewrote per operator-authored memory [${m.memory_id}]: ${m.reason} ` +
+                `(pattern "${m.pattern}" → "${m.replacement}" on tool ${m.tool})`,
+              updatedInput: updated,
+            },
+          }),
+        );
+        process.exit(0);
+      }
+      // Pattern matched the flattened input but didn't appear in any
+      // rewritable field (e.g. matched on the `description` but the
+      // operator only wants `command` rewritten — or the toolInput
+      // shape is one we don't handle yet). Fall through and let the
+      // tool proceed unmodified; the audit chain still recorded the
+      // hit. Failing closed here would block legitimate calls based
+      // on stale flattening logic.
+    }
   }
+}
+
+// Substring-replace `pattern` → `replacement` (case-insensitive) on
+// the string fields of toolInput that we know are command-shaped.
+// Returns a new object with the modified fields, or null if no
+// field's content changed (caller falls through to no-op).
+function rewriteToolInput(toolInput, pattern, replacement) {
+  if (!pattern || !toolInput || typeof toolInput !== 'object') return null;
+  const rewritable = ['command', 'description'];
+  const next = { ...toolInput };
+  let changed = false;
+  // Build a case-insensitive global regex from the pattern. Escape
+  // regex metacharacters so a pattern like `git status` matches
+  // literally, not as a regex.
+  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(escaped, 'gi');
+  for (const field of rewritable) {
+    const v = next[field];
+    if (typeof v !== 'string' || v.length === 0) continue;
+    if (!re.test(v)) continue;
+    re.lastIndex = 0; // reset after .test()
+    next[field] = v.replace(re, replacement);
+    changed = true;
+  }
+  return changed ? next : null;
 }
 
 // ─── 2. Sub-agent briefing (Task only) ─────────────────────────────
