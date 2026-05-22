@@ -127,16 +127,38 @@ if (toolName) {
 // the string fields of toolInput that we know are command-shaped.
 // Returns a new object with the modified fields, or null if no
 // field's content changed (caller falls through to no-op).
+//
+// Two modes, matching the Rust runtime's `apply_rewrite`:
+//   * Literal (default): regex metacharacters escaped so the
+//     pattern matches verbatim. Used for the common case
+//     `pattern:npm install` → `replacement:sfw npm install`.
+//   * Regex: pattern with a leading `regex:` prefix is used as-is.
+//     Lets one rule cover an alternation like
+//     `regex:\b(npm|yarn|pnpm|pip|uv|cargo)\b` → `sfw $1` and
+//     redirect every supported package manager in one rule.
+//     JS native `String.replace` honours `$1`, `$2`, `$&`, etc.
 function rewriteToolInput(toolInput, pattern, replacement) {
   if (!pattern || !toolInput || typeof toolInput !== 'object') return null;
   const rewritable = ['command', 'description'];
   const next = { ...toolInput };
   let changed = false;
-  // Build a case-insensitive global regex from the pattern. Escape
-  // regex metacharacters so a pattern like `git status` matches
-  // literally, not as a regex.
-  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(escaped, 'gi');
+  const isRegex = pattern.startsWith('regex:');
+  const rawSrc = isRegex ? pattern.slice('regex:'.length) : pattern;
+  const reSrc = isRegex
+    ? rawSrc
+    : rawSrc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let re;
+  try {
+    re = new RegExp(reSrc, 'gi');
+  } catch (e) {
+    // Malformed regex from operator — fail closed for this rule
+    // (no rewrite, hook falls through and the tool runs unmodified;
+    // the audit chain already recorded the rule hit).
+    process.stderr.write(
+      `[lastid-agent] rewrite skipped — invalid regex "${reSrc}": ${e?.message ?? e}\n`,
+    );
+    return null;
+  }
   for (const field of rewritable) {
     const v = next[field];
     if (typeof v !== 'string' || v.length === 0) continue;
