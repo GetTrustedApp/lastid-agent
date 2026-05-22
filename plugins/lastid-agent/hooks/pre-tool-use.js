@@ -45,6 +45,12 @@ try {
 const toolName = event?.tool_name ?? event?.toolName ?? '';
 const toolInput = event?.tool_input ?? event?.toolInput ?? {};
 
+// Accumulator for `additionalContext` blocks. We may surface a
+// policy warn, an ambient-memory recall, and a sub-agent briefing —
+// all on the same tool call. Claude Code only honours one JSON
+// envelope from the hook, so we join everything at the bottom.
+const contextParts = [];
+
 // ─── 1. Policy check ───────────────────────────────────────────────
 
 // Skip if the tool name is unknown — nothing to check against.
@@ -69,33 +75,19 @@ if (toolName) {
       process.exit(0);
     }
     if (m.severity === 'warn') {
-      // Soft warn — emit an additionalContext reminder to the agent
-      // and fall through to the existing logic. The agent should
-      // see the reminder before deciding to proceed.
-      console.log(
-        JSON.stringify({
-          hookSpecificOutput: {
-            hookEventName: 'PreToolUse',
-            additionalContext:
-              `⚠ Operator policy warning [${m.memory_id}]: ${m.reason} ` +
-              `(rule matched pattern "${m.pattern}" on tool ${m.tool}). ` +
-              `Proceed only if you have a clear reason; cite the memory id.`,
-          },
-        }),
+      // Soft warn — queue a reminder for the final envelope.
+      contextParts.push(
+        `⚠ Operator policy warning [${m.memory_id}]: ${m.reason} ` +
+          `(rule matched pattern "${m.pattern}" on tool ${m.tool}). ` +
+          `Proceed only if you have a clear reason; cite the memory id.`,
       );
-      // Continue to the Task-specific branch below. Don't exit yet.
     }
     if (m.severity === 'rewrite' && m.replacement) {
       // Silent redirect — substring-replace pattern → replacement in
       // the tool input, return `updatedInput` so Claude Code
-      // executes the modified command. Agent never sees the
-      // unwrapped form. Used to route risky invocations through a
-      // safer wrapper (`npm install` → `sfw npm install` via Socket
-      // Firewall; `curl` → `curl --proto =https`; etc.).
-      //
-      // For v1 we only rewrite Bash.command and Bash.description.
-      // Extending to other tools (Edit, Write, etc.) just means
-      // adding their string fields to this list.
+      // executes the modified command. Rewrites short-circuit
+      // ambient memory injection — once we've established the
+      // command needs to change, additional reminders are noise.
       const updated = rewriteToolInput(toolInput, m.pattern, m.replacement);
       if (updated) {
         console.log(
@@ -113,12 +105,42 @@ if (toolName) {
         process.exit(0);
       }
       // Pattern matched the flattened input but didn't appear in any
-      // rewritable field (e.g. matched on the `description` but the
-      // operator only wants `command` rewritten — or the toolInput
-      // shape is one we don't handle yet). Fall through and let the
-      // tool proceed unmodified; the audit chain still recorded the
-      // hit. Failing closed here would block legitimate calls based
-      // on stale flattening logic.
+      // rewritable field. Fall through — the audit chain already
+      // recorded the hit, and ambient retrieval may still surface
+      // useful context below.
+    }
+  }
+}
+
+// ─── 1b. Ambient memory injection ──────────────────────────────────
+//
+// For high-signal tools, semantic-search the operator's memory store
+// using the flattened tool input as the query and surface the
+// top-K non-bedrock topical hits as additionalContext. Bedrock
+// memories are excluded via the runtime's `exclude_bedrock=true`
+// path because they're already in the agent's UserPromptSubmit
+// packet — re-surfacing them on tool calls is noise.
+//
+// Skipped for low-signal tools (Read/Glob/Grep) where the
+// noise:signal ratio would be bad on every file probe.
+//
+// Resilience: `runAmbientMemoryRetrieve` uses spawnSync with a 5s
+// timeout. Desktop offline → CLI exits cleanly with no stdout →
+// hook treats as "no ambient context" and the tool proceeds
+// unaffected. The hook never blocks the agent indefinitely.
+const AMBIENT_RETRIEVE_TOOLS = new Set([
+  'Bash',
+  'Edit',
+  'Write',
+  'Task',
+  'NotebookEdit',
+]);
+if (toolName && AMBIENT_RETRIEVE_TOOLS.has(toolName)) {
+  const query = stringifyToolInput(toolInput);
+  if (query && query.length > 0) {
+    const ambient = runAmbientMemoryRetrieve(query);
+    if (ambient && ambient.trim().length > 0) {
+      contextParts.push(ambient.trim());
     }
   }
 }
@@ -172,39 +194,44 @@ function rewriteToolInput(toolInput, pattern, replacement) {
 
 // ─── 2. Sub-agent briefing (Task only) ─────────────────────────────
 
-if (toolName !== 'Task') {
-  process.exit(0);
+if (toolName === 'Task') {
+  const status = readStatus(cliPath);
+  if (status?.provisioned) {
+    const classSlug = String(toolInput?.subagent_type ?? 'general')
+      .toLowerCase()
+      .replace(/[^a-z0-9._:-]+/g, '-');
+
+    const note = buildSubAgentNote({
+      parentDid: status.agent_did,
+      parentHumanDid: status.parent_human_did,
+      classSlug,
+      parentMayDelegate: status.may_delegate === true,
+    });
+
+    process.stderr.write(
+      `[lastid-agent] Task spawn observed (class=${classSlug}, parent=${status.agent_did}); ` +
+        `sub-agent auto-enrollment is pending FFI bindings\n`,
+    );
+
+    contextParts.push(note);
+  }
 }
 
-const status = readStatus(cliPath);
-if (!status?.provisioned) {
-  process.exit(0);
+// ─── 3. Final emit ─────────────────────────────────────────────────
+//
+// Anything we accumulated above (policy warn, sub-agent briefing,
+// future ambient hits) emits as a single JSON envelope so Claude
+// Code sees one consistent decision. Empty buffer → silent allow.
+if (contextParts.length > 0) {
+  console.log(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        additionalContext: contextParts.join('\n\n'),
+      },
+    }),
+  );
 }
-
-const classSlug = String(toolInput?.subagent_type ?? 'general')
-  .toLowerCase()
-  .replace(/[^a-z0-9._:-]+/g, '-');
-
-const note = buildSubAgentNote({
-  parentDid: status.agent_did,
-  parentHumanDid: status.parent_human_did,
-  classSlug,
-  parentMayDelegate: status.may_delegate === true,
-});
-
-process.stderr.write(
-  `[lastid-agent] Task spawn observed (class=${classSlug}, parent=${status.agent_did}); ` +
-    `sub-agent auto-enrollment is pending FFI bindings\n`,
-);
-
-console.log(
-  JSON.stringify({
-    hookSpecificOutput: {
-      hookEventName: 'PreToolUse',
-      additionalContext: note,
-    },
-  }),
-);
 process.exit(0);
 
 // ---
@@ -278,6 +305,59 @@ function stringifyToolInput(obj) {
     }
   }
   return parts.join('\n');
+}
+
+/**
+ * Synchronous semantic search against the operator's memory store
+ * for the M11 ambient-injection path. Always passes
+ * `--exclude-bedrock` so we never re-surface memories the
+ * UserPromptSubmit packet already carries.
+ *
+ * Returns the CLI's stdout (a rendered `<lastid-memory>` block)
+ * verbatim, or an empty string when there's nothing relevant /
+ * the desktop isn't reachable / anything went wrong. ALWAYS
+ * non-fatal — the calling hook treats empty output as "no
+ * additional context" and lets the tool proceed.
+ *
+ * Resilience contract:
+ *   - 5s spawn timeout bounds the worst-case latency hit on every
+ *     ambient-eligible tool call.
+ *   - CLI exits 0 with no stdout when desktop is unreachable.
+ *   - Any caught error here returns '' so the hook never blocks
+ *     a tool call because of a memory subsystem hiccup.
+ */
+function runAmbientMemoryRetrieve(query) {
+  // Cap the query at a reasonable size — flattened tool input for
+  // a big Write/Edit could otherwise be tens of KB and embedding
+  // a giant string just slows the round-trip without adding
+  // signal beyond the first paragraph or two.
+  const truncated = query.length > 4000 ? query.slice(0, 4000) : query;
+  const result = spawnSync(
+    'node',
+    [
+      cliPath,
+      'memory-search',
+      '--prompt',
+      truncated,
+      '--exclude-bedrock',
+      '--limit',
+      '5',
+    ],
+    {
+      encoding: 'utf-8',
+      timeout: 5_000,
+      input: '',
+    },
+  );
+  if (result.error || result.status !== 0) {
+    if (result.stderr) {
+      process.stderr.write(
+        `[lastid-agent] ambient memory-search soft-failed: ${result.stderr}\n`,
+      );
+    }
+    return '';
+  }
+  return result.stdout || '';
 }
 
 function readStatus(cliPath) {

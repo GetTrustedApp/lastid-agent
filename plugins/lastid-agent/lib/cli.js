@@ -215,6 +215,85 @@ async function cmdMemoryRetrieve(flags) {
 }
 
 /**
+ * `lastid-agent memory-search --prompt "..." [--exclude-bedrock]`
+ *
+ * Pure topical semantic search — different from `memory-retrieve`
+ * which composes bedrock + topical into a single Markdown packet.
+ * The PreToolUse hook uses `--exclude-bedrock` to avoid re-surfacing
+ * memories already injected into the agent's prompt context via
+ * UserPromptSubmit. Renders hits as a Markdown `<lastid-memory>`
+ * block on stdout when there's signal; silent when there's nothing
+ * relevant.
+ *
+ * Soft-fail posture matches memory-retrieve: any error → exit 0
+ * with no stdout so the hook treats this as "no ambient context"
+ * and the tool proceeds.
+ */
+async function cmdMemorySearch(flags) {
+  const prompt =
+    typeof flags.prompt === 'string' ? flags.prompt : '';
+  if (prompt.trim().length === 0) {
+    process.stderr.write('memory-search: --prompt required\n');
+    process.exit(2);
+  }
+  const excludeBedrock = flags['exclude-bedrock'] === true;
+  const limit = Number.parseInt(flags.limit ?? '5', 10) || 5;
+  const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
+  const { loadAgentVc } = await import('./keychain.js');
+  const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
+  const loaded = await loadAgentVc(flags.scope ?? 'main');
+  if (!loaded) {
+    process.exit(0);
+  }
+  const { signingKey, signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
+  const client = new DesktopMcpClient({
+    agentDid: loaded.agentDid,
+    vcCompact: loaded.vcCompact,
+    signingKey,
+    signingSeed,
+  });
+  const ok = await client.connect().catch(() => false);
+  if (!ok) {
+    // Desktop unreachable. Stay silent so the calling hook treats
+    // this as no ambient context and lets the tool proceed.
+    process.exit(0);
+  }
+  try {
+    const res = await client.postJson('/memory/search', {
+      query: prompt,
+      agent_dids: [loaded.agentDid],
+      limit,
+      exclude_bedrock: excludeBedrock,
+    });
+    if (!res || !Array.isArray(res.hits) || res.hits.length === 0) {
+      process.exit(0);
+    }
+    // Render as a compact <lastid-memory> block. Each hit cites
+    // its id + score so the agent can audit what was injected.
+    const lines = ['<lastid-memory source="ambient">'];
+    for (const hit of res.hits) {
+      const score = typeof hit.score === 'number'
+        ? ` [match ${hit.score.toFixed(2)}]`
+        : '';
+      const subject = Array.isArray(hit.subject) ? hit.subject.join(', ') : '';
+      lines.push(
+        `- [${hit.memory_id}] ${hit.claim}${score}` +
+          (subject ? ` (subject: ${subject})` : ''),
+      );
+      if (hit.summary && typeof hit.summary === 'string' && hit.summary.trim().length > 0) {
+        // Indent the summary on its own line.
+        lines.push(`  ${hit.summary.trim()}`);
+      }
+    }
+    lines.push('</lastid-memory>');
+    process.stdout.write(lines.join('\n') + '\n');
+  } catch (e) {
+    process.stderr.write(`memory-search: ${e?.message ?? e}\n`);
+    process.exit(0);
+  }
+}
+
+/**
  * `lastid-agent policy-check --tool <name> --input <str>` — called
  * by the PreToolUse hook on every tool invocation. POSTs to the
  * desktop's /policy/check endpoint, prints the decision JSON on
@@ -285,6 +364,9 @@ async function main() {
       break;
     case 'memory-retrieve':
       await cmdMemoryRetrieve(flags);
+      break;
+    case 'memory-search':
+      await cmdMemorySearch(flags);
       break;
     case 'policy-check':
       await cmdPolicyCheck(flags);
