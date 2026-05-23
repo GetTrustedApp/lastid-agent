@@ -16,6 +16,7 @@
 import { argv, exit, env, platform, stdin, stdout } from 'node:process';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import qrcodeTerminal from 'qrcode-terminal';
 import { provisionAgent } from '../lib/agent-provisioning.js';
 import { persistAgentVc, loadAgentVc } from '../lib/keychain.js';
 import { linkHumanDid } from '../lib/agent-link.js';
@@ -43,11 +44,13 @@ import { decodeVcClaims } from '../lib/vc-claims.js';
  */
 async function promptIdentityLocation() {
   if (!stdin.isTTY) {
-    // No TTY (e.g. piped, CI). Default to browser — that's the
-    // path that's safe to drive non-interactively (a printed URL
-    // operator can paste anywhere) rather than rendering a QR
-    // into a logfile no one will scan.
-    return 'browser';
+    // No TTY (e.g. Claude Code's bash tool, CI, piped). Don't force
+    // a choice — emit BOTH surfaces and let whichever device the
+    // operator has handy resolve first. The IdP attaches the
+    // operator's DID at the first authenticated /pending GET, so
+    // wallet deep-link tap and browser console click both work
+    // against the same user_code.
+    return 'both';
   }
   const rl = createInterface({ input: stdin, output: stdout });
   try {
@@ -200,12 +203,26 @@ async function cmdProvision(flags) {
       console.log('');
       console.log(`Linked LastID: ${parentHumanDid}`);
       console.log('');
-    } else {
+    } else if (location === 'browser') {
       // Browser path — IdP attaches the operator's DID at first
       // authenticated /pending GET. No DID needed from the plugin.
       console.log('');
       console.log(
         'Browser flow — your already-signed-in console session will approve this agent.',
+      );
+      console.log('');
+    } else {
+      // 'both' — non-TTY context (Claude Code bash tool, CI, piped).
+      // Skip linkHumanDid (it blocks on a separate QR-for-VC-
+      // presentation step) and initiate provisioning without
+      // parent_human_did. The IdP attaches the operator's DID at the
+      // first authenticated /pending GET — works for either a phone
+      // wallet that tapped the `lastid://agent-approve` deep link OR
+      // a browser console at lastid.co/console/agents/approve. Both
+      // surfaces are emitted in the onUserCode callback below.
+      console.log('');
+      console.log(
+        'No TTY — printing both phone deep link and browser URL. Use whichever device has your LastID.',
       );
       console.log('');
     }
@@ -217,7 +234,7 @@ async function cmdProvision(flags) {
     parentHumanDid,
     runtimeName: flags.runtime ?? 'lastid-agent-cli',
     projectHint: flags['project-hint'] ?? env.LASTID_PROJECT_HINT,
-    onUserCode: ({ userCode, expiresIn }) => {
+    onUserCode: async ({ userCode, expiresIn }) => {
       console.log('');
       console.log(`User code:  ${userCode}`);
       console.log(`Expires in: ${expiresIn}s`);
@@ -230,7 +247,7 @@ async function cmdProvision(flags) {
         console.log('Check your LastID wallet — the approval screen pops automatically');
         console.log('on whichever device the wallet is open on. Cross-check the user');
         console.log('code matches, then approve.');
-      } else {
+      } else if (location === 'browser') {
         // Browser flow — print the console URL + auto-open. The
         // operator's already-signed-in lastid.co console session
         // holds the identity that signs human_authorization.
@@ -249,6 +266,35 @@ async function cmdProvision(flags) {
             })`,
           );
           console.log('  Paste the URL above into your browser instead.');
+        });
+      } else {
+        // 'both' — non-TTY. Emit phone deep link + QR + browser URL.
+        // /initiate ran without parent_human_did; the IdP will attach
+        // the operator's DID at whichever device's authenticated
+        // /pending GET lands first.
+        const consoleHost = consoleHostFor(idpUrl);
+        const approveUrl =
+          `https://${consoleHost}/console/agents/approve?user_code=` +
+          encodeURIComponent(userCode);
+        const walletDeepLink =
+          `lastid://agent-approve?user_code=${encodeURIComponent(userCode)}` +
+          `&idp=${encodeURIComponent(idpUrl)}`;
+        console.log('Approve in your LastID — pick whichever has the wallet:');
+        console.log('');
+        console.log('  Phone (tap deep link OR scan QR below):');
+        console.log(`    ${walletDeepLink}`);
+        console.log('');
+        console.log('  Browser console:');
+        console.log(`    ${approveUrl}`);
+        console.log('');
+        // QR of the deep link so an operator on a different device
+        // can scan from their phone camera. Small variant keeps the
+        // stdout block tight in narrow terminals.
+        await new Promise((resolve) => {
+          qrcodeTerminal.generate(walletDeepLink, { small: true }, (out) => {
+            console.log(out);
+            resolve();
+          });
         });
       }
       console.log('');

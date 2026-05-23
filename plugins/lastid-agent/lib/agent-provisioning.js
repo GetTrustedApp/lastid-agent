@@ -537,7 +537,7 @@ export async function provisionAgent({
     ephemeralPubkeyJwk: ephemeral.publicJwk,
   });
   if (typeof onUserCode === 'function') {
-    onUserCode({
+    await onUserCode({
       userCode: initiate.user_code,
       expiresIn: initiate.expires_in,
     });
