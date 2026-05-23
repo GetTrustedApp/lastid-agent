@@ -13,13 +13,60 @@
  * and persists (seed, VC) to the host keychain. Exit 0 on success.
  */
 
-import { argv, exit, env, platform } from 'node:process';
+import { argv, exit, env, platform, stdin, stdout } from 'node:process';
 import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
 import { provisionAgent } from '../lib/agent-provisioning.js';
 import { persistAgentVc, loadAgentVc } from '../lib/keychain.js';
 import { linkHumanDid } from '../lib/agent-link.js';
 import { runMcpServer } from '../lib/mcp-server.js';
 import { decodeVcClaims } from '../lib/vc-claims.js';
+
+/**
+ * Interactive prompt at provision time — where does the operator's
+ * LastID live? Two equally-valid paths:
+ *
+ *   - phone: QR + `lastid://` deep link, operator scans with the
+ *     mobile wallet (or taps the link on the device that holds
+ *     LastID). Right answer for operators who provisioned via
+ *     iOS/Android first.
+ *
+ *   - browser: print the lastid.co console URL + auto-open the
+ *     default browser. Right answer for operators who signed up
+ *     directly at lastid.co/signup and have their identity sealed
+ *     in IndexedDB.
+ *
+ * Returns 'phone' | 'browser'. The CLI flags `--link` / `--browser`
+ * and env vars `LASTID_LINK=1` / `LASTID_BROWSER=1` still override
+ * for scripting / CI; the prompt only fires when nothing forced a
+ * choice.
+ */
+async function promptIdentityLocation() {
+  if (!stdin.isTTY) {
+    // No TTY (e.g. piped, CI). Default to browser — that's the
+    // path that's safe to drive non-interactively (a printed URL
+    // operator can paste anywhere) rather than rendering a QR
+    // into a logfile no one will scan.
+    return 'browser';
+  }
+  const rl = createInterface({ input: stdin, output: stdout });
+  try {
+    while (true) {
+      const answer = await new Promise((resolve) => {
+        rl.question(
+          'Where is your LastID? [p]hone (scan QR) or [b]rowser (open console): ',
+          resolve,
+        );
+      });
+      const choice = String(answer ?? '').trim().toLowerCase();
+      if (choice === 'p' || choice === 'phone') return 'phone';
+      if (choice === 'b' || choice === 'browser') return 'browser';
+      console.log("  (please answer 'p' for phone or 'b' for browser)");
+    }
+  } finally {
+    rl.close();
+  }
+}
 
 /**
  * Map an IdP URL to its sibling console host. The IdP runs on
@@ -114,36 +161,54 @@ async function cmdProvision(flags) {
   const idpUrl =
     flags.idp ?? env.LASTID_IDP_URL ?? 'https://human.lastid.co';
 
-  // Operator DID discovery — three paths in priority order:
+  // Operator identity-location discovery — three paths in priority
+  // order:
   //   1. --parent-human-did flag or LASTID_PARENT_HUMAN_DID env var
-  //      (scripting / CI / explicit override).
-  //   2. --link (or LASTID_LINK=1): drive the QR / agent-link flow
-  //      for operators whose wallet lives on a different device.
-  //   3. Default (no DID supplied, no --link): browser-driven flow.
-  //      Plugin POSTs /initiate without parent_human_did; the IdP
-  //      binds the operator's DID at the browser console's first
-  //      authenticated /pending GET (OAuth device-code semantics).
+  //      (scripting / CI / explicit override). DID known, no prompt.
+  //   2. --link / LASTID_LINK=1  → force phone (QR) flow
+  //      --browser / LASTID_BROWSER=1 → force browser flow
+  //   3. Interactive prompt: "phone or browser?"
   //
-  // The default path is the browser flow because that's the
-  // browser-first product story — every signup at lastid.co/signup
-  // ends with a console session that already holds the operator's
-  // identity. Operators on a separate device opt-in to QR via
-  // --link.
+  // Browser flow: POST /initiate without parent_human_did; the IdP
+  // binds the operator's DID at the browser console's first
+  // authenticated /pending GET (OAuth device-code semantics).
+  //
+  // Phone flow: QR + `lastid://` deep link, operator scans with
+  // mobile wallet, plugin extracts DID from returned LastID.Base.
   let parentHumanDid =
     flags['parent-human-did'] ?? env.LASTID_PARENT_HUMAN_DID;
-  const useLinkFlow = flags.link === true || env.LASTID_LINK === '1';
-  if (!parentHumanDid && useLinkFlow) {
-    console.log('Link your LastID to provision this agent.');
-    const { subjectDid } = await linkHumanDid({ idpUrl });
-    parentHumanDid = subjectDid;
-    console.log('');
-    console.log(`Linked LastID: ${parentHumanDid}`);
-    console.log('');
-  } else if (!parentHumanDid) {
-    console.log(
-      'No DID supplied — browser console will bind the operator at first /pending fetch.',
-    );
-    console.log('');
+  // `phone` if the operator's wallet is on a separate device (QR
+  // scan); `browser` if their identity lives in this machine's
+  // lastid.co console session. Defaults to 'phone' when DID is
+  // pre-supplied because passing a DID is the QR-result shape.
+  let location = parentHumanDid ? 'phone' : null;
+  if (!parentHumanDid) {
+    const forcePhone = flags.link === true || env.LASTID_LINK === '1';
+    const forceBrowser =
+      flags.browser === true || env.LASTID_BROWSER === '1';
+    location = forcePhone
+      ? 'phone'
+      : forceBrowser
+      ? 'browser'
+      : await promptIdentityLocation();
+
+    if (location === 'phone') {
+      console.log('');
+      console.log('Link your LastID to provision this agent.');
+      const { subjectDid } = await linkHumanDid({ idpUrl });
+      parentHumanDid = subjectDid;
+      console.log('');
+      console.log(`Linked LastID: ${parentHumanDid}`);
+      console.log('');
+    } else {
+      // Browser path — IdP attaches the operator's DID at first
+      // authenticated /pending GET. No DID needed from the plugin.
+      console.log('');
+      console.log(
+        'Browser flow — your already-signed-in console session will approve this agent.',
+      );
+      console.log('');
+    }
   }
 
   console.log('Starting agent provisioning…');
@@ -153,38 +218,41 @@ async function cmdProvision(flags) {
     runtimeName: flags.runtime ?? 'lastid-agent-cli',
     projectHint: flags['project-hint'] ?? env.LASTID_PROJECT_HINT,
     onUserCode: ({ userCode, expiresIn }) => {
-      // Browser-driven flow (OAuth device-code style): print the
-      // console URL and try to open it. The operator's logged-in
-      // browser session at lastid.co already has the identity that
-      // signs the human_authorization JWS; clicking the URL is what
-      // binds it to the pending row via the IdP's atomic attach
-      // step. Mobile wallet flow still works in parallel — if a
-      // wallet is open on the operator's phone it'll see the WS
-      // push (only sent when parent_human_did was supplied at
-      // /initiate, which the QR-scan flow does and this CLI does
-      // not).
-      const consoleHost = consoleHostFor(idpUrl);
-      const approveUrl =
-        `https://${consoleHost}/console/agents/approve?user_code=` +
-        encodeURIComponent(userCode);
       console.log('');
       console.log(`User code:  ${userCode}`);
       console.log(`Expires in: ${expiresIn}s`);
       console.log('');
-      console.log('Approve in your LastID console:');
-      console.log(`  ${approveUrl}`);
+      if (location === 'phone') {
+        // Wallet flow — /initiate carried parent_human_did, so the
+        // IdP's broadcaster has already pushed the agent_provisioning
+        // event to every device the operator has connected. The
+        // wallet's approval screen pops automatically.
+        console.log('Check your LastID wallet — the approval screen pops automatically');
+        console.log('on whichever device the wallet is open on. Cross-check the user');
+        console.log('code matches, then approve.');
+      } else {
+        // Browser flow — print the console URL + auto-open. The
+        // operator's already-signed-in lastid.co console session
+        // holds the identity that signs human_authorization.
+        const consoleHost = consoleHostFor(idpUrl);
+        const approveUrl =
+          `https://${consoleHost}/console/agents/approve?user_code=` +
+          encodeURIComponent(userCode);
+        console.log('Approve in your LastID console:');
+        console.log(`  ${approveUrl}`);
+        console.log('');
+        console.log('Opening it for you now…');
+        void tryOpenInBrowser(approveUrl).catch((err) => {
+          console.log(
+            `  (couldn't auto-open: ${
+              err instanceof Error ? err.message : String(err)
+            })`,
+          );
+          console.log('  Paste the URL above into your browser instead.');
+        });
+      }
       console.log('');
-      console.log('Opening it for you now…');
-      void tryOpenInBrowser(approveUrl).catch((err) => {
-        console.log(
-          `  (couldn't auto-open: ${
-            err instanceof Error ? err.message : String(err)
-          })`,
-        );
-        console.log('  Paste the URL above into your browser instead.');
-      });
-      console.log('');
-      console.log('Waiting for you to approve in the browser…');
+      console.log('Waiting for you to approve…');
     },
   });
 
