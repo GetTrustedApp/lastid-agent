@@ -14,9 +14,45 @@
  */
 
 import { argv, exit, env, platform, stdin, stdout } from 'node:process';
+import { hostname } from 'node:os';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import qrcodeTerminal from 'qrcode-terminal';
+
+/**
+ * Detect the agent runtime the operator is running this from, so the
+ * wallet approval screen shows something concrete ("Claude Code on
+ * matt's laptop") rather than a hardcoded generic label.
+ *
+ * We probe env vars the popular agent runtimes set. No hardcoded
+ * fallback to any specific runtime name — if nothing matches we just
+ * report the hostname; the operator still sees which device the
+ * request is from.
+ *
+ * Sources, in priority order:
+ *   - Claude Code plugin runtime: CLAUDECODE / CLAUDE_PLUGIN_ROOT
+ *   - OpenAI Codex CLI:           CODEX_* env (e.g. CODEX_HOME, CODEX_TUI)
+ *   - Google Gemini CLI:          GEMINI_CLI / GEMINI_CODE_ASSIST
+ *   - Anthropic SDK in scripts:   ANTHROPIC_API_KEY without Claude markers
+ *   - OpenAI Assistants:          OPENAI_ASSISTANT_ID
+ *
+ * Anything not matched falls through to `lastid-agent on <host>`.
+ */
+function detectRuntimeName() {
+  const host = (() => {
+    try {
+      return hostname();
+    } catch {
+      return null;
+    }
+  })();
+  const here = host ? ` on ${host}` : '';
+  if (env.CLAUDECODE || env.CLAUDE_PLUGIN_ROOT) return `Claude Code${here}`;
+  if (env.CODEX_HOME || env.CODEX_TUI || env.CODEX_CLI) return `Codex${here}`;
+  if (env.GEMINI_CLI || env.GEMINI_CODE_ASSIST) return `Gemini${here}`;
+  if (env.OPENAI_ASSISTANT_ID) return `OpenAI Assistant${here}`;
+  return `lastid-agent${here}`;
+}
 import { provisionAgent } from '../lib/agent-provisioning.js';
 import { persistAgentVc, loadAgentVc } from '../lib/keychain.js';
 import { linkHumanDid } from '../lib/agent-link.js';
@@ -232,7 +268,7 @@ async function cmdProvision(flags) {
   const provisioned = await provisionAgent({
     idpUrl,
     parentHumanDid,
-    runtimeName: flags.runtime ?? 'lastid-agent-cli',
+    runtimeName: flags.runtime ?? detectRuntimeName(),
     projectHint: flags['project-hint'] ?? env.LASTID_PROJECT_HINT,
     onUserCode: async ({ userCode, expiresIn }) => {
       console.log('');
