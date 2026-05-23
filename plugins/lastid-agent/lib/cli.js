@@ -666,28 +666,31 @@ async function cmdListen(flags) {
   });
 
   if (flags['publish-keypackage'] || flags['publish-keypackage'] === undefined) {
-    // Route through publishAgentKeyPackage so this matches the
-    // canonical posture used by cmdProvision: Bearer + DPoP, stable
-    // ad-* device_id derived from the agent's Ed25519 pubkey,
-    // mls-client persist after generate. The inventory pre-check is
-    // intentionally skipped here — re-publish per-session is cheap,
-    // and the IdP de-dupes by content hash so duplicate calls don't
-    // accrue stale entries.
-    const { publishAgentKeyPackage } = await import('./mls-publish.js');
+    // Maintenance pass — fetch current inventory, top up only if
+    // below the threshold. Avoids re-publishing on every session
+    // start while still keeping enough KPs on file for the operator
+    // to add the agent to a group.
+    const { maintainAgentKeyPackages } = await import('./mls-publish.js');
     try {
-      const result = await publishAgentKeyPackage({
+      const result = await maintainAgentKeyPackages({
         idpUrl,
         agentDid: loaded.agentDid,
         vcCompact: loaded.vcCompact,
         slotSeed: loaded.slotSeed,
         scope,
       });
-      process.stderr.write(
-        `[lastid-agent] published keypackage ref=${result.ref ?? '?'}\n`,
-      );
+      if (result.replenished) {
+        process.stderr.write(
+          `[lastid-agent] keypackage inventory: ${result.available} on file — replenished (${result.refs?.length ?? 0} new)\n`,
+        );
+      } else {
+        process.stderr.write(
+          `[lastid-agent] keypackage inventory: ${result.available} on file — no top up needed\n`,
+        );
+      }
     } catch (err) {
       process.stderr.write(
-        `[lastid-agent] keypackage publish failed: ${err.message}\n`,
+        `[lastid-agent] keypackage maintenance failed: ${err.message}\n`,
       );
     }
   }

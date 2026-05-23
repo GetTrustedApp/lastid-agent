@@ -1,25 +1,39 @@
 /**
  * Plugin-side MLS KeyPackage publish.
  *
- * Fires automatically right after provisioning persists the agent
- * VC so the agent is reachable by the operator's chat dock the
- * moment provision returns. Authenticates with the agent's freshly-
- * issued LastID.Agent.Base VC + a DPoP-bound proof signed by the
- * agent's Ed25519 signing key.
+ * Each KeyPackage is consumed (atomically claimed) by the IdP the
+ * first time a peer fetches it. To keep the operator's dock able to
+ * reach the agent across multiple sessions, we publish a small batch
+ * of regulars + one last-resort:
  *
- * IdP route + schema:
- *   POST /v1/mls/keypackages
- *   body: { key_package: base64, device_id: string }
- *   strict — additional keys are rejected.
+ *   - REGULAR_COUNT regulars: consumed one-per-add-to-group. The
+ *     IdP enforces TTL + per-device caps.
+ *   - 1 last-resort: never consumed, ensures the dock can always
+ *     create a fresh group even after regulars are exhausted.
  *
- * device_id for an agent runtime is the agent DID itself. One
- * agent runtime = one device-level identity.
+ * Maintenance posture: on every cmdListen startup we top up to
+ * REGULAR_COUNT if the inventory dropped below TOPUP_THRESHOLD,
+ * keeping the operator-side dock reliable.
+ *
+ * IdP routes:
+ *   POST /v1/mls/keypackages/batch
+ *   body: { key_packages: [{ key_package, device_id, is_last_resort? }] }
+ *   GET  /v1/mls/keypackages/me?device_id=<id>
+ *
+ * device_id is derived from the agent's Ed25519 public key via
+ * `agentDeviceIdFromEd25519Jwk`. Stable across reinstalls,
+ * deterministic, colon-free.
  */
 import { MlsClient } from './mls-client.js';
 import { mintDpopJwt } from './dpop.js';
 import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
 import { agentDeviceIdFromEd25519Jwk } from './agent-device-id.js';
 import { createPublicKey } from 'node:crypto';
+
+/** How many regular (consumable) KeyPackages to keep on file. */
+const REGULAR_COUNT = 5;
+/** Inventory floor — below this, top up back to REGULAR_COUNT. */
+const TOPUP_THRESHOLD = 2;
 
 /**
  * Publish a fresh KeyPackage for this agent. Idempotent at the
@@ -78,14 +92,27 @@ export async function publishAgentKeyPackage({
     slotSeed,
     scope: scope ?? 'main',
   });
-  const keyPackageB64 = mls.generateKeyPackage();
-  // Persist immediately — the freshly-generated KP carries a
-  // private credential in the wasm state. Skipping persist would
-  // make the KP unusable on the next restart even if the IdP has
-  // already accepted it.
+
+  // Mint REGULAR_COUNT consumable KPs + 1 last-resort. Each
+  // generateKeyPackage call mints a fresh KP with its own private
+  // credential held in the wasm state; persist once at the end so
+  // every credential ends up in the sealed state file (skipping
+  // persist would invalidate all of them on the next restart).
+  const items = [];
+  for (let i = 0; i < REGULAR_COUNT; i++) {
+    items.push({
+      key_package: mls.generateKeyPackage(),
+      device_id: deviceId,
+    });
+  }
+  items.push({
+    key_package: mls.generateKeyPackage(),
+    device_id: deviceId,
+    is_last_resort: true,
+  });
   await mls.persist();
 
-  const url = `${trimmed}/v1/mls/keypackages`;
+  const url = `${trimmed}/v1/mls/keypackages/batch`;
   const dpopProof = mintDpopJwt({
     agentDid,
     httpMethod: 'POST',
@@ -94,13 +121,8 @@ export async function publishAgentKeyPackage({
   });
 
   // Auth pattern: Bearer SD-JWT VC compact + DPoP proof in a
-  // separate header. The IdP's vc-auth middleware sends Bearer-VC
-  // requests through `verifySDJWTVC` → recognises LastID.Agent.Base
-  // → validates the DPoP proof against the credential's `cnf.jwk`.
-  // The `DPoP <token>` scheme is for IdP-issued OAuth resource
-  // access tokens; sending a raw VC compact under that scheme makes
-  // the middleware try `verifyResourceAccessToken` which fails with
-  // an "ML-DSA signature verification failed" error.
+  // separate header. See note in single-publish flow — `DPoP <token>`
+  // scheme is for IdP-issued OAuth access tokens, not raw VCs.
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -108,19 +130,79 @@ export async function publishAgentKeyPackage({
       DPoP: dpopProof,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      key_package: keyPackageB64,
-      device_id: deviceId,
-    }),
+    body: JSON.stringify({ key_packages: items }),
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => '<no body>');
     throw new Error(
-      `POST /v1/mls/keypackages failed: HTTP ${res.status} ${text}`,
+      `POST /v1/mls/keypackages/batch failed: HTTP ${res.status} ${text}`,
     );
   }
 
   const body = await res.json().catch(() => ({}));
-  return { ok: true, ref: typeof body?.ref === 'string' ? body.ref : undefined };
+  const refs = Array.isArray(body?.refs) ? body.refs : [];
+  return { ok: true, refs, count: items.length };
+}
+
+/**
+ * Inventory + maintenance pass. Pulls the agent's current KP count
+ * from GET /me, and re-publishes a fresh batch if it dropped below
+ * TOPUP_THRESHOLD. Idempotent — re-running mid-pool is cheap and
+ * the IdP de-dupes by content hash so duplicate posts don't pile up.
+ *
+ * Returns `{ available, replenished, refs? }`.
+ */
+export async function maintainAgentKeyPackages({
+  idpUrl,
+  agentDid,
+  vcCompact,
+  slotSeed,
+  scope,
+}) {
+  const trimmed = String(idpUrl ?? '').replace(/\/$/, '');
+  if (!trimmed) throw new Error('maintainAgentKeyPackages: idpUrl required');
+  if (!Buffer.isBuffer(slotSeed) || slotSeed.length !== 32) {
+    throw new Error('maintainAgentKeyPackages: slotSeed must be 32 bytes');
+  }
+  const { signingKey } = deriveAgentEd25519Keypair(slotSeed);
+
+  const htu = `${trimmed}/v1/mls/keypackages/me`;
+  const dpop = mintDpopJwt({
+    agentDid,
+    httpMethod: 'GET',
+    httpUri: htu,
+    signingKey,
+  });
+  let available = 0;
+  try {
+    const res = await fetch(htu, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${vcCompact}`,
+        DPoP: dpop,
+      },
+    });
+    if (res.ok) {
+      const body = await res.json().catch(() => ({}));
+      // Count non-last-resort packages — last-resorts don't get
+      // consumed so they're not what determines "do we need more?".
+      const all = Array.isArray(body?.key_packages) ? body.key_packages : [];
+      available = all.filter((p) => !p.is_last_resort).length;
+    }
+  } catch {
+    // Network hiccup → fall through and publish (safer to over-publish).
+  }
+
+  if (available >= TOPUP_THRESHOLD) {
+    return { available, replenished: false };
+  }
+  const result = await publishAgentKeyPackage({
+    idpUrl,
+    agentDid,
+    vcCompact,
+    slotSeed,
+    scope,
+  });
+  return { available, replenished: true, refs: result.refs };
 }
