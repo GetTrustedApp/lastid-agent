@@ -55,6 +55,7 @@ function detectRuntimeName() {
 }
 import { provisionAgent } from '../lib/agent-provisioning.js';
 import { persistAgentVc, loadAgentVc } from '../lib/keychain.js';
+import { publishAgentKeyPackage } from '../lib/mls-publish.js';
 import { linkHumanDid } from '../lib/agent-link.js';
 import { runMcpServer } from '../lib/mcp-server.js';
 import { decodeVcClaims } from '../lib/vc-claims.js';
@@ -369,6 +370,30 @@ async function cmdProvision(flags) {
   console.log(`   agent_did:  ${provisioned.agentDid}`);
   console.log(`   idp_url:    ${idpUrl}`);
   console.log(`   vc length:  ${provisioned.vcCompact.length} chars`);
+
+  // Publish the agent's MLS KeyPackage so the operator's console
+  // can chat with it immediately. Non-fatal — if this fails the
+  // operator can still chat once the agent's runtime is up and
+  // retries the publish.
+  try {
+    await publishAgentKeyPackage({
+      idpUrl,
+      agentDid: provisioned.agentDid,
+      vcCompact: provisioned.vcCompact,
+      slotSeed: provisioned.slotSeed,
+      scope,
+    });
+    console.log('   mls keypkg: published');
+  } catch (err) {
+    console.error(
+      `   mls keypkg: publish failed (${
+        err instanceof Error ? err.message : String(err)
+      })`,
+    );
+    console.error(
+      '   You can retry later — the chat dock will fall back to a retry attempt.',
+    );
+  }
 }
 
 async function cmdShow(flags) {
@@ -642,38 +667,85 @@ async function cmdListen(flags) {
   });
 
   if (flags['publish-keypackage'] || flags['publish-keypackage'] === undefined) {
-    // Default to publishing on every `listen` start. The IdP de-dupes
-    // identical KeyPackages; a fresh one is cheap and the cost of
-    // missing one (operator can't add us to a group) is high.
-    const kpB64 = mls.generateKeyPackage();
-    await mls.persist();
-    const url = `${idpUrl.replace(/\/$/, '')}/v1/mls/keypackages`;
-    const dpop = mintDpopJwt({
-      agentDid: loaded.agentDid,
-      httpMethod: 'POST',
-      httpUri: url,
-      signingKey,
-    });
+    // Check current KeyPackage inventory before generating a new one.
+    // `GET /v1/mls/keypackages/me?device_id=<agent_did>` returns the
+    // KPs already on file for this device. Skip the publish if we
+    // already have an unconsumed KP available — otherwise we'd accrue
+    // junk entries on every session start.
+    const inventoryUrl = `${idpUrl.replace(/\/$/, '')}/v1/mls/keypackages/me?device_id=${encodeURIComponent(loaded.agentDid)}`;
+    let needsPublish = true;
     try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          Authorization: `DPoP ${loaded.vcCompact}`,
-          DPoP: dpop,
-        },
-        body: JSON.stringify({ key_package_b64: kpB64 }),
+      const dpopGet = mintDpopJwt({
+        agentDid: loaded.agentDid,
+        httpMethod: 'GET',
+        httpUri: inventoryUrl,
+        signingKey,
       });
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        process.stderr.write(
-          `[lastid-agent] keypackage publish failed (${res.status}): ${text}\n`,
-        );
+      const res = await fetch(inventoryUrl, {
+        method: 'GET',
+        headers: {
+          Authorization: `DPoP ${loaded.vcCompact}`,
+          DPoP: dpopGet,
+        },
+      });
+      if (res.ok) {
+        const body = await res.json().catch(() => ({}));
+        const available = Array.isArray(body?.key_packages)
+          ? body.key_packages.length
+          : 0;
+        if (available > 0) {
+          needsPublish = false;
+          process.stderr.write(
+            `[lastid-agent] keypackage inventory: ${available} on file — skip publish\n`,
+          );
+        }
       } else {
-        process.stderr.write(`[lastid-agent] published keypackage (${kpB64.length} chars) to ${url}\n`);
+        process.stderr.write(
+          `[lastid-agent] inventory check failed (${res.status}) — will publish anyway\n`,
+        );
       }
     } catch (err) {
-      process.stderr.write(`[lastid-agent] keypackage publish threw: ${err.message}\n`);
+      process.stderr.write(
+        `[lastid-agent] inventory check threw (${err.message}) — will publish anyway\n`,
+      );
+    }
+
+    if (needsPublish) {
+      const kpB64 = mls.generateKeyPackage();
+      await mls.persist();
+      const url = `${idpUrl.replace(/\/$/, '')}/v1/mls/keypackages`;
+      const dpop = mintDpopJwt({
+        agentDid: loaded.agentDid,
+        httpMethod: 'POST',
+        httpUri: url,
+        signingKey,
+      });
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            Authorization: `DPoP ${loaded.vcCompact}`,
+            DPoP: dpop,
+          },
+          body: JSON.stringify({
+            key_package: kpB64,
+            device_id: loaded.agentDid,
+          }),
+        });
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          process.stderr.write(
+            `[lastid-agent] keypackage publish failed (${res.status}): ${text}\n`,
+          );
+        } else {
+          process.stderr.write(
+            `[lastid-agent] published keypackage (${kpB64.length} chars) to ${url}\n`,
+          );
+        }
+      } catch (err) {
+        process.stderr.write(`[lastid-agent] keypackage publish threw: ${err.message}\n`);
+      }
     }
   }
 

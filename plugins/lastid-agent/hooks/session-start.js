@@ -21,6 +21,7 @@
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ensureListenerRunning } from '../lib/listener-daemon.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
@@ -61,6 +62,29 @@ const context = buildOperatingContext(status);
 process.stderr.write(
   `[lastid-agent] provisioned: ${status.agent_did}\n`,
 );
+
+// Ensure the MLS listener daemon is alive in the background. This
+// is the listener that receives Welcome / inbound MLS messages from
+// the operator so the agent can be added to chat groups + receive
+// memory-update / rule-update broadcasts even between Claude Code
+// sessions. Idempotent — if a prior session already spawned the
+// daemon and it's still alive, this returns immediately.
+try {
+  const result = await ensureListenerRunning({
+    scope: status.scope ?? 'main',
+    cliPath,
+  });
+  process.stderr.write(
+    `[lastid-agent] listener: ${result.status}${
+      result.pid ? ` (pid=${result.pid})` : ''
+    }\n`,
+  );
+} catch (err) {
+  process.stderr.write(
+    `[lastid-agent] listener spawn failed: ${err.message}\n`,
+  );
+}
+
 emit(context);
 process.exit(0);
 
