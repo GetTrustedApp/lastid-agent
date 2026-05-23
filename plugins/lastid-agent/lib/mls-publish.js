@@ -18,6 +18,8 @@
 import { MlsClient } from './mls-client.js';
 import { mintDpopJwt } from './dpop.js';
 import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
+import { agentDeviceIdFromEd25519Jwk } from './agent-device-id.js';
+import { createPublicKey } from 'node:crypto';
 
 /**
  * Publish a fresh KeyPackage for this agent. Idempotent at the
@@ -57,6 +59,20 @@ export async function publishAgentKeyPackage({
 
   const { signingKey } = deriveAgentEd25519Keypair(slotSeed);
 
+  // device_id for the IdP's key-package store. The IdP keys set
+  // entries as `${deviceId}:${ref}` and splits on `:` to parse them
+  // back — passing the agent DID directly breaks that parsing
+  // because DIDs contain colons. Derive a stable colon-free
+  // identifier from the agent's Ed25519 public key, matching the
+  // bot pattern in lastid-idp/packages/credential-service/src/mls/
+  // bot-device-id.ts.
+  const publicJwk = createPublicKey(signingKey).export({ format: 'jwk' });
+  const deviceId = agentDeviceIdFromEd25519Jwk({
+    kty: 'OKP',
+    crv: 'Ed25519',
+    x: publicJwk.x,
+  });
+
   const mls = await MlsClient.open({
     agentDid,
     slotSeed,
@@ -94,7 +110,7 @@ export async function publishAgentKeyPackage({
     },
     body: JSON.stringify({
       key_package: keyPackageB64,
-      device_id: agentDid,
+      device_id: deviceId,
     }),
   });
 
