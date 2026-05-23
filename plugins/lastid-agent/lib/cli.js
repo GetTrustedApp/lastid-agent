@@ -13,12 +13,66 @@
  * and persists (seed, VC) to the host keychain. Exit 0 on success.
  */
 
-import { argv, exit, env } from 'node:process';
+import { argv, exit, env, platform } from 'node:process';
+import { spawn } from 'node:child_process';
 import { provisionAgent } from '../lib/agent-provisioning.js';
 import { persistAgentVc, loadAgentVc } from '../lib/keychain.js';
 import { linkHumanDid } from '../lib/agent-link.js';
 import { runMcpServer } from '../lib/mcp-server.js';
 import { decodeVcClaims } from '../lib/vc-claims.js';
+
+/**
+ * Map an IdP URL to its sibling console host. The IdP runs on
+ * `human.lastid.co` (prod) or `human.dev.lastid.co` (dev); the
+ * console runs on `lastid.co` / `dev.lastid.co`. Both pairs share
+ * the same identity store, so the operator's already-logged-in
+ * console session at the same env can attach to a pending row that
+ * the plugin just opened on the matching IdP.
+ */
+function consoleHostFor(idpUrl) {
+  try {
+    const url = new URL(idpUrl);
+    const host = url.host;
+    if (host.includes('.dev.')) return 'dev.lastid.co';
+    if (host.includes('-dev.') || host === 'localhost') return 'localhost:3000';
+    return 'lastid.co';
+  } catch {
+    return 'lastid.co';
+  }
+}
+
+/**
+ * Best-effort cross-platform "open this URL in the operator's
+ * browser". Uses the OS-native opener (`open` on macOS, `xdg-open`
+ * on Linux, `start` on Windows). Fails silently if the host has no
+ * such command (headless servers, sandboxed environments) — the
+ * operator still has the printed URL to paste manually.
+ */
+function tryOpenInBrowser(url) {
+  return new Promise((resolve, reject) => {
+    let cmd;
+    let args;
+    if (platform === 'darwin') {
+      cmd = 'open';
+      args = [url];
+    } else if (platform === 'win32') {
+      // `start` is a cmd builtin so we go through cmd.exe with /c.
+      // The empty "" is the window title arg `start` requires when
+      // the first quoted arg is the URL.
+      cmd = 'cmd';
+      args = ['/c', 'start', '""', url];
+    } else {
+      cmd = 'xdg-open';
+      args = [url];
+    }
+    const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+    child.on('error', reject);
+    // Detach so the plugin's process can exit independently if the
+    // operator closes the terminal before approving in browser.
+    child.unref();
+    resolve();
+  });
+}
 
 function parseFlags(args) {
   const out = { _: [] };
@@ -83,18 +137,38 @@ async function cmdProvision(flags) {
     runtimeName: flags.runtime ?? 'lastid-agent-cli',
     projectHint: flags['project-hint'] ?? env.LASTID_PROJECT_HINT,
     onUserCode: ({ userCode, expiresIn }) => {
+      // Browser-driven flow (OAuth device-code style): print the
+      // console URL and try to open it. The operator's logged-in
+      // browser session at lastid.co already has the identity that
+      // signs the human_authorization JWS; clicking the URL is what
+      // binds it to the pending row via the IdP's atomic attach
+      // step. Mobile wallet flow still works in parallel — if a
+      // wallet is open on the operator's phone it'll see the WS
+      // push (only sent when parent_human_did was supplied at
+      // /initiate, which the QR-scan flow does and this CLI does
+      // not).
+      const consoleHost = consoleHostFor(idpUrl);
+      const approveUrl =
+        `https://${consoleHost}/console/agents/approve?user_code=` +
+        encodeURIComponent(userCode);
       console.log('');
       console.log(`User code:  ${userCode}`);
       console.log(`Expires in: ${expiresIn}s`);
       console.log('');
-      console.log('Check your LastID wallet — the approval screen pops automatically');
-      console.log('on any device the wallet is open on (phone or desktop). Cross-check');
-      console.log('the user code above matches the one shown in the wallet, approve');
-      console.log('with biometric + master password, and keep this process running.');
+      console.log('Approve in your LastID console:');
+      console.log(`  ${approveUrl}`);
       console.log('');
-      console.log('Your wallet derives this agent\'s identity from your BIP85 tree.');
-      console.log('The agent\'s DID will be derived from the slot it allocates and');
-      console.log('shown below once approval completes.');
+      console.log('Opening it for you now…');
+      void tryOpenInBrowser(approveUrl).catch((err) => {
+        console.log(
+          `  (couldn't auto-open: ${
+            err instanceof Error ? err.message : String(err)
+          })`,
+        );
+        console.log('  Paste the URL above into your browser instead.');
+      });
+      console.log('');
+      console.log('Waiting for you to approve in the browser…');
     },
   });
 
