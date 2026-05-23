@@ -77,10 +77,18 @@ export async function publishAgentKeyPackage({
     signingKey,
   });
 
+  // Auth pattern: Bearer SD-JWT VC compact + DPoP proof in a
+  // separate header. The IdP's vc-auth middleware sends Bearer-VC
+  // requests through `verifySDJWTVC` → recognises LastID.Agent.Base
+  // → validates the DPoP proof against the credential's `cnf.jwk`.
+  // The `DPoP <token>` scheme is for IdP-issued OAuth resource
+  // access tokens; sending a raw VC compact under that scheme makes
+  // the middleware try `verifyResourceAccessToken` which fails with
+  // an "ML-DSA signature verification failed" error.
   const res = await fetch(url, {
     method: 'POST',
     headers: {
-      Authorization: `DPoP ${vcCompact}`,
+      Authorization: `Bearer ${vcCompact}`,
       DPoP: dpopProof,
       'Content-Type': 'application/json',
     },
