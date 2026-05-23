@@ -118,12 +118,22 @@ export function generateEphemeralEnvelopeKeypair() {
  */
 export async function initiateProvisioning(opts) {
   const idp = opts.idpUrl ?? DEFAULT_IDP;
+  // `parent_human_did` is optional in the browser-driven OAuth-
+  // device-code flow — when the plugin doesn't know the operator's
+  // DID up front, the IdP binds it atomically on the browser
+  // console's first authenticated `/pending` GET (see
+  // lastid-idp/src/services/agent/agent-provisioning-store.ts
+  // attachParentHumanDid). Only include the field when actually
+  // supplied; otherwise sending `undefined` serializes as
+  // `parent_human_did: null` which the IdP regex-rejects.
   const body = {
     ephemeral_pubkey_jwk: opts.ephemeralPubkeyJwk,
-    parent_human_did: opts.parentHumanDid,
     runtime_name: opts.runtimeName ?? 'lastid-agent-plugin',
     project_hint: opts.projectHint ?? null,
   };
+  if (opts.parentHumanDid) {
+    body.parent_human_did = opts.parentHumanDid;
+  }
   const response = await fetch(`${idp}/v1/oid4vci/agent-provision/initiate`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

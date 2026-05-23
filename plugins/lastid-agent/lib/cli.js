@@ -114,19 +114,35 @@ async function cmdProvision(flags) {
   const idpUrl =
     flags.idp ?? env.LASTID_IDP_URL ?? 'https://human.lastid.co';
 
-  // Discover the operator's LastID DID. Pre-supplied flag or env var
-  // wins (useful for scripting / CI). Otherwise drive the agent-link
-  // QR flow: render a QR + lastid:// deep link, operator scans with
-  // their LastID wallet and presents their LastID.Base credential, we
-  // decode the subject DID from the returned SD-JWT.
+  // Operator DID discovery — three paths in priority order:
+  //   1. --parent-human-did flag or LASTID_PARENT_HUMAN_DID env var
+  //      (scripting / CI / explicit override).
+  //   2. --link (or LASTID_LINK=1): drive the QR / agent-link flow
+  //      for operators whose wallet lives on a different device.
+  //   3. Default (no DID supplied, no --link): browser-driven flow.
+  //      Plugin POSTs /initiate without parent_human_did; the IdP
+  //      binds the operator's DID at the browser console's first
+  //      authenticated /pending GET (OAuth device-code semantics).
+  //
+  // The default path is the browser flow because that's the
+  // browser-first product story — every signup at lastid.co/signup
+  // ends with a console session that already holds the operator's
+  // identity. Operators on a separate device opt-in to QR via
+  // --link.
   let parentHumanDid =
     flags['parent-human-did'] ?? env.LASTID_PARENT_HUMAN_DID;
-  if (!parentHumanDid) {
+  const useLinkFlow = flags.link === true || env.LASTID_LINK === '1';
+  if (!parentHumanDid && useLinkFlow) {
     console.log('Link your LastID to provision this agent.');
     const { subjectDid } = await linkHumanDid({ idpUrl });
     parentHumanDid = subjectDid;
     console.log('');
     console.log(`Linked LastID: ${parentHumanDid}`);
+    console.log('');
+  } else if (!parentHumanDid) {
+    console.log(
+      'No DID supplied — browser console will bind the operator at first /pending fetch.',
+    );
     console.log('');
   }
 
