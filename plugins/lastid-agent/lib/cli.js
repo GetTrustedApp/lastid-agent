@@ -268,10 +268,23 @@ async function cmdProvision(flags) {
           console.log('  Paste the URL above into your browser instead.');
         });
       } else {
-        // 'both' — non-TTY. Emit phone deep link + QR + browser URL.
-        // /initiate ran without parent_human_did; the IdP will attach
-        // the operator's DID at whichever device's authenticated
-        // /pending GET lands first.
+        // 'both' — non-TTY (Claude Code bash tool, CI, piped). The
+        // operator never sees stdout from a subprocess unless the
+        // calling agent reads it back, AND there's no terminal to
+        // host an interactive QR scan. So we lean on the browser
+        // path: spawn the OS opener so the approve page pops in
+        // the operator's actual default browser (works regardless
+        // of stdin/stdout — `open` / `xdg-open` / `start` is fire-
+        // and-forget against the windowing system, not the calling
+        // TTY). The URL is also printed for the case where the
+        // opener can't reach a display (SSH session, headless CI)
+        // and the operator has to copy/paste manually.
+        //
+        // Phone deep link + QR stay printed below as a fallback —
+        // useful when the operator's LastID lives on their phone
+        // and they're working at a different workstation than the
+        // one running Claude Code. The browser auto-open just
+        // covers the common case painlessly.
         const consoleHost = consoleHostFor(idpUrl);
         const approveUrl =
           `https://${consoleHost}/console/agents/approve?user_code=` +
@@ -279,17 +292,24 @@ async function cmdProvision(flags) {
         const walletDeepLink =
           `lastid://agent-approve?user_code=${encodeURIComponent(userCode)}` +
           `&idp=${encodeURIComponent(idpUrl)}`;
-        console.log('Approve in your LastID — pick whichever has the wallet:');
+        console.log('Approve this agent in your LastID:');
         console.log('');
-        console.log('  Phone (tap deep link OR scan QR below):');
-        console.log(`    ${walletDeepLink}`);
+        console.log(`  ${approveUrl}`);
         console.log('');
-        console.log('  Browser console:');
-        console.log(`    ${approveUrl}`);
+        console.log('Opening it in your browser now…');
+        void tryOpenInBrowser(approveUrl).catch((err) => {
+          console.log(
+            `  (couldn't auto-open: ${
+              err instanceof Error ? err.message : String(err)
+            })`,
+          );
+          console.log('  Paste the URL above into your browser instead.');
+        });
         console.log('');
-        // QR of the deep link so an operator on a different device
-        // can scan from their phone camera. Small variant keeps the
-        // stdout block tight in narrow terminals.
+        console.log('Or, if your LastID is on your phone:');
+        console.log(`  tap: ${walletDeepLink}`);
+        console.log('  or scan the QR below from your phone camera:');
+        console.log('');
         await new Promise((resolve) => {
           qrcodeTerminal.generate(walletDeepLink, { small: true }, (out) => {
             console.log(out);
