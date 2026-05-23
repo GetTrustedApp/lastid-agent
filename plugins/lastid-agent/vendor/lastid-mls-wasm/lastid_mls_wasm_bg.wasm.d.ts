@@ -1,0 +1,35 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const __wbg_botmlsclient_free: (a: number, b: number) => void;
+export const botmlsclient_addMember: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+export const botmlsclient_applyLoaded: (a: number, b: number, c: number) => [number, number];
+export const botmlsclient_botDid: (a: number) => [number, number];
+export const botmlsclient_commitPendingProposals: (a: number, b: number, c: number) => [number, number, number, number];
+export const botmlsclient_createBotClient: (a: number, b: number) => [number, number, number];
+export const botmlsclient_createGroup: (a: number, b: number, c: number) => [number, number, number, number];
+export const botmlsclient_destroyGroup: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+export const botmlsclient_dumpState: (a: number) => [number, number, number, number];
+export const botmlsclient_encryptApplicationMessage: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+export const botmlsclient_forgetGroup: (a: number, b: number, c: number) => [number, number];
+export const botmlsclient_generateKeyPackage: (a: number) => [number, number, number, number];
+export const botmlsclient_groupEpoch: (a: number, b: number, c: number) => [bigint, number, number];
+export const botmlsclient_processInbound: (a: number, b: number, c: number) => [number, number, number, number];
+export const botmlsclient_processWelcome: (a: number, b: number, c: number) => [number, number, number, number];
+export const botmlsclient_removeMember: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+export const botmlsclient_restoreBotClient: (a: number, b: number, c: number, d: number) => [number, number, number];
+export const botmlsclient_rollbackPendingCommit: (a: number, b: number, c: number) => [number, number];
+export const botmlsclient_selfUpdate: (a: number, b: number, c: number) => [number, number, number, number];
+export const botmlsclient_snapshotBaseline: (a: number) => [number, number];
+export const botmlsclient_takeDiffJson: (a: number) => [number, number, number, number];
+export const ciphersuiteSupportJson: () => [number, number, number, number];
+export const targetCiphersuiteCodePoint: () => number;
+export const init: () => void;
+export const __wbindgen_exn_store: (a: number) => void;
+export const __externref_table_alloc: () => number;
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __wbindgen_free: (a: number, b: number, c: number) => void;
+export const __wbindgen_malloc: (a: number, b: number) => number;
+export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+export const __externref_table_dealloc: (a: number) => void;
+export const __wbindgen_start: () => void;

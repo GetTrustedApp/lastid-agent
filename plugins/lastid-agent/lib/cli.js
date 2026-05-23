@@ -567,6 +567,117 @@ async function cmdPolicyCheck(flags) {
   }
 }
 
+/**
+ * `lastid-agent listen [--scope main]`
+ *
+ * Opens a persistent WebSocket to the IdP, joins MLS Welcomes the
+ * operator sent us, decrypts inbound application messages, and
+ * appends them to the agent's local inbox. Runs until SIGINT.
+ *
+ * Publishes a fresh MLS KeyPackage on first start if one isn't
+ * already known to be live IdP-side — `--publish-keypackage` forces
+ * a re-publish. Posts to /v1/mls/keypackages using the agent's
+ * VC + a DPoP proof minted from the slot-derived signing key (same
+ * auth shape every other agent-side REST call uses).
+ */
+async function cmdListen(flags) {
+  const scope = flags.scope ?? 'main';
+  const loaded = await loadAgentVc(scope);
+  if (!loaded) {
+    process.stderr.write(`not_provisioned (scope=${scope}) — run \`lastid-agent provision\` first\n`);
+    exit(3);
+  }
+  const idpUrl = loaded.idpUrl ?? env.LASTID_IDP_URL ?? 'https://human.lastid.co';
+
+  const [{ deriveAgentEd25519Keypair }, { MlsClient }, { LastIdWsClient }, { MlsDispatcher }, { mintDpopJwt }] =
+    await Promise.all([
+      import('./agent-provisioning.js'),
+      import('./mls-client.js'),
+      import('./ws-client.js'),
+      import('./mls-dispatch.js'),
+      import('./dpop.js'),
+    ]);
+
+  const { signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed);
+  const mls = await MlsClient.open({
+    agentDid: loaded.agentDid,
+    slotSeed: loaded.slotSeed,
+    scope,
+  });
+
+  if (flags['publish-keypackage'] || flags['publish-keypackage'] === undefined) {
+    // Default to publishing on every `listen` start. The IdP de-dupes
+    // identical KeyPackages; a fresh one is cheap and the cost of
+    // missing one (operator can't add us to a group) is high.
+    const kpB64 = mls.generateKeyPackage();
+    await mls.persist();
+    const url = `${idpUrl.replace(/\/$/, '')}/v1/mls/keypackages`;
+    const dpop = mintDpopJwt({
+      agentDid: loaded.agentDid,
+      httpMethod: 'POST',
+      httpUri: url,
+      signingKey,
+    });
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          Authorization: `DPoP ${loaded.vcCompact}`,
+          DPoP: dpop,
+        },
+        body: JSON.stringify({ key_package_b64: kpB64 }),
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        process.stderr.write(
+          `[lastid-agent] keypackage publish failed (${res.status}): ${text}\n`,
+        );
+      } else {
+        process.stderr.write(`[lastid-agent] published keypackage (${kpB64.length} chars) to ${url}\n`);
+      }
+    } catch (err) {
+      process.stderr.write(`[lastid-agent] keypackage publish threw: ${err.message}\n`);
+    }
+  }
+
+  const dispatcher = new MlsDispatcher({ mls, scope });
+  const ws = new LastIdWsClient({
+    idpUrl,
+    agentDid: loaded.agentDid,
+    vcCompact: loaded.vcCompact,
+    signingKey,
+    onOpen: ({ ws_url }) => process.stderr.write(`[lastid-agent] ws connected: ${ws_url}\n`),
+    onWelcome: (evt) => {
+      dispatcher.onWelcome(evt).catch((err) =>
+        process.stderr.write(`[lastid-agent] onWelcome threw: ${err.message}\n`),
+      );
+    },
+    onMessage: (evt) => {
+      dispatcher.onMessage(evt).catch((err) =>
+        process.stderr.write(`[lastid-agent] onMessage threw: ${err.message}\n`),
+      );
+    },
+    onError: (err) => process.stderr.write(`[lastid-agent] ws error: ${err.message}\n`),
+  });
+
+  process.stderr.write(`[lastid-agent] listening as ${loaded.agentDid} on ${idpUrl}\n`);
+  ws.start();
+
+  const shutdown = () => {
+    process.stderr.write('[lastid-agent] shutting down\n');
+    ws.stop();
+    try { mls.free(); } catch { /* ignore */ }
+    exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  // Resolve never — the WS client + signal handlers keep the
+  // process alive.
+  await new Promise(() => {});
+}
+
 async function main() {
   const [, , cmd, ...rest] = argv;
   const flags = parseFlags(rest);
@@ -585,6 +696,9 @@ async function main() {
         scope: flags.scope ?? 'main',
         http: typeof flags.http === 'string' ? flags.http : flags.http === true ? ':8787' : null,
       });
+      break;
+    case 'listen':
+      await cmdListen(flags);
       break;
     case 'memory-retrieve':
       await cmdMemoryRetrieve(flags);
@@ -607,6 +721,9 @@ async function main() {
       console.log('  serve      Run the MCP server exposing the agent tools.');
       console.log('             Default: stdio (Claude Code, Codex, Agents SDK).');
       console.log('             --http [host:port] for HTTP transport (ChatGPT Custom Connector).');
+      console.log('  listen     Open the WS to the IdP, publish an MLS KeyPackage,');
+      console.log('             and receive operator messages into the local inbox.');
+      console.log('             --no-publish-keypackage to skip the publish step.');
       console.log('');
       console.log('provision flags:');
       console.log(

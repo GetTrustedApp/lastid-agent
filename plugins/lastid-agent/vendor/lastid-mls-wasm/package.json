@@ -1,0 +1,12 @@
+{
+  "name": "lastid-mls-wasm",
+  "description": "Minimal openmls 0.7 wrapper packaged as a WASM artifact for the credential-service bot runtime",
+  "version": "0.1.0",
+  "files": [
+    "lastid_mls_wasm_bg.wasm",
+    "lastid_mls_wasm.js",
+    "lastid_mls_wasm.d.ts"
+  ],
+  "main": "lastid_mls_wasm.js",
+  "types": "lastid_mls_wasm.d.ts"
+}
