@@ -650,13 +650,19 @@ async function cmdListen(flags) {
   }
   const idpUrl = loaded.idpUrl ?? env.LASTID_IDP_URL ?? 'https://human.lastid.co';
 
-  const [{ deriveAgentEd25519Keypair }, { MlsClient }, { LastIdWsClient }, { MlsDispatcher }] =
-    await Promise.all([
-      import('./agent-provisioning.js'),
-      import('./mls-client.js'),
-      import('./ws-client.js'),
-      import('./mls-dispatch.js'),
-    ]);
+  const [
+    { deriveAgentEd25519Keypair },
+    { MlsClient },
+    { LastIdWsClient },
+    { MlsDispatcher },
+    { drainOutbox },
+  ] = await Promise.all([
+    import('./agent-provisioning.js'),
+    import('./mls-client.js'),
+    import('./ws-client.js'),
+    import('./mls-dispatch.js'),
+    import('./agent-send.js'),
+  ]);
 
   const { signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed);
   const mls = await MlsClient.open({
@@ -720,12 +726,20 @@ async function cmdListen(flags) {
       wsRef.send(envelope);
     },
   });
+  // WS-open gate for the outbox drain. We only encrypt + send queued
+  // replies while the socket is up; a down socket pauses the drain
+  // so we don't burn MLS message generations into the void. Set true
+  // on every (re)connect, cleared when a send finds the socket gone.
+  let wsOpen = false;
   const ws = new LastIdWsClient({
     idpUrl,
     agentDid: loaded.agentDid,
     vcCompact: loaded.vcCompact,
     signingKey,
-    onOpen: ({ ws_url }) => process.stderr.write(`[lastid-agent] ws connected: ${ws_url}\n`),
+    onOpen: ({ ws_url }) => {
+      wsOpen = true;
+      process.stderr.write(`[lastid-agent] ws connected: ${ws_url}\n`);
+    },
     onEvent: (evt) => dispatcher.onEvent(evt),
     onError: (err) => process.stderr.write(`[lastid-agent] ws error: ${err.message}\n`),
   });
@@ -734,8 +748,41 @@ async function cmdListen(flags) {
   process.stderr.write(`[lastid-agent] listening as ${loaded.agentDid} on ${idpUrl}\n`);
   ws.start();
 
+  // Outbox drain loop. The listener is the single MLS-state writer,
+  // so it is the only process that encrypts + sends. Claude's
+  // `lastid_send_message` tool (a separate MCP process) only appends
+  // to the outbox; we drain it here. Poll (rather than fs.watch) for
+  // portability + simplicity — a 2s reply latency on an agent message
+  // is imperceptible.
+  const OUTBOX_POLL_MS = 2_000;
+  let draining = false;
+  const drainTimer = setInterval(() => {
+    if (!wsOpen || draining) return;
+    draining = true;
+    void drainOutbox({
+      scope,
+      mls,
+      agentDid: loaded.agentDid,
+      send: (frame) => {
+        const ok = ws.send(frame);
+        if (!ok) {
+          wsOpen = false;
+          throw new Error('ws not open');
+        }
+      },
+    })
+      .catch((err) =>
+        process.stderr.write(`[lastid-agent] outbox drain failed: ${err.message}\n`),
+      )
+      .finally(() => {
+        draining = false;
+      });
+  }, OUTBOX_POLL_MS);
+  if (typeof drainTimer.unref === 'function') drainTimer.unref();
+
   const shutdown = () => {
     process.stderr.write('[lastid-agent] shutting down\n');
+    clearInterval(drainTimer);
     ws.stop();
     try { mls.free(); } catch { /* ignore */ }
     exit(0);

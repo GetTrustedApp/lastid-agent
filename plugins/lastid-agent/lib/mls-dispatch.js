@@ -57,6 +57,7 @@ import { Buffer } from 'node:buffer';
 import { mkdir, appendFile, stat, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { recordGroup } from './agent-groups.js';
 
 /**
  * Known application-message types. Mirrors
@@ -195,6 +196,29 @@ export class MlsDispatcher {
       this.#log(
         `[lastid-agent] joined MLS group ${info.group_id_b64} (members=${info.member_count})`,
       );
+
+      // Record the IdP-UUID ↔ openmls-id link + the operator (peer)
+      // DID so the outbound send path can resolve "reply to this
+      // group" later. This is the only place we observe both ids
+      // together — the welcome event carries the IdP UUID, the join
+      // gave us the openmls id.
+      const idpGroupId =
+        typeof event?.payload?.group_id === 'string'
+          ? event.payload.group_id
+          : null;
+      if (idpGroupId) {
+        await recordGroup({
+          scope: this.#scope,
+          idpGroupId,
+          groupIdB64: info.group_id_b64,
+          operatorDid:
+            typeof event?.payload?.inviter_did === 'string'
+              ? event.payload.inviter_did
+              : null,
+        }).catch((err) =>
+          this.#log(`[lastid-agent] recordGroup (welcome) failed: ${err.message}`),
+        );
+      }
 
       // Drain any commits the IdP queued for this specific group
       // BEFORE we joined via the deferred-welcome path. Without this,

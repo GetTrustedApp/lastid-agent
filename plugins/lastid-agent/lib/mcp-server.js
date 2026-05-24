@@ -44,11 +44,75 @@ const PLUGIN_TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'lastid_send_message',
+    description:
+      'Send a message to the human you work with (your operator). The message is end-to-end encrypted and shows up in their LastID chat — console dock and phone. Just provide the text; you do not need to know anything about groups or keys. Returns once the message is queued for delivery.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: {
+          type: 'string',
+          description: 'What you want to say to your operator.',
+        },
+      },
+      required: ['text'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 const PLUGIN_TOOL_NAMES = new Set(PLUGIN_TOOLS.map((t) => t.name));
 
 async function handlePluginTool(name, _args, { scope, loadedAgent }) {
+  if (name === 'lastid_send_message') {
+    const text = typeof _args?.text === 'string' ? _args.text : '';
+    if (!text) {
+      throw new Error('lastid_send_message requires text');
+    }
+    if (!loadedAgent) {
+      throw new Error(
+        'not provisioned — run `lastid-agent provision` before sending messages',
+      );
+    }
+    // Resolve the operator (the agent's parent human) from the VC.
+    // The LLM never sees a DID or a group id — it just says text.
+    const claims = decodeVcClaims(loadedAgent.vcCompact) ?? {};
+    const operatorDid = claims.parent_human_did ?? null;
+    if (!operatorDid) {
+      throw new Error('agent VC has no parent_human_did — cannot resolve operator');
+    }
+    const { resolveActiveGroupForOperator } = await import('./agent-groups.js');
+    const { enqueueSend } = await import('./agent-send.js');
+    const group = await resolveActiveGroupForOperator({ scope, operatorDid });
+    if (!group) {
+      // No conversation yet. Agent-initiated group creation (fetch
+      // the operator's KeyPackage, create + invite) is a follow-up
+      // that must run in the listener (single MLS-state writer) and
+      // needs the create/export/add wrappers on the legacy client.
+      // Until then, the operator opens the chat first.
+      throw new Error(
+        'no active conversation with your operator yet — ask them to open the LastID chat with you first, then reply',
+      );
+    }
+    const id = await enqueueSend({ scope, idpGroupId: group.idpGroupId, text });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              queued: true,
+              request_id: id,
+              note: 'Encrypted + delivered by your listener within a couple seconds. The operator sees it in their console chat and on their phone.',
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
   if (name === 'lastid_whoami') {
     if (!loadedAgent) {
       return {
@@ -114,7 +178,23 @@ async function tryConnectDesktop({ loadedAgent }) {
 
 async function buildServer({ scope }) {
   const server = new Server(SERVER_INFO, {
-    capabilities: { tools: {} },
+    capabilities: {
+      tools: {},
+      // Real-time inbound channel. Declaring this lets us push
+      // `notifications/claude/channel` so an operator message reaches
+      // the agent's session the instant it arrives — even when the
+      // agent is idle and taking no turns of its own. Same mechanism
+      // the iMessage plugin uses. The reply path is the
+      // `lastid_send_message` tool. We authenticate the channel: the
+      // listener only decrypts messages from MLS groups the operator
+      // established, so inbound content is provably from a member.
+      experimental: { 'claude/channel': {} },
+    },
+    instructions: [
+      'Messages from the human you work with arrive as <channel source="lastid-agent" group_id="..." ts="...">. They are end-to-end encrypted MLS group messages your listener decrypted — provably from a member of your group.',
+      '',
+      'To reply, call the `lastid_send_message` tool with just the text. You never handle group ids or keys — the tool resolves the conversation with your operator automatically and will ONLY ever send to your operator. Your transcript output does NOT reach the operator; only `lastid_send_message` does.',
+    ].join('\n'),
   });
 
   // Cached state. Connect once at build time; tools/list re-attempts
@@ -243,11 +323,64 @@ async function buildServer({ scope }) {
   return server;
 }
 
+/**
+ * Tail the operator inbox and push each new message into the session
+ * as a `notifications/claude/channel`. This is the real-time inbound
+ * path: the listener daemon decrypts + appends to the inbox, and this
+ * loop — running inside the long-lived MCP server connected to the
+ * agent's session — pushes it so the agent gets a turn even when
+ * idle. Poll (not fs.watch) for portability; ~2s latency is fine.
+ * Best-effort throughout: a read/parse error logs and the loop keeps
+ * going.
+ */
+function startInboxChannel({ server, scope }) {
+  const POLL_MS = 2_000;
+  let busy = false;
+  const timer = setInterval(() => {
+    if (busy) return;
+    busy = true;
+    void (async () => {
+      try {
+        const { readUnreadMessages } = await import('./agent-inbox.js');
+        const items = await readUnreadMessages({ scope });
+        for (const it of items) {
+          await server.notification({
+            method: 'notifications/claude/channel',
+            params: {
+              // `content` becomes the <channel> body; `source` is set
+              // automatically from the server name (lastid-agent). meta
+              // keys must be identifiers (letters/digits/underscore) —
+              // group_id + ts qualify and become tag attributes.
+              content: it.text,
+              meta: {
+                group_id: it.group_id,
+                ts: it.received_at,
+              },
+            },
+          });
+        }
+      } catch (err) {
+        process.stderr.write(
+          `[lastid-agent] inbox channel push failed: ${err?.message ?? err}\n`,
+        );
+      } finally {
+        busy = false;
+      }
+    })();
+  }, POLL_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
+
 export async function runMcpServer({ scope = 'main', http = null } = {}) {
   const server = await buildServer({ scope });
   if (!http) {
     const transport = new StdioServerTransport();
     await server.connect(transport);
+    // Start the real-time inbound channel only on the stdio transport
+    // — that's the one bound to an interactive agent session that can
+    // receive pushed notifications.
+    startInboxChannel({ server, scope });
     return;
   }
   const [hostIn, portIn] = http.split(':');

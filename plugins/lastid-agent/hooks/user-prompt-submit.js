@@ -68,6 +68,12 @@ if (result.error || result.status !== 0) {
   process.exit(0);
 }
 
+// NOTE: inbound operator chat messages are NOT surfaced here. A
+// UserPromptSubmit hook only fires when the agent's own human takes
+// a turn — useless for an idle agent waiting on a message. Real-time
+// delivery is the MCP server's `notifications/claude/channel` push
+// (see lib/mcp-server.js + lib/agent-inbox.js), the same mechanism
+// the iMessage plugin uses. This hook stays memory-only.
 const packetMarkdown = (result.stdout ?? '').trim();
 if (packetMarkdown.length === 0) {
   // Nothing to inject this turn.
