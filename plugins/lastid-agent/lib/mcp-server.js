@@ -22,7 +22,7 @@ import {
 import { DesktopMcpClient } from './desktop-mcp-client.js';
 import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
 import { loadAgentVc } from './keychain.js';
-import { decodeVcClaims } from './vc-claims.js';
+import { decodeVcClaims, hasCapability } from './vc-claims.js';
 import {
   parseApprovalRequiredResult,
   runApprovalLoop,
@@ -33,11 +33,19 @@ const SERVER_INFO = {
   version: '0.1.0',
 };
 
+// Each plugin tool carries a `requiredCapability` annotation: the
+// exact { resource, action } pair the agent's VC must grant for the
+// call to run. A null annotation means "no capability required" (e.g.
+// reading your own identity). The dispatcher enforces this centrally
+// — the tool body never has to re-check, and the LLM never gets to
+// decide whether it "has" a capability. Add a tool, declare what it
+// needs here, and enforcement is automatic.
 const PLUGIN_TOOLS = [
   {
     name: 'lastid_whoami',
     description:
       'Return the agent identity provisioned for this host: agent DID, parent human DID, capabilities, expiry. Returns { provisioned: false } when no agent credential is present.',
+    requiredCapability: null, // reading your own card needs nothing
     inputSchema: {
       type: 'object',
       properties: {},
@@ -48,6 +56,7 @@ const PLUGIN_TOOLS = [
     name: 'lastid_send_message',
     description:
       'Send a message to the human you work with (your operator). The message is end-to-end encrypted and shows up in their LastID chat — console dock and phone. Just provide the text; you do not need to know anything about groups or keys. Returns once the message is queued for delivery.',
+    requiredCapability: { resource: 'message:send', action: 'Send' },
     inputSchema: {
       type: 'object',
       properties: {
@@ -63,21 +72,60 @@ const PLUGIN_TOOLS = [
 ];
 
 const PLUGIN_TOOL_NAMES = new Set(PLUGIN_TOOLS.map((t) => t.name));
+const PLUGIN_TOOL_CAPS = new Map(
+  PLUGIN_TOOLS.map((t) => [t.name, t.requiredCapability ?? null]),
+);
+
+/**
+ * Central capability gate. Throws if the tool declares a
+ * `requiredCapability` the agent's VC doesn't grant. Called before any
+ * plugin tool body runs, so authorization is enforced in one place by
+ * code — not by the model's judgement.
+ */
+function enforceToolCapability(name, claims, loadedAgent) {
+  const required = PLUGIN_TOOL_CAPS.get(name) ?? null;
+  if (!required) return; // tool needs no capability
+  if (!loadedAgent) {
+    throw new Error(
+      `not provisioned — run \`lastid-agent provision\` before using '${name}'`,
+    );
+  }
+  if (hasCapability(claims, required.resource, required.action)) {
+    process.stderr.write(
+      `[lastid-agent] capability ok: '${name}' → ${required.action} ` +
+        `on '${required.resource}'\n`,
+    );
+    return;
+  }
+  const granted = Array.isArray(claims?.capabilities)
+    ? claims.capabilities.map((c) => c?.resource).filter(Boolean).join(', ')
+    : '(none)';
+  process.stderr.write(
+    `[lastid-agent] capability DENIED: '${name}' needs ${required.action} ` +
+      `on '${required.resource}'; granted: ${granted}\n`,
+  );
+  throw new Error(
+    `capability denied: '${name}' requires ${required.action} on ` +
+      `'${required.resource}', which this agent credential does not grant. ` +
+      `Granted resources: ${granted}.`,
+  );
+}
 
 async function handlePluginTool(name, _args, { scope, loadedAgent }) {
+  // Decode the VC once, then run the authoritative capability gate
+  // before any tool body. Authorization lives here, in code, driven by
+  // each tool's `requiredCapability` annotation — never by the model.
+  const claims = loadedAgent ? (decodeVcClaims(loadedAgent.vcCompact) ?? {}) : {};
+  enforceToolCapability(name, claims, loadedAgent);
+
   if (name === 'lastid_send_message') {
     const text = typeof _args?.text === 'string' ? _args.text : '';
     if (!text) {
       throw new Error('lastid_send_message requires text');
     }
-    if (!loadedAgent) {
-      throw new Error(
-        'not provisioned — run `lastid-agent provision` before sending messages',
-      );
-    }
     // Resolve the operator (the agent's parent human) from the VC.
     // The LLM never sees a DID or a group id — it just says text.
-    const claims = decodeVcClaims(loadedAgent.vcCompact) ?? {};
+    // (loadedAgent + message:send already verified by the gate above.)
     const operatorDid = claims.parent_human_did ?? null;
     if (!operatorDid) {
       throw new Error('agent VC has no parent_human_did — cannot resolve operator');
@@ -127,7 +175,7 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
         ],
       };
     }
-    const claims = decodeVcClaims(loadedAgent.vcCompact) ?? {};
+    // Reuse the claims decoded at the top of the dispatcher.
     return {
       content: [
         {

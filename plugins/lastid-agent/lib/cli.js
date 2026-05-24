@@ -739,6 +739,15 @@ async function cmdListen(flags) {
     onOpen: ({ ws_url }) => {
       wsOpen = true;
       process.stderr.write(`[lastid-agent] ws connected: ${ws_url}\n`);
+      // Replay-on-connect: drain whatever the IdP queued for each of
+      // our groups while this listener was offline. Without this, a
+      // message sent while we were down stays in the IdP queue and the
+      // agent never sees it. Fire-and-forget; it logs its own progress.
+      void dispatcher.fetchQueues().catch((err) =>
+        process.stderr.write(
+          `[lastid-agent] fetchQueues on connect failed: ${err?.message ?? err}\n`,
+        ),
+      );
     },
     onEvent: (evt) => dispatcher.onEvent(evt),
     onError: (err) => process.stderr.write(`[lastid-agent] ws error: ${err.message}\n`),

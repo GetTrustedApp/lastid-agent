@@ -23,3 +23,26 @@ export function decodeVcClaims(vcCompact) {
     return null;
   }
 }
+
+/**
+ * True iff the VC claims grant `action` on `resource`.
+ *
+ * Capability shape (matches `lastid_whoami` output and the IdP's
+ * issued VC):
+ *   { resource: "message:send", actions: ["Send"], constraints: [] }
+ *
+ * Matching is exact on both resource and action — no wildcards, no
+ * substring matches. An agent that wasn't issued the capability is
+ * refused, full stop. This is the authoritative gate; the LLM does
+ * not get to decide whether it "has" a capability.
+ */
+export function hasCapability(claims, resource, action) {
+  const caps = Array.isArray(claims?.capabilities) ? claims.capabilities : [];
+  return caps.some(
+    (c) =>
+      c &&
+      c.resource === resource &&
+      Array.isArray(c.actions) &&
+      c.actions.includes(action),
+  );
+}

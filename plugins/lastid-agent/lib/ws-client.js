@@ -194,19 +194,17 @@ export class LastIdWsClient {
     ws.on('open', () => {
       this.#state = 'open';
       this.#attempt = 0;
+      // The caller's onOpen drives replay-on-connect (a per-group
+      // `group_chat.fetch_queue` via the dispatcher). We do NOT send a
+      // group_id-less fetch here — the IdP requires a group_id per
+      // queue (handleFetchQueue warns + no-ops without one), so the old
+      // payload-less fetch never drained anything. sender_did is
+      // injected server-side from the authenticated connection.
       try {
         this.#opts.onOpen?.({ ws_url: wsUrl });
       } catch (err) {
         process.stderr.write(`[lastid-agent] ws onOpen handler threw: ${err.message}\n`);
       }
-      // Drain anything the IdP queued for us while we were offline.
-      // This is the global queue (no group_id) — once the IdP fans
-      // those frames back we discover any groups that need a
-      // per-group drain via the welcome handler's own follow-up.
-      this.send({
-        type: 'group_chat.fetch_queue',
-        payload: {},
-      });
       this.#startHeartbeat();
     });
 

@@ -57,7 +57,7 @@ import { Buffer } from 'node:buffer';
 import { mkdir, appendFile, stat, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { recordGroup } from './agent-groups.js';
+import { recordGroup, listGroups } from './agent-groups.js';
 
 /**
  * Known application-message types. Mirrors
@@ -174,11 +174,93 @@ export class MlsDispatcher {
         case 'group_chat.dissolved':
           await this.#handleDissolved(event);
           return;
+        case 'group_chat.queue_batch':
+          await this.#handleQueueBatch(event);
+          return;
         default:
           await this.#defensiveMlsRoute(event);
       }
     } catch (err) {
       this.#log(`[lastid-agent] dispatch ${type} threw: ${err?.message ?? err}`);
+    }
+  }
+
+  /**
+   * Replay-on-connect. For every group we've recorded (groups.json),
+   * ask the IdP for the messages it queued while this listener was
+   * offline (`group_chat.fetch_queue` → `group_chat.queue_batch`,
+   * handled below). The frame carries only the group_id — the IdP
+   * injects the authenticated sender_did from the connection, so no
+   * DID goes on the wire. Call from the WS `onOpen`.
+   */
+  async fetchQueues() {
+    if (!this.#requestSend) return;
+    let groups = [];
+    try {
+      groups = await listGroups({ scope: this.#scope });
+    } catch (err) {
+      this.#log(`[lastid-agent] fetchQueues listGroups failed: ${err?.message ?? err}`);
+      return;
+    }
+    this.#log(
+      `[lastid-agent] fetch_queue on connect for ${groups.length} group(s)`,
+    );
+    for (const g of groups) {
+      if (!g || typeof g.idpGroupId !== 'string') continue;
+      this.#requestSend({
+        type: 'group_chat.fetch_queue',
+        payload: { group_id: g.idpGroupId, limit: 200 },
+      });
+    }
+  }
+
+  /**
+   * Process a `group_chat.queue_batch` — the offline messages the IdP
+   * held for us. Each entry is a queued group_chat.* event; replay it
+   * through `onEvent` as if it just arrived live (commits advance the
+   * ratchet before messages encrypted at that epoch; application
+   * messages land in the inbox), then ACK the group so the IdP clears
+   * the queue and doesn't replay on the next connect.
+   */
+  async #handleQueueBatch(event) {
+    const payload = event?.payload ?? {};
+    const groupId = typeof payload.group_id === 'string' ? payload.group_id : null;
+    const messages = Array.isArray(payload.messages) ? payload.messages : [];
+    this.#log(
+      `[lastid-agent] queue_batch group=${groupId ?? '?'} ` +
+        `count=${messages.length} total=${payload.total_queued ?? '?'} ` +
+        `has_more=${payload.has_more === true}`,
+    );
+    let handled = 0;
+    for (const m of messages) {
+      if (!m || typeof m !== 'object') continue;
+      const mtype = typeof m.type === 'string' ? m.type : null;
+      if (!mtype) continue;
+      // Queued events may nest fields under `payload` or carry them
+      // flat at top level — accept both.
+      const inner = m.payload && typeof m.payload === 'object' ? m.payload : m;
+      try {
+        await this.onEvent({ type: mtype, payload: inner });
+        handled += 1;
+      } catch (err) {
+        this.#log(
+          `[lastid-agent] queue_batch replay of ${mtype} threw: ${err?.message ?? err}`,
+        );
+      }
+    }
+    if (groupId && this.#requestSend) {
+      this.#requestSend({
+        type: 'group_chat.ack_queue',
+        payload: { group_id: groupId, all: true },
+      });
+      this.#log(`[lastid-agent] queue_batch acked group=${groupId} replayed=${handled}`);
+    }
+    // If the IdP capped the batch, immediately page the rest.
+    if (payload.has_more === true && groupId && this.#requestSend) {
+      this.#requestSend({
+        type: 'group_chat.fetch_queue',
+        payload: { group_id: groupId, limit: 200 },
+      });
     }
   }
 
@@ -241,6 +323,21 @@ export class MlsDispatcher {
   // --- Application message ------------------------------------------------
 
   async #handleMessage(event) {
+    // Skip our own messages echoed back. The IdP normally excludes the
+    // sending connection from fan-out, but a second connection or a
+    // queue replay can still hand us a message we authored — openmls
+    // can't decrypt its own ciphertext (CannotDecryptOwnMessage, which
+    // surfaced as the `processInbound failed: undefined` noise), and
+    // attempting it could disturb the ratchet. Drop it cleanly.
+    const senderDid =
+      typeof event?.payload?.sender_did === 'string' ? event.payload.sender_did : null;
+    if (
+      senderDid &&
+      typeof this.#mls.agentDid === 'string' &&
+      senderDid === this.#mls.agentDid
+    ) {
+      return;
+    }
     const mlsMessageB64 = pickPayloadString(event?.payload, FIELD_ALIASES.message);
     if (!mlsMessageB64) {
       this.#log('[lastid-agent] message event missing mls_message; ignoring');
