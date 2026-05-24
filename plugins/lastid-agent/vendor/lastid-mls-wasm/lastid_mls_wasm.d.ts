@@ -137,10 +137,108 @@ export class BotMlsClient {
 }
 
 /**
+ * Durable MLS client. Constructed via the async
+ * [`createPersistentBotClient`] free function below; this opaque
+ * handle wraps the client + its backing `IndexedDbRawKv` so each
+ * state-mutating method can await a flush before returning.
+ */
+export class PersistentBotMlsClient {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Add a peer to an existing group. Returns JSON
+     * `AddMemberResult`.
+     */
+    addMember(group_id_b64: string, key_package_b64: string): Promise<string>;
+    /**
+     * Commit every pending queued proposal.
+     */
+    commitPendingProposals(group_id_b64: string): Promise<string>;
+    /**
+     * Author a fresh group with this client as sole creator.
+     * Returns JSON `JoinedGroupInfo`.
+     */
+    createGroup(group_id_b64: string): Promise<string>;
+    /**
+     * Destroy a group. Returns JSON `DestroyGroupResult`.
+     */
+    destroyGroup(group_id_b64: string, farewell_plaintext_b64: string): Promise<string>;
+    /**
+     * Encrypt an application message in `group_id_b64`. Plaintext
+     * is passed as base64. Returns base64 of the wire payload.
+     */
+    encryptApplicationMessage(group_id_b64: string, plaintext_b64: string): Promise<string>;
+    /**
+     * Explicit flush — drain the pending queue without doing
+     * any new MLS op first. Useful when JS wants to be defensive
+     * (e.g. before a tab-close handler) or to drain any tail
+     * queue from a prior method that bailed before its own
+     * flush completed. Idempotent — no-op when queue is empty.
+     */
+    flushPending(): Promise<void>;
+    /**
+     * Wipe local state for a dissolved group. Idempotent.
+     */
+    forgetGroup(group_id_b64: string): Promise<void>;
+    /**
+     * Generate a fresh KeyPackage. Returns the base64-encoded
+     * TLS-serialized KeyPackage. Awaits IDB flush before
+     * resolving so the private credentials openmls just minted
+     * are durable before JS sees the KeyPackage bytes (and
+     * before the caller publishes them to the IdP).
+     */
+    generateKeyPackage(): Promise<string>;
+    /**
+     * Current MLS epoch for the named group. Read-only — no
+     * flush needed.
+     */
+    groupEpoch(group_id_b64: string): bigint;
+    /**
+     * Process an inbound MLS message. Returns JSON
+     * `InboundResult` — see Rust-side docs for the schema.
+     */
+    processInbound(message_b64: string): Promise<string>;
+    /**
+     * Process an MLS Welcome and join the new group.
+     */
+    processWelcome(welcome_b64: string): Promise<string>;
+    /**
+     * Remove a member by leaf index. Returns JSON `CommitResult`.
+     */
+    removeMember(group_id_b64: string, member_leaf_index: number): Promise<string>;
+    /**
+     * Discard a locally-prepared-but-not-yet-published commit.
+     */
+    rollbackPendingCommit(group_id_b64: string): Promise<void>;
+    /**
+     * Rotate this client's own leaf without changing membership.
+     */
+    selfUpdate(group_id_b64: string): Promise<string>;
+    /**
+     * Bot DID this handle is bound to.
+     */
+    readonly botDid: string;
+}
+
+/**
  * Returns a JSON-serialized [`CiphersuiteSupportReport`]. Useful as a smoke
  * test from the credential-service test harness.
  */
 export function ciphersuiteSupportJson(): string;
+
+/**
+ * Open or rehydrate a persistent MLS client for `bot_did`. If
+ * IndexedDB has prior `mls_kv` rows for this scope they are
+ * loaded into the in-mem cache; if not, the client starts
+ * fresh. Either way, every subsequent op writes through to
+ * IndexedDB inside an atomic flush before the Promise resolves.
+ *
+ * The same bot_did calling this twice returns two independent
+ * handles sharing IDB state — useful for tests, an antipattern
+ * in production (one client per bot_did per tab).
+ */
+export function createPersistentBotClient(bot_did: string): Promise<PersistentBotMlsClient>;
 
 /**
  * Install a panic hook that pipes Rust panics to the JS console. Call once.
