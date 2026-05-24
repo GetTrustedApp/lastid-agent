@@ -199,6 +199,37 @@ export class MlsClient {
   }
 
   /**
+   * Wipe local MlsGroup state for a dissolved group. Idempotent —
+   * absent group is a no-op. Subsequent `processInbound` for the
+   * same group_id surfaces `GroupNotFound`, which the dispatcher
+   * treats as "drop silently".
+   */
+  forgetGroup(groupIdB64) {
+    this.#handle.forgetGroup(groupIdB64);
+  }
+
+  /**
+   * Issue a commit covering every pending proposal openmls has
+   * queued locally for this group. Triggered when the IdP
+   * designates this agent as the new committer via
+   * `group_chat.proposal_reassigned`. Returns JSON `CommitResult`
+   * ({ commit_b64, new_epoch }); caller broadcasts the commit
+   * via POST /v1/groups/:id/commits so peers can advance.
+   */
+  commitPendingProposals(groupIdB64) {
+    return JSON.parse(this.#handle.commitPendingProposals(groupIdB64));
+  }
+
+  /**
+   * Discard any locally-prepared-but-not-yet-published commit.
+   * Called when committer authority is reassigned away from us so
+   * the stale pending commit doesn't sit in storage forever.
+   */
+  rollbackPendingCommit(groupIdB64) {
+    this.#handle.rollbackPendingCommit(groupIdB64);
+  }
+
+  /**
    * Serialize + seal current state to disk. Call after every
    * mutating op (generateKeyPackage / processWelcome /
    * processInbound that landed a commit). Cheap (~few ms on small

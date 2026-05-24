@@ -695,25 +695,41 @@ async function cmdListen(flags) {
     }
   }
 
-  const dispatcher = new MlsDispatcher({ mls, scope });
+  // Forward dispatcher-originated frames (per-group fetch_queue,
+  // committer reassignment commits) through the WS once it's open.
+  // The cycle (dispatcher → ws.send → ws → dispatcher.onEvent) is
+  // broken because each leg is async; no recursion concerns.
+  let wsRef;
+  const dispatcher = new MlsDispatcher({
+    mls,
+    scope,
+    requestSend: (frame) => {
+      if (!wsRef) return;
+      // The WS handler normalizes top-level envelope vs payload, so
+      // send the dispatcher's events with the canonical shape.
+      const envelope = {
+        type: frame.type,
+        correlation_id:
+          typeof globalThis.crypto?.randomUUID === 'function'
+            ? globalThis.crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        timestamp: new Date().toISOString(),
+        target: { kind: 'self' },
+        payload: frame.payload ?? {},
+      };
+      wsRef.send(envelope);
+    },
+  });
   const ws = new LastIdWsClient({
     idpUrl,
     agentDid: loaded.agentDid,
     vcCompact: loaded.vcCompact,
     signingKey,
     onOpen: ({ ws_url }) => process.stderr.write(`[lastid-agent] ws connected: ${ws_url}\n`),
-    onWelcome: (evt) => {
-      dispatcher.onWelcome(evt).catch((err) =>
-        process.stderr.write(`[lastid-agent] onWelcome threw: ${err.message}\n`),
-      );
-    },
-    onMessage: (evt) => {
-      dispatcher.onMessage(evt).catch((err) =>
-        process.stderr.write(`[lastid-agent] onMessage threw: ${err.message}\n`),
-      );
-    },
+    onEvent: (evt) => dispatcher.onEvent(evt),
     onError: (err) => process.stderr.write(`[lastid-agent] ws error: ${err.message}\n`),
   });
+  wsRef = ws;
 
   process.stderr.write(`[lastid-agent] listening as ${loaded.agentDid} on ${idpUrl}\n`);
   ws.start();

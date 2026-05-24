@@ -1,13 +1,30 @@
 /**
- * Application-message dispatch.
+ * Application-message dispatch — parity with the bot subscriber at
+ * `lastid-idp/packages/credential-service/src/mls/bot-mls-subscriber.ts`.
  *
- * The WS client (`ws-client.js`) hands us raw inbound events. For
- * `group_chat.welcome` we feed the wrapped MLS Welcome into the
- * MlsClient and persist. For `group_chat.message` we decrypt via MLS
- * and write the inner application envelope to a local inbox JSONL
- * file the agent owns. Hooks (PreToolUse, UserPromptSubmit) read
- * from the inbox when they want recent operator state; nothing else
- * is required to be running.
+ * The WS client (`ws-client.js`) hands us raw inbound events; this
+ * module owns:
+ *
+ *   - The full set of `group_chat.*` event handlers (welcome,
+ *     message, commit, proposal, membership_change,
+ *     proposal_reassigned, proposal_ack_confirmed, dissolved).
+ *   - Defensive routing for unknown event types that happen to
+ *     carry an `mls_*` payload — we'd rather pay one extra
+ *     processInbound than silently lose an epoch-advancing commit
+ *     to a future IdP event type the plugin doesn't know yet.
+ *   - Persistence after every state-mutating op. Skipping a
+ *     persist drops the bot's pending KeyPackage credentials,
+ *     commits, or proposal store on the next restart.
+ *   - Application-envelope inbox: decrypted `operator.*` messages
+ *     land in `~/.lastid-agent/<scope>/operator-inbox.jsonl` for
+ *     hooks (PreToolUse, UserPromptSubmit) to read.
+ *
+ * Inbound serialization is enforced by `ws-client.js` — each
+ * inbound event chains onto the previous, so welcome + commit
+ * arriving back-to-back are processed in order. Without that,
+ * the bot hit a prod race at 2026-05-20T03:00 where a message's
+ * decrypt raced the welcome's group-join. Same bug shape applies
+ * here; same fix.
  *
  * Inner envelope shape (matches IdP's `MLS_APPLICATION_EVENT_TYPE`
  * vocabulary in `models/websocket/mls-application-event-types.ts`):
@@ -22,7 +39,7 @@
  * Persistence:
  *   ~/.lastid-agent/<scope>/operator-inbox.jsonl
  *
- * One JSON object per line, appended. The line shape is:
+ * One JSON object per line, appended. Shape:
  *
  *   {
  *     "received_at": <ISO-8601 from local clock>,
@@ -30,20 +47,10 @@
  *     "envelope": { … the decrypted inner JSON … }
  *   }
  *
- * The file is rotated when it crosses 1 MB — the old file is renamed
- * to `operator-inbox.jsonl.1`; older rolls are not kept (we trade
- * deep history for predictable disk usage; MLS group state remains
- * authoritative on the IdP and is replayable). Rotation is best-
- * effort; a failure to rotate is logged and we keep appending.
- *
- * Why a local file rather than the desktop MCP:
- *
- *   The desktop wallet is an *optional* sidecar. Many operators will
- *   run the agent on a headless host (CI, server, container) where
- *   no desktop wallet is present. The agent has to be able to
- *   receive + retain operator state on its own. The desktop, when it
- *   IS running, has its own MLS connection to the same group — it
- *   does not need the plugin to forward.
+ * Rotated when > 1 MB; the prior roll is kept as
+ * `operator-inbox.jsonl.1`. MLS group state remains authoritative
+ * on the IdP and is replayable, so we trade deep history for
+ * predictable disk usage.
  */
 
 import { Buffer } from 'node:buffer';
@@ -56,9 +63,9 @@ import { homedir } from 'node:os';
  * `MLS_APPLICATION_EVENT_TYPE` in lastid-idp. Kept inline so the
  * plugin can dispatch without a shared package dependency; the IdP
  * is the canonical source of truth and rejects unknown types at
- * intake. Unknown types are still persisted — we'd rather keep the
- * message than drop it because the plugin is one rev behind the
- * IdP's vocabulary.
+ * intake. Unknown types are still persisted to the inbox — we'd
+ * rather keep the message than drop it because the plugin is one
+ * rev behind the IdP's vocabulary.
  */
 export const APP_MESSAGE_TYPES = Object.freeze({
   OPERATOR_MEMORY_WRITE: 'operator.memory.write',
@@ -76,60 +83,149 @@ function inboxPath(scope) {
 }
 
 /**
+ * String fields we accept as the MLS wire payload on each event.
+ * The IdP's canonical names are `mls_welcome` / `mls_message` /
+ * `mls_commit` (see lastid-idp/src/api/websocket/handlers/group-chat-handler.ts).
+ * We accept the legacy variants too in case an older IdP / test
+ * fixture is in play; the handler doesn't care which key the
+ * sender used.
+ */
+const FIELD_ALIASES = Object.freeze({
+  welcome: ['mls_welcome', 'welcome_b64'],
+  message: ['mls_message', 'mls_b64'],
+  commit: ['mls_commit', 'commit_b64'],
+  proposal: ['mls_proposal', 'proposal_b64'],
+});
+
+function pickPayloadString(payload, aliases) {
+  if (!payload || typeof payload !== 'object') return null;
+  for (const key of aliases) {
+    const v = payload[key];
+    if (typeof v === 'string' && v.length > 0) return v;
+  }
+  return null;
+}
+
+/**
  * @typedef {Object} DispatcherOptions
  * @property {import('./mls-client.js').MlsClient} mls
  * @property {string} [scope]   Defaults to 'main'.
  * @property {(line: string) => void} [log]   Defaults to stderr.
+ * @property {(event: object) => void} [requestSend]
+ *   Optional callback the dispatcher uses to ask the WS layer to
+ *   send a frame on its behalf — currently used to request a
+ *   per-group `group_chat.fetch_queue` right after a welcome so
+ *   any commits the IdP queued before we joined drain before the
+ *   next inbound message arrives. Without this the customer's
+ *   next message at epoch N+1 trips WrongEpoch (the exact race the
+ *   bot hit in prod — see bot-mls-subscriber.ts handleWelcome).
  */
 
 export class MlsDispatcher {
   #mls;
   #scope;
   #log;
+  #requestSend;
 
   /** @param {DispatcherOptions} opts */
-  constructor({ mls, scope = 'main', log }) {
+  constructor({ mls, scope = 'main', log, requestSend }) {
     this.#mls = mls;
     this.#scope = scope;
     this.#log = log ?? ((line) => process.stderr.write(`${line}\n`));
+    this.#requestSend = requestSend;
   }
 
   /**
-   * Handle a `group_chat.welcome` event. The MLS Welcome is in
-   * `event.payload.welcome_b64`. Adds this agent to the group.
+   * Entry point the WS layer calls for every inbound event. Inbound
+   * serialization (welcome-then-message ordering) is enforced by
+   * the caller via a Promise chain; this method only needs to be
+   * async — concurrent calls remain a programmer error.
    */
-  async onWelcome(event) {
-    const welcomeB64 = event?.payload?.welcome_b64;
-    if (typeof welcomeB64 !== 'string') {
-      this.#log('[lastid-agent] welcome event missing payload.welcome_b64; ignoring');
+  async onEvent(event) {
+    const type = typeof event?.type === 'string' ? event.type : null;
+    if (!type) {
+      this.#log('[lastid-agent] inbound event missing type; ignoring');
+      return;
+    }
+    try {
+      switch (type) {
+        case 'group_chat.welcome':
+          await this.#handleWelcome(event);
+          return;
+        case 'group_chat.message':
+          await this.#handleMessage(event);
+          return;
+        case 'group_chat.commit':
+          await this.#handleCommit(event);
+          return;
+        case 'group_chat.proposal':
+          await this.#handleProposal(event);
+          return;
+        case 'group_chat.membership_change':
+          await this.#handleMembershipChange(event);
+          return;
+        case 'group_chat.proposal_reassigned':
+          await this.#handleProposalReassigned(event);
+          return;
+        case 'group_chat.proposal_ack_confirmed':
+          this.#handleProposalAckConfirmed(event);
+          return;
+        case 'group_chat.dissolved':
+          await this.#handleDissolved(event);
+          return;
+        default:
+          await this.#defensiveMlsRoute(event);
+      }
+    } catch (err) {
+      this.#log(`[lastid-agent] dispatch ${type} threw: ${err?.message ?? err}`);
+    }
+  }
+
+  // --- Welcome ------------------------------------------------------------
+
+  async #handleWelcome(event) {
+    const welcomeB64 = pickPayloadString(event?.payload, FIELD_ALIASES.welcome);
+    if (!welcomeB64) {
+      this.#log('[lastid-agent] welcome event missing mls_welcome; ignoring');
       return;
     }
     try {
       const info = this.#mls.processWelcome(welcomeB64);
       await this.#mls.persist();
       this.#log(
-        `[lastid-agent] joined MLS group ${info.group_id_b64} (members=${info.member_count} epoch=${info.epoch})`,
+        `[lastid-agent] joined MLS group ${info.group_id_b64} (members=${info.member_count})`,
       );
+
+      // Drain any commits the IdP queued for this specific group
+      // BEFORE we joined via the deferred-welcome path. Without this,
+      // a customer/operator self-update at epoch N+1 that arrived
+      // while we were not yet a member sits in the per-group queue
+      // forever, and the next live message at epoch N+1 trips
+      // WrongEpoch. Mirrors bot-mls-subscriber.ts:765-779.
+      const groupIdRaw = event?.payload?.group_id;
+      if (typeof groupIdRaw === 'string' && groupIdRaw.length > 0 && this.#requestSend) {
+        this.#requestSend({
+          type: 'group_chat.fetch_queue',
+          payload: { group_id: groupIdRaw },
+        });
+      }
     } catch (err) {
       this.#log(`[lastid-agent] processWelcome failed: ${err.message}`);
     }
   }
 
-  /**
-   * Handle a `group_chat.message` event. The MLS application message
-   * is in `event.payload.mls_b64`. We decrypt, then write the inner
-   * envelope to the agent's local inbox.
-   */
-  async onMessage(event) {
-    const mlsB64 = event?.payload?.mls_b64;
-    if (typeof mlsB64 !== 'string') {
-      this.#log('[lastid-agent] message event missing payload.mls_b64; ignoring');
+  // --- Application message ------------------------------------------------
+
+  async #handleMessage(event) {
+    const mlsMessageB64 = pickPayloadString(event?.payload, FIELD_ALIASES.message);
+    if (!mlsMessageB64) {
+      this.#log('[lastid-agent] message event missing mls_message; ignoring');
       return;
     }
 
     let inbound;
     try {
-      inbound = this.#mls.processInbound(mlsB64);
+      inbound = this.#mls.processInbound(mlsMessageB64);
     } catch (err) {
       this.#log(`[lastid-agent] processInbound failed: ${err.message}`);
       return;
@@ -141,22 +237,27 @@ export class MlsDispatcher {
       this.#log(`[lastid-agent] mls persist after inbound failed: ${err.message}`);
     }
 
-    // Commits / proposals come back without an application payload —
-    // they only mutate MLS group state, which the persist() above
-    // already captured.
-    const appB64 = inbound?.application_b64;
-    if (typeof appB64 !== 'string') return;
+    // Non-application inbound (commit, proposal, external) only
+    // mutated MLS group state — already captured by the persist
+    // above. No envelope to write to the inbox.
+    if (inbound?.kind !== 'application') return;
+
+    // Wasm returns `plaintext_b64`. (The previous version of this
+    // file read `application_b64`, which never matched — so all
+    // operator messages were silently dropped before this fix.)
+    const plaintextB64 = inbound?.plaintext_b64;
+    if (typeof plaintextB64 !== 'string') return;
 
     let envelope;
     try {
-      envelope = JSON.parse(Buffer.from(appB64, 'base64').toString('utf-8'));
+      envelope = JSON.parse(Buffer.from(plaintextB64, 'base64').toString('utf-8'));
     } catch (err) {
       this.#log(`[lastid-agent] application payload not JSON: ${err.message}`);
       return;
     }
 
     const type = typeof envelope?.type === 'string' ? envelope.type : '(missing)';
-    const groupId = event?.payload?.group_id_b64 ?? '?';
+    const groupId = event?.payload?.group_id_b64 ?? event?.payload?.group_id ?? '?';
     await this.#appendInbox({
       received_at: new Date().toISOString(),
       group_id_b64: groupId,
@@ -164,6 +265,194 @@ export class MlsDispatcher {
     });
     this.#log(`[lastid-agent] inbox: ${type} (group=${groupId})`);
   }
+
+  // --- Commit -------------------------------------------------------------
+
+  async #handleCommit(event) {
+    const mlsCommitB64 = pickPayloadString(event?.payload, FIELD_ALIASES.commit);
+    if (!mlsCommitB64) {
+      this.#log('[lastid-agent] commit event missing mls_commit; ignoring');
+      return;
+    }
+    try {
+      this.#mls.processInbound(mlsCommitB64);
+      await this.#mls.persist();
+    } catch (err) {
+      const msg = err?.message ?? String(err);
+      // A commit referencing a group we already forgot (dissolved
+      // path, or membership removal that wiped us) surfaces as
+      // GroupNotFound. Same posture the bot takes — silent drop.
+      if (msg.includes('GroupNotFound') || msg.includes('group_not_found')) {
+        return;
+      }
+      this.#log(`[lastid-agent] commit processing failed: ${msg}`);
+    }
+  }
+
+  // --- Proposal -----------------------------------------------------------
+
+  async #handleProposal(event) {
+    const mlsProposalB64 = pickPayloadString(event?.payload, FIELD_ALIASES.proposal);
+    if (!mlsProposalB64) {
+      this.#log('[lastid-agent] proposal event missing mls_proposal; ignoring');
+      return;
+    }
+    try {
+      this.#mls.processInbound(mlsProposalB64);
+      await this.#mls.persist();
+    } catch (err) {
+      this.#log(`[lastid-agent] proposal processing failed: ${err.message}`);
+    }
+  }
+
+  // --- Membership change --------------------------------------------------
+
+  /**
+   * The IdP emits this when a member is added or removed; the
+   * underlying MLS commit that carried the change already arrived
+   * separately as `group_chat.commit` and mutated our state. This
+   * event is purely informational — log it so audits can correlate
+   * the public membership view with the in-band commit, but don't
+   * try to re-apply.
+   */
+  async #handleMembershipChange(event) {
+    const payload = event?.payload ?? {};
+    this.#log(
+      `[lastid-agent] membership change group=${payload.group_id ?? '?'} ` +
+        `kind=${payload.change_kind ?? '?'} member=${payload.member_did ?? '?'}`,
+    );
+  }
+
+  // --- Proposal reassigned (we are / are not the new committer) -----------
+
+  /**
+   * IdP designates a new committer after the prior one went away
+   * without committing. If the new committer is us, drain every
+   * pending proposal openmls has queued for the group into a single
+   * commit and broadcast it. Otherwise we are no longer authorized
+   * to commit — discard our locally-prepared pending commit so it
+   * doesn't sit in storage forever and shadow the real one.
+   *
+   * Mirrors bot-mls-subscriber.ts:1505-1565.
+   */
+  async #handleProposalReassigned(event) {
+    const payload = event?.payload ?? {};
+    const groupIdB64 = payload.group_id_b64 ?? payload.group_id;
+    const newCommitterDid = payload.new_committer_did;
+    const meIsCommitter =
+      typeof newCommitterDid === 'string' &&
+      typeof this.#mls.agentDid === 'string' &&
+      newCommitterDid === this.#mls.agentDid;
+
+    if (!groupIdB64) {
+      this.#log('[lastid-agent] proposal_reassigned missing group_id; ignoring');
+      return;
+    }
+
+    try {
+      if (meIsCommitter) {
+        const result = this.#mls.commitPendingProposals(groupIdB64);
+        await this.#mls.persist();
+        this.#log(
+          `[lastid-agent] committed pending proposals group=${groupIdB64} ` +
+            `new_epoch=${result?.new_epoch ?? '?'}`,
+        );
+        if (this.#requestSend && typeof result?.commit_b64 === 'string') {
+          this.#requestSend({
+            type: 'group_chat.commit',
+            payload: {
+              group_id: groupIdB64,
+              mls_commit: result.commit_b64,
+              epoch: result.new_epoch,
+            },
+          });
+        }
+      } else {
+        this.#mls.rollbackPendingCommit(groupIdB64);
+        await this.#mls.persist();
+        this.#log(
+          `[lastid-agent] rolled back pending commit group=${groupIdB64} ` +
+            `new_committer=${newCommitterDid ?? '?'}`,
+        );
+      }
+    } catch (err) {
+      this.#log(`[lastid-agent] proposal_reassigned handler failed: ${err.message}`);
+    }
+  }
+
+  // --- Proposal ack confirmed (UI-only) -----------------------------------
+
+  #handleProposalAckConfirmed(event) {
+    const payload = event?.payload ?? {};
+    this.#log(
+      `[lastid-agent] proposal_ack_confirmed group=${payload.group_id ?? '?'} ` +
+        `proposal=${payload.proposal_id ?? '?'} status=${payload.status ?? '?'}`,
+    );
+  }
+
+  // --- Group dissolved ----------------------------------------------------
+
+  async #handleDissolved(event) {
+    const payload = event?.payload ?? {};
+    const groupIdB64 = payload.group_id_b64 ?? payload.group_id;
+    if (!groupIdB64) {
+      this.#log('[lastid-agent] dissolved event missing group_id; ignoring');
+      return;
+    }
+    try {
+      this.#mls.forgetGroup(groupIdB64);
+      await this.#mls.persist();
+      this.#log(`[lastid-agent] forgot dissolved group ${groupIdB64}`);
+    } catch (err) {
+      this.#log(`[lastid-agent] forgetGroup failed: ${err.message}`);
+    }
+  }
+
+  // --- Defensive routing for unknown events with mls_* bytes -------------
+
+  /**
+   * Defensive routing for unknown event types that carry an
+   * `mls_*` byte field. The IdP can introduce new event vocabulary
+   * (reactions, typing, etc.) and an older plugin would silently
+   * drop them. If the event happens to embed a commit / proposal,
+   * dropping the bytes drifts our local MLS state out of epoch
+   * with the rest of the group. Sniff for a likely candidate field
+   * and route it through processInbound; openmls's own classifier
+   * decides what to do with the bytes. Pure-metadata events fall
+   * through here and are no-ops.
+   */
+  async #defensiveMlsRoute(event) {
+    const payload = event?.payload;
+    if (!payload || typeof payload !== 'object') return;
+    let mlsBytes = null;
+    for (const [k, v] of Object.entries(payload)) {
+      if (typeof v !== 'string' || v.length === 0) continue;
+      if (k.startsWith('mls_') || k.endsWith('_b64')) {
+        mlsBytes = v;
+        break;
+      }
+    }
+    if (!mlsBytes) return;
+    try {
+      this.#mls.processInbound(mlsBytes);
+      await this.#mls.persist();
+      this.#log(
+        `[lastid-agent] defensive mls route ok for unknown event type=${event?.type ?? '?'}`,
+      );
+    } catch (err) {
+      // Don't treat this as fatal — many candidate fields will not
+      // be MLS bytes at all. Logged at debug-equivalent only.
+      const msg = err?.message ?? String(err);
+      if (!msg.includes('GroupNotFound') && !msg.includes('group_not_found')) {
+        this.#log(
+          `[lastid-agent] defensive route did not parse as mls bytes ` +
+            `(type=${event?.type ?? '?'}): ${msg}`,
+        );
+      }
+    }
+  }
+
+  // --- Inbox append -------------------------------------------------------
 
   async #appendInbox(record) {
     const path = inboxPath(this.#scope);

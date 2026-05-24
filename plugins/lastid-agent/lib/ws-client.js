@@ -1,33 +1,46 @@
 /**
- * Agent-side `/v1/ws` client (Node).
+ * Agent-side `/v1/ws` client (Node) — parity with the bot
+ * subscriber's transport posture at
+ * `lastid-idp/packages/credential-service/src/mls/bot-mls-subscriber.ts`.
  *
  * Holds a persistent WebSocket to the LastID IdP so the agent
- * receives MLS Welcomes + group_chat.message events without
- * polling. Authenticates with the agent's `LastID.Agent.Base` VC
- * carried as a DPoP-bound bearer; DPoP proof signed by the agent's
- * Ed25519 slot key (the same key that backs `did:lastid:agent:<pub>`).
+ * receives MLS Welcomes, application messages, commits, proposals,
+ * membership changes, committer reassignments, and dissolves
+ * without polling. Authenticates with the agent's
+ * `LastID.Agent.Base` VC carried as a DPoP-bound bearer; DPoP
+ * proof signed by the agent's Ed25519 slot key (the same key that
+ * backs `did:lastid:agent:<pub>`).
  *
- * Auth shape (mirrors what `lastid-api::build_v2_rest_headers`
- * produces for native tungstenite consumers — see the IdP-side
- * `WebSocket Authentication Handler` in
- * `src/api/websocket/handlers/auth.ts`):
+ * Auth shape (mirrors `lastid-api::build_v2_rest_headers`):
  *
  *   Authorization: DPoP <agent VC SD-JWT compact string>
  *   DPoP:          <fresh DPoP proof JWT, htu=https://idp/v1/ws, htm=GET>
  *
- * vc-auth middleware was extended in task #193 to accept
- * `LastID.Agent.Base` (`allowAgentCredential: true` on the WS
- * upgrade handler), so this is the canonical native-client path —
- * no subprotocol smuggle, no `/v1/auth/resource-token` round-trip.
+ * vc-auth middleware accepts `LastID.Agent.Base` on the WS
+ * upgrade handler via `allowAgentCredential: true` (task #193).
  *
- * Lifecycle.
+ * Lifecycle / invariants:
  *
  *   - `start()` opens the socket and arms reconnect.
- *   - On `open`: fire `handlers.onOpen()`. The caller publishes
- *     its KeyPackage via REST then sits waiting for events.
- *   - On every inbound JSON message: parse, dispatch by event.type.
- *     `group_chat.welcome` and `group_chat.message` are the two
- *     agent-relevant types; anything else is logged and ignored.
+ *   - On `open`:
+ *       - fire `handlers.onOpen()` (caller publishes its KeyPackage
+ *         via REST then sits waiting).
+ *       - send `group_chat.fetch_queue` (no group_id) so the IdP
+ *         drains anything queued while we were offline. Without
+ *         this, commits / messages that arrived during a reconnect
+ *         window stay queued until the next per-event-type
+ *         trigger, by which point our MLS epoch is behind.
+ *       - start the 25s heartbeat. NLB / ECS idle-timeout is ~350s;
+ *         we beat well below that. Mirrors HEARTBEAT_MS in
+ *         bot-mls-subscriber.ts:128.
+ *   - On every inbound JSON message:
+ *       - parse, then chain onto an inbound Promise queue so
+ *         handlers run in arrival order. Same bug as
+ *         bot-mls-subscriber.ts:284-292 — without serialization,
+ *         a welcome + application message back-to-back race and
+ *         the decrypt loses to the welcome's group-join.
+ *       - dispatch every event type through a single `onEvent`
+ *         callback (the dispatcher decides what to do with each).
  *   - On `close` / `error`: schedule reconnect with exponential
  *     backoff + jitter (up to 30s). Reconnect re-mints a fresh
  *     DPoP proof — the IdP tracks `jti` so the prior proof can't
@@ -43,6 +56,26 @@ const { WebSocket } = localRequire('ws');
 
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
+const HEARTBEAT_MS = 25_000;
+
+/**
+ * Event types the dispatcher cares about. Unknown event types are
+ * still forwarded to `onEvent` so the dispatcher's defensive
+ * routing can probe for embedded mls_* fields — but the *known*
+ * set is logged at info so we can correlate WS-layer arrival with
+ * dispatcher behaviour without grovelling through full event
+ * bodies.
+ */
+const KNOWN_EVENT_TYPES = new Set([
+  'group_chat.welcome',
+  'group_chat.message',
+  'group_chat.commit',
+  'group_chat.proposal',
+  'group_chat.membership_change',
+  'group_chat.proposal_reassigned',
+  'group_chat.proposal_ack_confirmed',
+  'group_chat.dissolved',
+]);
 
 /**
  * @typedef {Object} WsClientOptions
@@ -50,9 +83,11 @@ const RECONNECT_MAX_MS = 30_000;
  * @property {string} agentDid - `did:lastid:agent:z…`.
  * @property {string} vcCompact - Agent VC SD-JWT compact string.
  * @property {import('node:crypto').KeyObject} signingKey - Ed25519 KeyObject.
- * @property {(evt: any) => void} onOpen
- * @property {(evt: any) => void} onWelcome   group_chat.welcome
- * @property {(evt: any) => void} onMessage   group_chat.message
+ * @property {(evt: any) => void} [onOpen]
+ * @property {(evt: any) => Promise<void> | void} onEvent
+ *   Called for every inbound `group_chat.*` event in arrival order.
+ *   Returning a Promise serializes the next event behind it (this
+ *   client awaits the promise before consuming the next frame).
  * @property {(err: Error) => void} [onError]
  */
 
@@ -63,6 +98,9 @@ export class LastIdWsClient {
   #state = 'idle';
   #attempt = 0;
   #reconnectTimer;
+  #heartbeatTimer;
+  /** Serializes inbound event handling (welcome → message → commit). */
+  #inboundQueue = Promise.resolve();
 
   /** @param {WsClientOptions} opts */
   constructor(opts) {
@@ -81,6 +119,7 @@ export class LastIdWsClient {
       clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = undefined;
     }
+    this.#stopHeartbeat();
     if (this.#socket) {
       try {
         this.#socket.close(1000, 'agent shutting down');
@@ -88,6 +127,30 @@ export class LastIdWsClient {
         // ignore
       }
       this.#socket = undefined;
+    }
+  }
+
+  /**
+   * Send an outbound event frame. The dispatcher uses this for
+   * - per-group fetch_queue after a welcome (drain commits queued
+   *   pre-join)
+   * - broadcasting commits the agent authored after a committer
+   *   reassignment.
+   *
+   * No-op when the socket isn't open. Frames sent while we're
+   * mid-reconnect would be DPoP-bound to the old session anyway —
+   * the dispatcher can re-emit on the next `open` if it cares.
+   */
+  send(event) {
+    if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    try {
+      this.#socket.send(JSON.stringify(event));
+      return true;
+    } catch (err) {
+      process.stderr.write(`[lastid-agent] ws send failed: ${err.message}\n`);
+      return false;
     }
   }
 
@@ -125,35 +188,21 @@ export class LastIdWsClient {
       } catch (err) {
         process.stderr.write(`[lastid-agent] ws onOpen handler threw: ${err.message}\n`);
       }
+      // Drain anything the IdP queued for us while we were offline.
+      // This is the global queue (no group_id) — once the IdP fans
+      // those frames back we discover any groups that need a
+      // per-group drain via the welcome handler's own follow-up.
+      this.send({
+        type: 'group_chat.fetch_queue',
+        payload: {},
+      });
+      this.#startHeartbeat();
     });
 
-    ws.on('message', (data) => {
-      let parsed;
-      try {
-        parsed = JSON.parse(data.toString('utf-8'));
-      } catch (err) {
-        process.stderr.write(`[lastid-agent] ws: non-JSON frame, ignoring: ${err.message}\n`);
-        return;
-      }
-      const type = typeof parsed?.type === 'string' ? parsed.type : '';
-      try {
-        if (type === 'group_chat.welcome') {
-          this.#opts.onWelcome?.(parsed);
-        } else if (type === 'group_chat.message') {
-          this.#opts.onMessage?.(parsed);
-        }
-        // Other event types are ignored at the WS layer. Application-
-        // message event types (operator.memory.write etc.) ride INSIDE
-        // group_chat.message payloads, after MLS decryption — they're
-        // dispatched by `mls-dispatch.js`, not here.
-      } catch (err) {
-        process.stderr.write(
-          `[lastid-agent] ws inbound handler threw on ${type}: ${err.message}\n`,
-        );
-      }
-    });
+    ws.on('message', (data) => this.#enqueueInbound(data));
 
     ws.on('close', (code, reason) => {
+      this.#stopHeartbeat();
       this.#socket = undefined;
       if (this.#state === 'stopped') return;
       process.stderr.write(
@@ -170,6 +219,73 @@ export class LastIdWsClient {
       }
       // `close` will fire after `error`; reconnect logic lives there.
     });
+  }
+
+  /**
+   * Push an inbound frame onto the serialization queue. Each frame
+   * waits for the prior one's handler to settle before its own
+   * dispatch begins. Failures in one handler don't break the
+   * chain — every link is wrapped so a thrown handler can't poison
+   * subsequent frames.
+   */
+  #enqueueInbound(data) {
+    this.#inboundQueue = this.#inboundQueue.then(() => this.#consumeInbound(data));
+    // Swallow any rejection in the chain — they're already logged
+    // inside #consumeInbound; we just don't want an unhandled
+    // promise rejection if a handler throws synchronously.
+    this.#inboundQueue.catch(() => {});
+  }
+
+  async #consumeInbound(data) {
+    let parsed;
+    try {
+      parsed = JSON.parse(data.toString('utf-8'));
+    } catch (err) {
+      process.stderr.write(`[lastid-agent] ws: non-JSON frame, ignoring: ${err.message}\n`);
+      return;
+    }
+    const type = typeof parsed?.type === 'string' ? parsed.type : '(missing)';
+    if (KNOWN_EVENT_TYPES.has(type)) {
+      // Known type — info log so timing is correlatable with
+      // dispatcher behaviour.
+      process.stderr.write(`[lastid-agent] ws inbound ${type}\n`);
+    }
+    // Heartbeat ack and similar frames have no useful behaviour for
+    // the dispatcher; drop them at the WS layer so the dispatch
+    // queue stays lean.
+    if (type === 'heartbeat' || type === 'pong' || type === 'connection.established') {
+      return;
+    }
+    try {
+      await this.#opts.onEvent?.(parsed);
+    } catch (err) {
+      process.stderr.write(
+        `[lastid-agent] ws onEvent threw on ${type}: ${err?.message ?? err}\n`,
+      );
+    }
+  }
+
+  #startHeartbeat() {
+    this.#stopHeartbeat();
+    this.#heartbeatTimer = setInterval(() => {
+      if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) return;
+      this.send({
+        type: 'heartbeat',
+        payload: { ts: new Date().toISOString() },
+      });
+    }, HEARTBEAT_MS);
+    // Don't keep the event loop alive solely for the heartbeat —
+    // the WS itself is the keep-alive anchor.
+    if (typeof this.#heartbeatTimer.unref === 'function') {
+      this.#heartbeatTimer.unref();
+    }
+  }
+
+  #stopHeartbeat() {
+    if (this.#heartbeatTimer) {
+      clearInterval(this.#heartbeatTimer);
+      this.#heartbeatTimer = undefined;
+    }
   }
 
   #scheduleReconnect() {
