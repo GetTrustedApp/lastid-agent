@@ -170,6 +170,15 @@ export class PersistentBotMlsClient {
      */
     encryptApplicationMessage(group_id_b64: string, plaintext_b64: string): Promise<string>;
     /**
+     * Export the GroupInfo for a freshly-created group as
+     * TLS-serialized base64. This is what the IdP wants in its
+     * `POST /v1/groups { mls_group_init: <this> }` body — it
+     * hashes the bytes to derive the canonical mls_group_id
+     * that every peer ends up agreeing on. Read-only; no
+     * state mutation, no flush.
+     */
+    exportGroupInfo(group_id_b64: string): Promise<string>;
+    /**
      * Explicit flush — drain the pending queue without doing
      * any new MLS op first. Useful when JS wants to be defensive
      * (e.g. before a tab-close handler) or to drain any tail

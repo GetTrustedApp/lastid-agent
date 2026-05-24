@@ -31,6 +31,7 @@ export const persistentbotmlsclient_commitPendingProposals: (a: number, b: numbe
 export const persistentbotmlsclient_createGroup: (a: number, b: number, c: number) => any;
 export const persistentbotmlsclient_destroyGroup: (a: number, b: number, c: number, d: number, e: number) => any;
 export const persistentbotmlsclient_encryptApplicationMessage: (a: number, b: number, c: number, d: number, e: number) => any;
+export const persistentbotmlsclient_exportGroupInfo: (a: number, b: number, c: number) => any;
 export const persistentbotmlsclient_flushPending: (a: number) => any;
 export const persistentbotmlsclient_forgetGroup: (a: number, b: number, c: number) => any;
 export const persistentbotmlsclient_generateKeyPackage: (a: number) => any;

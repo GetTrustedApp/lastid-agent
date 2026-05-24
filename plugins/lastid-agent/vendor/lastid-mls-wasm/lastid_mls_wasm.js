@@ -586,6 +586,22 @@ class PersistentBotMlsClient {
         return ret;
     }
     /**
+     * Export the GroupInfo for a freshly-created group as
+     * TLS-serialized base64. This is what the IdP wants in its
+     * `POST /v1/groups { mls_group_init: <this> }` body — it
+     * hashes the bytes to derive the canonical mls_group_id
+     * that every peer ends up agreeing on. Read-only; no
+     * state mutation, no flush.
+     * @param {string} group_id_b64
+     * @returns {Promise<string>}
+     */
+    exportGroupInfo(group_id_b64) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.persistentbotmlsclient_exportGroupInfo(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
      * Explicit flush — drain the pending queue without doing
      * any new MLS op first. Useful when JS wants to be defensive
      * (e.g. before a tab-close handler) or to drain any tail
@@ -1153,17 +1169,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 748, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 737, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 569, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 558, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 555, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 544, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h06cd8775ba25515b);
             return ret;
         },
