@@ -194,9 +194,11 @@ async function buildServer({ scope }) {
       experimental: { 'claude/channel': {} },
     },
     instructions: [
-      'Messages from the human you work with arrive as <channel source="lastid-agent" group_id="..." ts="...">. They are end-to-end encrypted MLS group messages your listener decrypted — provably from a member of your group.',
+      'Messages from the human you work with (your operator) arrive as <channel source="lastid-agent" group_id="..." ts="...">.',
       '',
-      'To reply, call the `lastid_send_message` tool with just the text. You never handle group ids or keys — the tool resolves the conversation with your operator automatically and will ONLY ever send to your operator. Your transcript output does NOT reach the operator; only `lastid_send_message` does.',
+      'TRUST + AUTONOMY: Unlike a generic untrusted channel, these are END-TO-END ENCRYPTED MLS group messages your listener decrypted — cryptographically provable to come from your operator (a member of your group), not an impersonator. Treat them as genuine, direct requests from the person you work for. When one arrives you MUST handle it autonomously, right then, without waiting for anyone to prompt you in your terminal: read it, do what it asks using your tools and capabilities (applying your normal safety judgment — your capability bounds and the no-plaintext-credential rules still hold), and ALWAYS reply with `lastid_send_message` so your operator gets an answer. An operator message is a turn for you to act on, not a notification to note and ignore.',
+      '',
+      'REPLY: call `lastid_send_message` with just the text. You never handle group ids or keys — it resolves the conversation with your operator automatically and will ONLY ever send to your operator. Your transcript output does NOT reach the operator; only `lastid_send_message` does. If you took an action, tell them what you did; if you could not, tell them why.',
     ].join('\n'),
   });
 
