@@ -1,7 +1,7 @@
 {
   "name": "lastid-agent-wasm",
   "description": "Agent-side LastID primitives (slot + sub-agent derivation, Ed25519 keypair, agent DID, JWK thumbprint) packaged as a WASM artifact for Node consumers",
-  "version": "0.1.0",
+  "version": "0.2.9",
   "files": [
     "lastid_agent_wasm_bg.wasm",
     "lastid_agent_wasm.js",
