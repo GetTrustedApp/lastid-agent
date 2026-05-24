@@ -19,12 +19,45 @@
  * CLI.
  */
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureListenerRunning } from '../lib/listener-daemon.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
+const pluginRoot = join(__dirname, '..');
+
+// Self-heal runtime deps. `/plugin update` syncs files but does NOT
+// run `npm install`, so a dependency added after a user's first
+// install (notably `ws`, needed by the listener daemon) is missing
+// and the listener crash-loops on "Cannot find module 'ws'". If a
+// required module is absent, install. Guarded so the steady state is
+// a single stat with no npm spawn. Runs before the listener spawn
+// below so the daemon finds its deps. Best-effort: a failed install
+// logs and the session continues.
+ensureRuntimeDeps();
+
+function ensureRuntimeDeps() {
+  try {
+    if (existsSync(join(pluginRoot, 'node_modules', 'ws'))) return;
+    process.stderr.write('[lastid-agent] installing runtime deps (first run / post-update)…\n');
+    const r = spawnSync('npm', ['install', '--omit=dev', '--no-audit', '--no-fund'], {
+      cwd: pluginRoot,
+      encoding: 'utf-8',
+      timeout: 90_000,
+    });
+    if (r.status !== 0) {
+      process.stderr.write(
+        `[lastid-agent] dep install failed: ${(r.stderr || r.error?.message || 'unknown').slice(0, 200)}\n`,
+      );
+    } else {
+      process.stderr.write('[lastid-agent] runtime deps installed\n');
+    }
+  } catch (err) {
+    process.stderr.write(`[lastid-agent] dep install error: ${err.message}\n`);
+  }
+}
 
 const result = spawnSync('node', [cliPath, 'status', '--json'], {
   encoding: 'utf-8',
