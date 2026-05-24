@@ -95,7 +95,10 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
         'no active conversation with your operator yet — ask them to open the LastID chat with you first, then reply',
       );
     }
-    const id = await enqueueSend({ scope, idpGroupId: group.idpGroupId, text });
+    // Enqueue against the operator DID — the listener resolves the
+    // operator's current group at send time, so a rotated group is
+    // handled without the queued message getting stuck.
+    const id = await enqueueSend({ scope, operatorDid, text });
     return {
       content: [
         {

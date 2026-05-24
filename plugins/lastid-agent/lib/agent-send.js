@@ -37,7 +37,7 @@ import { Buffer } from 'node:buffer';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { resolveGroup } from './agent-groups.js';
+import { resolveActiveGroupForOperator } from './agent-groups.js';
 
 function outboxPath(scope) {
   return join(homedir(), '.lastid-agent', scope ?? 'main', 'outbox.jsonl');
@@ -54,16 +54,21 @@ function newId() {
  * (the MCP tool does) — it never touches MLS state. The listener
  * picks it up on its next drain tick. Returns the request id.
  */
-export async function enqueueSend({ scope, idpGroupId, text }) {
-  if (!idpGroupId || typeof idpGroupId !== 'string') {
-    throw new Error('enqueueSend: idp_group_id required');
+export async function enqueueSend({ scope, operatorDid, text }) {
+  if (!operatorDid || typeof operatorDid !== 'string') {
+    throw new Error('enqueueSend: operatorDid required');
   }
   if (typeof text !== 'string' || text.length === 0) {
     throw new Error('enqueueSend: text required');
   }
+  // Store the OPERATOR did, not a fixed group id. The drain resolves
+  // the operator's current active group at send time, so if the
+  // group rotated (recovery — the operator recreated it and we
+  // rejoined via welcome) the queued message rides the new group
+  // automatically instead of being stuck on a dead one.
   const req = {
     id: newId(),
-    idp_group_id: idpGroupId,
+    operator_did: operatorDid,
     text,
     enqueued_at: new Date().toISOString(),
   };
@@ -144,13 +149,20 @@ export async function drainOutbox({ scope, mls, agentDid, send, log }) {
 }
 
 async function sendOne({ scope, mls, agentDid, send, req }) {
-  const resolved = await resolveGroup({ scope, idpGroupId: req.idp_group_id });
+  // Resolve the operator's CURRENT active group at send time (not a
+  // group id baked in at enqueue) so a rotated group is picked up
+  // automatically. Strict operator match — we never send to anyone
+  // but the operator.
+  const resolved = await resolveActiveGroupForOperator({
+    scope,
+    operatorDid: req.operator_did,
+  });
   if (!resolved) {
     throw new Error(
-      `unknown group ${req.idp_group_id} — no welcome recorded its openmls id`,
+      `no active group with operator ${req.operator_did} — waiting for a group to be established`,
     );
   }
-  const { groupIdB64 } = resolved;
+  const { groupIdB64, idpGroupId } = resolved;
 
   const envelope = {
     version: 1,
@@ -171,7 +183,7 @@ async function sendOne({ scope, mls, agentDid, send, req }) {
     correlation_id: req.id,
     timestamp: new Date().toISOString(),
     payload: {
-      group_id: req.idp_group_id,
+      group_id: idpGroupId,
       mls_message: mlsMessage,
       epoch: Number.isFinite(epoch) ? epoch : 0,
       sender_did: agentDid,
