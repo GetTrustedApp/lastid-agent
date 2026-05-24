@@ -393,6 +393,17 @@ export function sdkDenyAgentProvisioning(user_code: string, reason: string, idp_
 export function sdkFetchAgentProvisioningPending(user_code: string, idp_url: string): Promise<any>;
 
 /**
+ * Load the full message-array JSON for a conversation. Returns
+ * `null` when nothing has been persisted yet.
+ */
+export function sdkGetChatThread(conversation_id: string): Promise<any>;
+
+/**
+ * Get a single conversation record by id. `null` when absent.
+ */
+export function sdkGetConversation(conversation_id: string): Promise<any>;
+
+/**
  * Settings → "Recovery QR" view. Reads the persisted
  * `QRRecoveryData` blob the signup orchestrator stored under
  * `qr_recovery_data_<master_id>`, regenerates the SVG-encoded
@@ -448,6 +459,13 @@ export function sdkGetV2IdentityProfile(): Promise<any>;
 export function sdkHasV2DeviceKey(key_id: string): Promise<boolean>;
 
 /**
+ * List every conversation record as a JSON array string. The
+ * console renders this as the conversation list (parity with
+ * the native `sdkGetGroupConversations`).
+ */
+export function sdkListConversations(): Promise<string>;
+
+/**
  * Return-visit login: WebAuthn assertion against the existing
  * V2 device-key credential → recovers the PRF output →
  * at-rest wrap key is cached on a fresh
@@ -473,6 +491,13 @@ export function sdkLogin(): Promise<any>;
  * this to validate signatures produced by `sdkSignWithPqDeviceKey`.
  */
 export function sdkMldsaPublicKey(key_id: string): Promise<Uint8Array>;
+
+/**
+ * Persist the full message-array JSON for a conversation
+ * (sealed). The caller passes the complete array; this
+ * overwrites the prior blob.
+ */
+export function sdkPutChatThread(conversation_id: string, messages_json: string): Promise<void>;
 
 /**
  * Register the operator's `delegation_authority` public key with
@@ -516,6 +541,14 @@ export function sdkSignWithPqDeviceKey(key_id: string, data: Uint8Array): Promis
  * timestamps.
  */
 export function sdkSignup(password: string, use_biometrics: boolean, persona_json: any, idp_url: string): Promise<any>;
+
+/**
+ * Upsert a conversation record (sealed). `record_json` is the
+ * caller-defined ConversationRecord shape. Keyed by
+ * `conversation_id` (the peer's DID for a 1:1) — this is the
+ * dedup index.
+ */
+export function sdkUpsertConversation(conversation_id: string, record_json: string): Promise<void>;
 
 /**
  * Sign an arbitrary payload with an Ed25519 signing key. Returns the
