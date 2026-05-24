@@ -45,6 +45,43 @@ export function listenerLogPath(scope) {
   return join(dataDirFor(scope), 'listener.log');
 }
 
+// Records which binary (and thus which plugin version — the cache
+// path embeds the version, e.g. `.../lastid-agent/0.8.13/bin/...`)
+// the running listener was spawned from. Lets us detect + recycle a
+// listener left over from an OLD version after `/plugin update` (the
+// PID is alive so `ensureListenerRunning` would otherwise leave the
+// stale code running — exactly the bug where a 0.8.11 listener kept
+// 502'ing on superseded auth while 0.8.13 sat unused on disk).
+function listenerMetaPath(scope) {
+  return join(dataDirFor(scope), 'listener.meta.json');
+}
+
+async function readMeta(scope) {
+  try {
+    const raw = await readFile(listenerMetaPath(scope), 'utf-8');
+    const m = JSON.parse(raw);
+    return m && typeof m === 'object' ? m : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeMeta(scope, meta) {
+  try {
+    await writeFile(listenerMetaPath(scope), `${JSON.stringify(meta)}\n`, 'utf-8');
+  } catch {
+    // best-effort — meta is informational; the pid file is the lock.
+  }
+}
+
+async function clearMeta(scope) {
+  try {
+    await unlink(listenerMetaPath(scope));
+  } catch {
+    // best-effort
+  }
+}
+
 /**
  * Check whether `pid` corresponds to a live process. `process.kill(pid, 0)`
  * doesn't send a signal — it just probes existence and permissions. Throws
@@ -95,10 +132,27 @@ export async function ensureListenerRunning({ scope = 'main', cliPath } = {}) {
 
   const existing = await readPid(scope);
   if (existing && isAlive(existing)) {
-    return { status: 'already-running', pid: existing };
-  }
-  if (existing) {
+    // A listener is alive — but is it THIS plugin version? Compare
+    // the recorded spawn cliPath to the current one. If it matches,
+    // leave it. If it differs (the plugin updated) OR there's no
+    // meta (a pre-meta / pre-fix daemon), recycle: kill the stale
+    // listener so we respawn from the current version. This is what
+    // guarantees a *fresh* listener after an update instead of an
+    // old one surviving on superseded code.
+    const meta = await readMeta(scope);
+    if (meta && meta.cliPath === cliPath) {
+      return { status: 'already-running', pid: existing };
+    }
+    try {
+      process.kill(existing);
+    } catch {
+      // already gone / not ours — fall through to respawn
+    }
     await clearStalePid(scope);
+    await clearMeta(scope);
+  } else if (existing) {
+    await clearStalePid(scope);
+    await clearMeta(scope);
   }
 
   // Open the log file as appended sink for the detached child.
@@ -140,6 +194,15 @@ export async function ensureListenerRunning({ scope = 'main', cliPath } = {}) {
     }
   }
 
+  // Stamp the version/binary this listener was spawned from so a
+  // later ensureListenerRunning can detect a stale-version daemon
+  // and recycle it.
+  await writeMeta(scope, {
+    pid: child.pid,
+    cliPath,
+    startedAt: new Date().toISOString(),
+  });
+
   // Detach. The child now owns the log fd; parent can exit freely.
   child.unref();
   await logFh.close().catch(() => {});
@@ -163,5 +226,6 @@ export async function stopListener({ scope = 'main' } = {}) {
     return { status: 'kill-failed', error: err.message };
   }
   await clearStalePid(scope);
+  await clearMeta(scope);
   return { status: 'stopped', pid };
 }

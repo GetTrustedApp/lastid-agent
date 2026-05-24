@@ -15,8 +15,12 @@
  * Outbox: `~/.lastid-agent/<scope>/outbox.jsonl`, one JSON request
  * per line:
  *
- *   { "id": "<uuid>", "idp_group_id": "<uuid>", "text": "<plaintext>",
+ *   { "id": "<uuid>", "operator_did": "did:lastid:z…", "text": "<plaintext>",
  *     "enqueued_at": "<ISO-8601>" }
+ *
+ * Keyed by operator DID (not a fixed group id) so the drain resolves
+ * the operator's current group at send time — a rotated group is
+ * handled without the queued message getting stuck.
  *
  * Transport: application messages ride the WebSocket as
  * `group_chat.message` frames (NOT a REST endpoint — /v1/groups/:id/
@@ -132,7 +136,7 @@ export async function drainOutbox({ scope, mls, agentDid, send, log }) {
     try {
       await sendOne({ scope, mls, agentDid, send, req });
       logLine(
-        `[lastid-agent] outbox: sent ${req.id} → group ${req.idp_group_id}`,
+        `[lastid-agent] outbox: sent ${req.id} → operator ${req.operator_did}`,
       );
     } catch (err) {
       const msg = err?.message ?? String(err);
