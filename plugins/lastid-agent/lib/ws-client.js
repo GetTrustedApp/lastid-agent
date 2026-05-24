@@ -11,13 +11,20 @@
  * proof signed by the agent's Ed25519 slot key (the same key that
  * backs `did:lastid:agent:<pub>`).
  *
- * Auth shape (mirrors `lastid-api::build_v2_rest_headers`):
+ * Auth shape (matches the working REST path in mls-publish.js):
  *
- *   Authorization: DPoP <agent VC SD-JWT compact string>
+ *   Authorization: Bearer <agent VC SD-JWT compact string>
  *   DPoP:          <fresh DPoP proof JWT, htu=https://idp/v1/ws, htm=GET>
  *
- * vc-auth middleware accepts `LastID.Agent.Base` on the WS
- * upgrade handler via `allowAgentCredential: true` (task #193).
+ * IMPORTANT — scheme is `Bearer`, NOT `DPoP`. On the IdP's vc-auth
+ * middleware, a `DPoP`-scheme Authorization is parsed as a *resource
+ * access token* (verifyResourceAccessToken → ML-DSA verify), which a
+ * raw VC is not — that path fails with "Resource token validation
+ * failed: ML-DSA signature verification failed". `Bearer <vc>` routes
+ * to the SD-JWT VC path, which for `LastID.Agent.Base` verifies the
+ * VC + requires this DPoP proof header as holder PoP (verifyAgentPopJwt,
+ * Ed25519 cnf.jwk, htu/htm-bound). vc-auth accepts `LastID.Agent.Base`
+ * on the WS upgrade via `allowAgentCredential: true`.
  *
  * Lifecycle / invariants:
  *
@@ -174,7 +181,11 @@ export class LastIdWsClient {
 
     const ws = new WebSocket(wsUrl, {
       headers: {
-        Authorization: `DPoP ${vcCompact}`,
+        // Bearer (NOT DPoP) — see the auth-shape note at the top of
+        // this file. DPoP scheme ⇒ resource-token path ⇒ ML-DSA
+        // failure for a raw VC. Bearer ⇒ SD-JWT path + the DPoP
+        // header below as agent holder PoP.
+        Authorization: `Bearer ${vcCompact}`,
         DPoP: dpopProof,
       },
     });
@@ -269,10 +280,18 @@ export class LastIdWsClient {
     this.#stopHeartbeat();
     this.#heartbeatTimer = setInterval(() => {
       if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) return;
-      this.send({
-        type: 'heartbeat',
-        payload: { ts: new Date().toISOString() },
-      });
+      // Native WS ping frame — NOT an app-level `{type:'heartbeat'}`
+      // event. The IdP's router rejects non-`domain.action` event
+      // types ("Invalid event type: heartbeat"), and it already pings
+      // clients itself (server.ts) + tracks liveness via pong. A
+      // client-side native ping just keeps NAT/proxy state warm from
+      // our end; the server auto-pongs. The `ws` package exposes
+      // `.ping()`; it's a no-op-safe protocol frame.
+      try {
+        this.#socket.ping();
+      } catch {
+        // socket race — next tick (or reconnect) handles it.
+      }
     }, HEARTBEAT_MS);
     // Don't keep the event loop alive solely for the heartbeat —
     // the WS itself is the keep-alive anchor.
