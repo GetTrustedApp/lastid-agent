@@ -27,6 +27,7 @@ import {
   parseApprovalRequiredResult,
   runApprovalLoop,
 } from './use-approval-loop.js';
+import { reapStaleServers } from './reap-stale-servers.js';
 
 const SERVER_INFO = {
   name: 'lastid-agent',
@@ -426,6 +427,12 @@ function startInboxChannel({ server, scope }) {
 }
 
 export async function runMcpServer({ scope = 'main', http = null } = {}) {
+  // Before binding our transport, reap any serve left running on an OLDER
+  // plugin version (a prior session's process the runtime didn't reap on
+  // `/plugin update`). Same-version concurrent sessions are left alone.
+  // Best-effort, stderr-only — never blocks or corrupts the JSON-RPC stdout.
+  reapStaleServers({ selfPid: process.pid, selfPath: process.argv[1] });
+
   const server = await buildServer({ scope });
   if (!http) {
     const transport = new StdioServerTransport();
