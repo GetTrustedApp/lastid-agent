@@ -301,6 +301,22 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
     }
     args = { ...args, project_key: sticky };
   }
+  // A project-tier write needs the operator's project_root_seed (sealed at
+  // provisioning). If this session's bundle lacks it — the agent predates
+  // project memories, OR a long-lived server cached a pre-reprovision bundle —
+  // the write fails at publishAgentMemory's seed guard with a misleading
+  // "server write failed". Surface the REAL reason so it isn't mistaken for an
+  // IdP problem (that misread cost an hour-long IdP hunt once).
+  if (
+    (name === 'lastid_memory_write' || name === 'lastid_memory_draft') &&
+    args.tier === 'project' &&
+    !Buffer.isBuffer(loadedAgent.projectRootSeed)
+  ) {
+    return err(
+      "can't write a project-tier memory: no project_root_seed is loaded for this agent in this session. " +
+        'If you just (re)provisioned, restart the session to pick it up; otherwise this agent predates project memories and needs reprovisioning.',
+    );
+  }
   try {
     switch (name) {
       case 'lastid_memory_write': {

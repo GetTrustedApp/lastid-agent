@@ -292,10 +292,20 @@ async function buildServer({ scope }) {
   let signingSeed = desktopConn.signingSeed;
 
   const reloadAgentIfStale = async () => {
-    // Re-read keychain only when we don't have one yet. Once the
-    // agent is provisioned the bundle doesn't change in-process.
-    if (!loadedAgent) {
-      loadedAgent = await loadAgentVc(scope);
+    // Re-read the keychain when we have no agent yet — AND when the cached
+    // bundle is missing its project_root_seed. The old assumption ("once
+    // provisioned the bundle never changes in-process") was wrong: a
+    // RE-PROVISION (or a later seal/migration) adds the project_root_seed to
+    // the keychain AFTER this long-lived server first loaded. A stale bundle
+    // with projectRootSeed=null silently fails every project-tier and
+    // global-shared memory/rule write (publishAgentMemory's seed guard) until
+    // a restart — which is exactly the "server write failed" we chased. Once
+    // the reload picks the seed up, the bundle has it and this no-ops; only a
+    // genuinely seedless (pre-project) agent re-reads, which is a cheap, rare,
+    // non-prompting keychain read for a trusted app.
+    if (!loadedAgent || !loadedAgent.projectRootSeed) {
+      const fresh = await loadAgentVc(scope);
+      if (fresh) loadedAgent = fresh;
     }
   };
 

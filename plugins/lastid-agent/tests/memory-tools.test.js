@@ -45,6 +45,44 @@ function body(res) {
   return JSON.parse(res.content[0].text);
 }
 
+// REGRESSION (project_root_seed stale-bundle bug): a long-lived MCP server
+// cached a pre-reprovision agent bundle with projectRootSeed=null, so every
+// project-tier write failed at publishAgentMemory's seed guard and surfaced the
+// misleading generic "server write failed" — which read like an IdP problem.
+// The fix: mcp-server reloads the bundle when the seed is missing, and the tool
+// refuses a seedless project write with the REAL reason. These lock the refusal.
+test('REGRESSION: project-tier write WITHOUT a project_root_seed refuses with the real reason', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const res = await call('lastid_memory_draft', {
+      kind: 'fact', subject: ['x'], claim: 'c', source_kind: 'inferred',
+      tier: 'project', project_key: 'github.com/acme/widgets',
+    }, scope);
+    assert.equal(res.isError, true);
+    const b = body(res);
+    assert.match(b.error, /project_root_seed/);
+    assert.doesNotMatch(b.error, /server write failed/); // not the misleading generic one
+  } finally {
+    cleanup();
+  }
+});
+
+test('a project-tier write WITH a project_root_seed passes the seed guard and proceeds', async () => {
+  const { scope, cleanup } = withScope();
+  const seeded = { ...loadedAgent, projectRootSeed: Buffer.alloc(32, 9) };
+  try {
+    const res = await handleMemoryTool({
+      name: 'lastid_memory_write',
+      args: { kind: 'fact', subject: ['x'], claim: 'c', source_kind: 'inferred', tier: 'project', project_key: 'github.com/acme/widgets' },
+      scope, loadedAgent: seeded, claims, fetchImpl: okFetch,
+    });
+    assert.equal(res.isError ?? false, false);
+    assert.equal(body(res).ok, true);
+  } finally {
+    cleanup();
+  }
+});
+
 test('MEMORY_TOOL_NAMES covers the 7 tools', () => {
   for (const n of [
     'lastid_memory_write',
