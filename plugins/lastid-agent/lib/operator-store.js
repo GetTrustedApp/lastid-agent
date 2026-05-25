@@ -253,41 +253,86 @@ function ruleAppliesToTool(normalizedRuleTool, toolName) {
  */
 export function patternMatches(pattern, isRegexFlag, text) {
   if (pattern == null || pattern === '') return true;
-  const isRegex = isRegexFlag || pattern.startsWith('regex:');
-  const rawSrc = pattern.startsWith('regex:')
-    ? pattern.slice('regex:'.length)
-    : pattern;
+  const re = compileRulePattern(pattern, isRegexFlag, 'i');
+  return re ? re.test(text) : false;
+}
+
+/**
+ * THE single source of truth for how a rule's `pattern` + `is_regex` flag
+ * compile to a RegExp. Used by patternMatches (the matcher), redactMatches
+ * (inbound channel redaction), and applyRewrite (the PreToolUse rewriter).
+ *
+ * A pattern is a regex when EITHER the rule's `is_regex` flag is set (the
+ * console checkbox) OR the pattern carries a leading `regex:` prefix.
+ * Otherwise it's a literal and regex metacharacters are escaped so it
+ * matches verbatim. Returns null on a malformed regex so every caller
+ * fails closed (no match / no rewrite) rather than throwing.
+ *
+ * Keeping this in ONE place is the fix for the class of bug where the
+ * matcher honoured `is_regex` but the rewriter only checked the `regex:`
+ * prefix — so a checkbox-authored regex rule matched but then escaped its
+ * own pattern into a literal and rewrote nothing (e.g. the `sfw $1$2`
+ * supply-chain rule silently no-op'd).
+ */
+export function compileRulePattern(pattern, isRegexFlag, flags = 'i') {
+  if (pattern == null) return null;
+  const str = String(pattern);
+  const hasPrefix = str.startsWith('regex:');
+  const isRegex = isRegexFlag === true || hasPrefix;
+  const rawSrc = hasPrefix ? str.slice('regex:'.length) : str;
   const src = isRegex ? rawSrc : rawSrc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   try {
-    return new RegExp(src, 'i').test(text);
+    return new RegExp(src, flags);
   } catch {
-    return false;
+    return null;
   }
 }
 
 /**
  * Globally replace every match of `pattern` in `text` with `replacement`
- * (default "[redacted]"). Used for `rewrite`-severity rules on the channel
- * surface — the outbound PreToolUse path has its own rewriteToolInput; this
- * is the inbound twin, redacting matched spans of a decrypted operator
- * message before the agent sees it. Same pattern grammar as patternMatches
- * (literal by default, "regex:" prefix or isRegexFlag for a regex source;
- * `$1`/`$&` backrefs honoured in the replacement). A malformed regex fails
- * closed — returns the text unchanged rather than throwing.
+ * (default "[redacted]"). The inbound twin of applyRewrite: redacts matched
+ * spans of a decrypted operator message before the agent sees it. `$1`/`$&`
+ * backrefs honoured. Malformed regex fails closed (text unchanged).
  */
 export function redactMatches(text, pattern, replacement, isRegexFlag) {
   if (typeof text !== 'string' || !pattern) return text;
   const repl = typeof replacement === 'string' && replacement.length > 0
     ? replacement
     : '[redacted]';
-  const isRegex = isRegexFlag === true || pattern.startsWith('regex:');
-  const rawSrc = pattern.startsWith('regex:')
-    ? pattern.slice('regex:'.length)
-    : pattern;
-  const src = isRegex ? rawSrc : rawSrc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  try {
-    return text.replace(new RegExp(src, 'gi'), repl);
-  } catch {
-    return text;
+  const re = compileRulePattern(pattern, isRegexFlag, 'gi');
+  return re ? text.replace(re, repl) : text;
+}
+
+/**
+ * Apply a `rewrite`-severity rule to a tool input: substring/regex-replace
+ * `pattern` → `replacement` across the command-shaped string fields. Returns
+ * a NEW object with the changed fields, or null when nothing changed (caller
+ * falls through to a no-op). Shared by the PreToolUse hook so the rewrite
+ * uses the exact same pattern grammar as the matcher.
+ *
+ * `fields` defaults to the command-shaped inputs: `command`/`description`
+ * (shell tools) + `text` (the outbound channel tool lastid_send_message).
+ */
+export function applyRewrite(
+  toolInput,
+  pattern,
+  replacement,
+  isRegexFlag,
+  fields = ['command', 'description', 'text'],
+) {
+  if (!pattern || !toolInput || typeof toolInput !== 'object') return null;
+  const re = compileRulePattern(pattern, isRegexFlag, 'gi');
+  if (!re) return null; // malformed → fail closed (no rewrite)
+  const next = { ...toolInput };
+  let changed = false;
+  for (const field of fields) {
+    const v = next[field];
+    if (typeof v !== 'string' || v.length === 0) continue;
+    re.lastIndex = 0;
+    if (!re.test(v)) continue;
+    re.lastIndex = 0; // reset after .test() before .replace()
+    next[field] = v.replace(re, replacement);
+    changed = true;
   }
+  return changed ? next : null;
 }

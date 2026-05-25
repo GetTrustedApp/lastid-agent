@@ -30,6 +30,7 @@ import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { applyRewrite } from '../lib/operator-store.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
@@ -88,7 +89,7 @@ if (toolName) {
       // executes the modified command. Rewrites short-circuit
       // ambient memory injection — once we've established the
       // command needs to change, additional reminders are noise.
-      const updated = rewriteToolInput(toolInput, m.pattern, m.replacement);
+      const updated = applyRewrite(toolInput, m.pattern, m.replacement, m.is_regex);
       if (updated) {
         console.log(
           JSON.stringify({
@@ -145,55 +146,12 @@ if (toolName && AMBIENT_RETRIEVE_TOOLS.has(toolName)) {
   }
 }
 
-// Substring-replace `pattern` → `replacement` (case-insensitive) on
-// the string fields of toolInput that we know are command-shaped.
-// Returns a new object with the modified fields, or null if no
-// field's content changed (caller falls through to no-op).
-//
-// Two modes, matching the Rust runtime's `apply_rewrite`:
-//   * Literal (default): regex metacharacters escaped so the
-//     pattern matches verbatim. Used for the common case
-//     `pattern:npm install` → `replacement:sfw npm install`.
-//   * Regex: pattern with a leading `regex:` prefix is used as-is.
-//     Lets one rule cover an alternation like
-//     `regex:\b(npm|yarn|pnpm|pip|uv|cargo)\b` → `sfw $1` and
-//     redirect every supported package manager in one rule.
-//     JS native `String.replace` honours `$1`, `$2`, `$&`, etc.
-function rewriteToolInput(toolInput, pattern, replacement) {
-  if (!pattern || !toolInput || typeof toolInput !== 'object') return null;
-  // `command`/`description` cover shell tools; `text` covers the outbound
-  // channel tool (lastid_send_message) so a `message_out` rewrite rule can
-  // redact the message body before it's sent to the operator.
-  const rewritable = ['command', 'description', 'text'];
-  const next = { ...toolInput };
-  let changed = false;
-  const isRegex = pattern.startsWith('regex:');
-  const rawSrc = isRegex ? pattern.slice('regex:'.length) : pattern;
-  const reSrc = isRegex
-    ? rawSrc
-    : rawSrc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  let re;
-  try {
-    re = new RegExp(reSrc, 'gi');
-  } catch (e) {
-    // Malformed regex from operator — fail closed for this rule
-    // (no rewrite, hook falls through and the tool runs unmodified;
-    // the audit chain already recorded the rule hit).
-    process.stderr.write(
-      `[lastid-agent] rewrite skipped — invalid regex "${reSrc}": ${e?.message ?? e}\n`,
-    );
-    return null;
-  }
-  for (const field of rewritable) {
-    const v = next[field];
-    if (typeof v !== 'string' || v.length === 0) continue;
-    if (!re.test(v)) continue;
-    re.lastIndex = 0; // reset after .test()
-    next[field] = v.replace(re, replacement);
-    changed = true;
-  }
-  return changed ? next : null;
-}
+// NOTE: the rewrite logic lives in operator-store.js::applyRewrite (imported
+// above) so the PreToolUse rewriter and the matcher (patternMatches) share
+// ONE pattern grammar. Previously a local copy here only honoured the
+// `regex:` prefix and ignored the rule's `is_regex` flag, so a checkbox-
+// authored regex rule matched but escaped its own pattern into a literal
+// and rewrote nothing — the `sfw $1$2` supply-chain rule silently no-op'd.
 
 // ─── 2. Sub-agent briefing (Task only) ─────────────────────────────
 
