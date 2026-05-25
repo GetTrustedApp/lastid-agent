@@ -35,6 +35,12 @@ import { projectKeyForPath, operativePathFromToolInput } from '../lib/project-ke
 import { writeLastProject } from '../lib/project-sticky.js';
 import { recordRuleHit } from '../lib/rule-metrics.js';
 import { hostMemoryWriteWarning } from '../lib/memory-guidance.js';
+import { resolveScope } from '../lib/scope.js';
+
+// This session's agent scope (LASTID_AGENT_SCOPE → 'main'). The policy-check /
+// memory-search CLI children inherit the env and resolve it themselves; this
+// is for the in-process metric record below.
+const activeScope = resolveScope();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
@@ -68,7 +74,7 @@ if (toolName) {
     // rule id, severity, tool category, and curated provenance.
     try {
       recordRuleHit({
-        scope: 'main',
+        scope: activeScope,
         ruleId: m.memory_id,
         severity: m.severity,
         tool: m.tool,

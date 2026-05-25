@@ -24,6 +24,12 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureListenerRunning } from '../lib/listener-daemon.js';
 import { memoryGuidanceLines } from '../lib/memory-guidance.js';
+import { resolveScope } from '../lib/scope.js';
+
+// This session's agent scope (LASTID_AGENT_SCOPE → 'main') — pins the listener,
+// sync, and memory-setup below to the right identity so one host can run
+// several agents (`LASTID_AGENT_SCOPE=lastid claude …`).
+const sessionScope = resolveScope();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
@@ -105,7 +111,7 @@ process.stderr.write(
 // daemon and it's still alive, this returns immediately.
 try {
   const result = await ensureListenerRunning({
-    scope: status.scope ?? 'main',
+    scope: sessionScope,
     cliPath,
   });
   process.stderr.write(
@@ -124,7 +130,7 @@ try {
 // connect; this covers the case where it was already running). Detached +
 // unref + ignored stdio so it never delays the session start.
 try {
-  const sync = spawn('node', [cliPath, 'sync', '--scope', status.scope ?? 'main'], {
+  const sync = spawn('node', [cliPath, 'sync', '--scope', sessionScope], {
     detached: true,
     stdio: 'ignore',
   });
@@ -139,26 +145,32 @@ try {
 // detached `memory-setup` to install + warm it in the background (the first
 // seconds), non-blocking. Idempotent: once installed, embeddingsInstalled()
 // is true and this no-ops. Opt out with LASTID_AGENT_NO_EMBEDDINGS=1.
+// Semantic memory: do NOT silently auto-install. If this host has no embedding
+// model yet, TELL the agent to offer it to the operator (a one-time ~137MB
+// download, SHARED across every agent/scope on this host — only the memories
+// stay per-identity). The operator opts in via the provision prompt or
+// `lastid-agent memory-setup`. Opt out entirely: LASTID_AGENT_NO_EMBEDDINGS=1.
+let embeddingsHint = '';
 if (!process.env.LASTID_AGENT_NO_EMBEDDINGS) {
   try {
     const { embeddingsInstalled } = await import('../lib/embeddings.js');
     if (!(await embeddingsInstalled())) {
-      process.stderr.write(
-        '[lastid-agent] enabling semantic memory in the background (one-time, ~1–2 min). ' +
-          'Set LASTID_AGENT_NO_EMBEDDINGS=1 to skip; until it finishes, memory uses keyword search.\n',
-      );
-      const setup = spawn('node', [cliPath, 'memory-setup', '--scope', status.scope ?? 'main'], {
-        detached: true,
-        stdio: 'ignore',
-      });
-      setup.unref();
+      embeddingsHint = [
+        '',
+        '## Semantic memory — not enabled on this host yet',
+        '',
+        'Memory search is keyword-only until the local embedding model is installed.',
+        "It's a one-time ~137MB download, SHARED across every agent/scope on this host",
+        '(memories stay per-identity). Offer to enable it for the operator: run',
+        '`lastid-agent memory-setup` (installs, downloads, and verifies it).',
+      ].join('\n');
     }
   } catch (err) {
     process.stderr.write(`[lastid-agent] embeddings check failed: ${err.message}\n`);
   }
 }
 
-emit(context);
+emit(context + embeddingsHint);
 process.exit(0);
 
 // ---

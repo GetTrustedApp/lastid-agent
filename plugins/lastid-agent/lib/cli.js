@@ -54,6 +54,7 @@ function detectRuntimeName() {
   return `lastid-agent${here}`;
 }
 import { provisionAgent } from '../lib/agent-provisioning.js';
+import { resolveScope } from '../lib/scope.js';
 import { persistAgentVc, loadAgentVc } from '../lib/keychain.js';
 import { publishAgentKeyPackage } from '../lib/mls-publish.js';
 import { linkHumanDid } from '../lib/agent-link.js';
@@ -103,6 +104,31 @@ async function promptIdentityLocation() {
       if (choice === 'b' || choice === 'browser') return 'browser';
       console.log("  (please answer 'p' for phone or 'b' for browser)");
     }
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Provision-time prompt: enable semantic memory? Recommended (Enter = yes).
+ * The model is a one-time ~137MB download shared by every agent on this host.
+ * TTY only — returns true/false from the operator, or `null` when there's no
+ * TTY (Claude Code's bash tool, CI) so the caller falls back to a printed
+ * recommendation instead of silently doing nothing or auto-installing.
+ */
+async function promptEnableEmbeddings() {
+  if (!stdin.isTTY) return null;
+  const rl = createInterface({ input: stdin, output: stdout });
+  try {
+    const answer = await new Promise((resolve) => {
+      rl.question(
+        'Enable semantic memory now? One-time ~137MB model download (shared by all ' +
+          'your agents on this host), then verified. [Y/n]: ',
+        resolve,
+      );
+    });
+    const c = String(answer ?? '').trim().toLowerCase();
+    return c === '' || c === 'y' || c === 'yes';
   } finally {
     rl.close();
   }
@@ -182,11 +208,18 @@ function parseFlags(args) {
 }
 
 async function cmdProvision(flags) {
-  const scope = flags.scope ?? 'main';
+  const scope = resolveScope(flags);
   const existing = await loadAgentVc(scope);
-  if (existing && !flags.force) {
+  // Replacing an existing identity is a REISSUE, not a "force". (`--force`
+  // stays as a back-compat alias, but it's also matched by the operator's own
+  // dangerous-flags rule — `--reissue` is the verb to use.) A reissue mints a
+  // new identity, so afterwards we tear down the old listener + local state and
+  // reconnect on the new one (see the reset at the end of this function).
+  const reissue = flags.reissue === true || flags.force === true;
+  if (existing && !reissue) {
     console.error(
-      `agent scope=${scope} already provisioned. Re-run with --force to overwrite.`,
+      `agent scope=${scope} already provisioned. Re-run with --reissue to replace it ` +
+        `(mints a new identity, clears local state, and reconnects).`,
     );
     exit(3);
   }
@@ -394,10 +427,79 @@ async function cmdProvision(flags) {
       '   You can retry later — the chat dock will fall back to a retry attempt.',
     );
   }
+
+  // Reissue reset. We just minted a NEW identity (the keychain now holds it).
+  // The running listener still has a WebSocket bound to the OLD agent DID, and
+  // the local store is full of records sealed to the old slot_seed / signed by
+  // the old key (a stale sync cursor + undecryptable MLS state). Close the old
+  // connection, wipe that state, and bring the listener back up so it
+  // reconnects + syncs from scratch on the new identity.
+  if (reissue && existing) {
+    const { stopListener, clearScopeState, ensureListenerRunning } = await import(
+      './listener-daemon.js'
+    );
+    const { fileURLToPath } = await import('node:url');
+    console.log('');
+    console.log('Reissue — resetting local state for the new identity…');
+    try {
+      const stopped = await stopListener({ scope });
+      console.log(`   listener:   ${stopped.status} (old WebSocket closed)`);
+      await clearScopeState(scope);
+      console.log('   state:      cleared (old rules, memories, MLS, inbox, cursor)');
+      const cliPath = fileURLToPath(new URL('../bin/lastid-agent.js', import.meta.url));
+      const started = await ensureListenerRunning({ scope, cliPath });
+      console.log(`   listener:   ${started.status} — reconnecting on the new identity`);
+    } catch (err) {
+      console.error(
+        `   reset:      partial — ${err instanceof Error ? err.message : String(err)}`,
+      );
+      console.error(
+        `   If state looks stale, stop Claude Code and run: rm -rf ~/.lastid-agent/${scope}`,
+      );
+    }
+  }
+
+  // Semantic memory onboarding. The embedding model (~137MB) + dep install ONCE
+  // per host and are SHARED across every agent/scope (only the memories are
+  // per-identity), so we only prompt when this host has no model yet. Asked,
+  // never silently auto-installed; best-effort, so it never fails provisioning.
+  try {
+    const { embeddingsInstalled } = await import('./embeddings.js');
+    if (await embeddingsInstalled()) {
+      console.log('   semantic mem: enabled (shared model already on this host)');
+    } else {
+      const choice = await promptEnableEmbeddings();
+      if (choice === true) {
+        const { spawnSync } = await import('node:child_process');
+        const { fileURLToPath } = await import('node:url');
+        const cliPath = fileURLToPath(new URL('../bin/lastid-agent.js', import.meta.url));
+        console.log('');
+        const r = spawnSync('node', [cliPath, 'memory-setup', '--scope', scope], {
+          stdio: 'inherit',
+        });
+        console.log(
+          r.status === 0
+            ? '   semantic mem: enabled + verified'
+            : '   semantic mem: setup did not finish — retry with `lastid-agent memory-setup`',
+        );
+      } else if (choice === false) {
+        console.log('   semantic mem: skipped — enable later with `lastid-agent memory-setup`');
+      } else {
+        // No TTY (Claude Code's bash tool, CI): can't prompt — recommend, and
+        // let the operator (or the agent on their behalf) run it.
+        console.log('');
+        console.log('Recommended next: enable semantic memory — run `lastid-agent memory-setup`.');
+        console.log('   One-time ~137MB model, shared by all your agents on this host, then verified.');
+        console.log('   Until then, memory search uses keyword matching.');
+      }
+    }
+  } catch {
+    /* embeddings onboarding is best-effort — never fail provisioning on it */
+  }
 }
 
 async function cmdShow(flags) {
-  const scope = flags.scope ?? 'main';
+  const scope = resolveScope(flags);
   const loaded = await loadAgentVc(scope);
   if (!loaded) {
     console.error(`no agent provisioned for scope=${scope}`);
@@ -416,7 +518,7 @@ async function cmdShow(flags) {
  * structured output; without it, the text form goes to stdout.
  */
 async function cmdStatus(flags) {
-  const scope = flags.scope ?? 'main';
+  const scope = resolveScope(flags);
   const loaded = await loadAgentVc(scope);
   const claims = loaded ? decodeVcClaims(loaded.vcCompact) ?? {} : {};
   const report = loaded
@@ -465,7 +567,7 @@ async function cmdMemoryRetrieve(flags) {
     process.stderr.write('memory-retrieve: --prompt required\n');
     process.exit(2);
   }
-  const scope = flags.scope ?? 'main';
+  const scope = resolveScope(flags);
   const { loadAgentVc } = await import('./keychain.js');
   const loaded = await loadAgentVc(scope);
   if (!loaded) {
@@ -558,7 +660,7 @@ async function cmdMemorySearch(flags) {
   }
   const excludeBedrock = flags['exclude-bedrock'] === true;
   const limit = Number.parseInt(flags.limit ?? '5', 10) || 5;
-  const scope = flags.scope ?? 'main';
+  const scope = resolveScope(flags);
   const { loadAgentVc } = await import('./keychain.js');
   const loaded = await loadAgentVc(scope);
   if (!loaded) {
@@ -694,7 +796,7 @@ async function cmdMemorySetup(flags) {
 
   // Backfill embeddings for the agent's existing memories so the first real
   // search is fast.
-  const scope = flags.scope ?? 'main';
+  const scope = resolveScope(flags);
   const { loadAgentVc } = await import('./keychain.js');
   const loaded = await loadAgentVc(scope);
   if (loaded) {
@@ -730,7 +832,7 @@ async function cmdPolicyCheck(flags) {
   const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
   const { loadAgentVc } = await import('./keychain.js');
   const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
-  const loaded = await loadAgentVc(flags.scope ?? 'main');
+  const loaded = await loadAgentVc(resolveScope(flags));
   if (!loaded) {
     // Not provisioned — fail open. The plugin acts only on
     // explicitly-authored rules; without an agent there is no
@@ -745,7 +847,7 @@ async function cmdPolicyCheck(flags) {
   // saas-migration.md §2.3.
   try {
     const { OperatorStore } = await import('./operator-store.js');
-    const local = new OperatorStore(flags.scope ?? 'main').policyDecision(tool, input);
+    const local = new OperatorStore(resolveScope(flags)).policyDecision(tool, input);
     if (local) {
       process.stdout.write(JSON.stringify(local));
       process.exit(0);
@@ -836,7 +938,7 @@ async function runAgentStateSync(loaded, scope) {
  * 0 with a stderr note so it never blocks a session.
  */
 async function cmdSync(flags) {
-  const scope = flags.scope ?? 'main';
+  const scope = resolveScope(flags);
   const loaded = await loadAgentVc(scope);
   if (!loaded) process.exit(0); // not provisioned — nothing to sync
   try {
@@ -864,7 +966,7 @@ async function cmdSync(flags) {
  * auth shape every other agent-side REST call uses).
  */
 async function cmdListen(flags) {
-  const scope = flags.scope ?? 'main';
+  const scope = resolveScope(flags);
   const loaded = await loadAgentVc(scope);
   if (!loaded) {
     process.stderr.write(`not_provisioned (scope=${scope}) — run \`lastid-agent provision\` first\n`);
@@ -1185,7 +1287,7 @@ async function main() {
       break;
     case 'serve':
       await runMcpServer({
-        scope: flags.scope ?? 'main',
+        scope: resolveScope(flags),
         http: typeof flags.http === 'string' ? flags.http : flags.http === true ? ':8787' : null,
       });
       break;

@@ -26,7 +26,7 @@
  * one process wins the slot.
  */
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, writeFile, unlink, open } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, unlink, open, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
@@ -282,6 +282,38 @@ export async function releaseListenerLock({ scope = 'main', selfPid = process.pi
     return { released: true };
   }
   return { released: false };
+}
+
+/**
+ * Wipe a scope's local runtime state — used by REISSUE (provision replacing an
+ * existing identity). Removes the synced operator store (rules/memories), the
+ * agent's own memories + audit, MLS group state, the inbox/outbox + cursors,
+ * and metrics. The agent's CREDENTIAL lives in the OS keychain, NOT here, so a
+ * reissued identity re-syncs from scratch and never trips over records sealed
+ * to the old slot_seed or signed by the old key (which is how a reissue
+ * otherwise leaks a stale sync cursor + undecryptable MLS state).
+ *
+ * Caller MUST stop the listener first (it writes into this dir). `scope` is
+ * validated to a safe slug so a bad value can't escalate the recursive remove
+ * beyond `~/.lastid-agent/<scope>`. `dir` overrides the target for tests only.
+ */
+export async function clearScopeState(scope, { dir } = {}) {
+  // No default scope: a destructive recursive remove must NOT silently fall
+  // back to wiping 'main'. The caller passes an explicit scope; anything that
+  // isn't a safe slug (incl. undefined/empty) is refused so a bad value can't
+  // escalate the remove beyond ~/.lastid-agent/<scope>.
+  if (dir === undefined) {
+    const ok =
+      typeof scope === 'string' &&
+      /^[A-Za-z0-9_.-]+$/.test(scope) &&
+      scope !== '.' &&
+      scope !== '..';
+    if (!ok) throw new Error(`refusing to clear unsafe scope: ${JSON.stringify(scope)}`);
+  }
+  const target = dir ?? dataDirFor(scope);
+  await rm(target, { recursive: true, force: true });
+  await mkdir(target, { recursive: true });
+  return { cleared: target };
 }
 
 /**
