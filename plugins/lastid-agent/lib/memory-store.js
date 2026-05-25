@@ -265,6 +265,66 @@ export class MemoryStore {
     return obj;
   }
 
+  /**
+   * Reconcile a synced agent-state record into the local cache — the
+   * cross-session/cross-host path. `rec` is the decoded store record
+   * ({ id, target, version, status, content }); `author` is the record's
+   * author. Version-guarded (only strictly-newer applies, so this host's own
+   * just-written records — and their local embeddings — aren't clobbered).
+   *
+   *   - revoked (any author) → drop the id locally if present.
+   *   - active + author='agent' → rebuild the MemoryObject from content + put
+   *     (embedding null → re-embedded locally on next search).
+   *   - active + operator-authored → ignored (those live in operator-store).
+   *
+   * Returns true if the local cache changed.
+   */
+  applySync(rec, author) {
+    if (!rec || !rec.id) return false;
+    const existing = this.state.records[rec.id];
+    const ver = Number(rec.version) || 0;
+    if (existing && (Number(existing.version) || 0) >= ver) return false; // downgrade / self-echo guard
+    if (rec.status === 'revoked') {
+      if (existing) {
+        delete this.state.records[rec.id];
+        this.save();
+        return true;
+      }
+      return false;
+    }
+    if (author !== 'agent') return false; // operator-authored actives belong in operator-store
+    const c = rec.content || {};
+    if (typeof c.claim !== 'string' || c.claim.length === 0) return false;
+    const ts = nowIso();
+    this.state.records[rec.id] = {
+      id: rec.id,
+      version: ver,
+      tier: rec.target === 'global' ? 'global' : 'agent',
+      agent_did: rec.target === 'global' ? null : this.agentDid,
+      parent_human_did: this.parentHumanDid,
+      kind: MEMORY_KINDS.includes(c.kind) ? c.kind : 'fact',
+      subject: Array.isArray(c.subject) ? c.subject : [],
+      claim: c.claim,
+      ...(typeof c.summary === 'string' ? { summary: c.summary } : {}),
+      source: { kind: SOURCE_KINDS.includes(c.source_kind) ? c.source_kind : 'inferred' },
+      confidence: typeof c.confidence === 'number' ? c.confidence : 0.6,
+      sensitivity: SENSITIVITIES.includes(c.sensitivity) ? c.sensitivity : 'low',
+      bedrock: c.bedrock === true,
+      allowed_uses: ['reasoning', 'style'],
+      forbidden_uses: [],
+      status: STATUSES.includes(c.status) ? c.status : 'active',
+      created_at: typeof c.created_at === 'string' ? c.created_at : ts,
+      updated_at: ts,
+      last_confirmed_at: ts,
+      decay: DECAYS.includes(c.decay) ? c.decay : 'none',
+      related: [],
+      embedding: null,
+      embedding_model_version: null,
+    };
+    this.save();
+    return true;
+  }
+
   /** Partial update. Only claim/summary/sensitivity/status/bedrock/
    *  expires_at are caller-editable (mirrors the update tool). Editing
    *  claim/summary invalidates the embedding so it gets recomputed. */

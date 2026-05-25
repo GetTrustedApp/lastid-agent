@@ -781,15 +781,30 @@ async function cmdPolicyCheck(flags) {
  * errors (callers fail open).
  */
 async function runAgentStateSync(loaded, scope) {
-  const [{ deriveAgentEd25519Keypair }, { OperatorStore }, { syncAgentState }] =
-    await Promise.all([
-      import('./agent-provisioning.js'),
-      import('./operator-store.js'),
-      import('./agent-state-sync.js'),
-    ]);
+  const [
+    { deriveAgentEd25519Keypair },
+    { OperatorStore },
+    { syncAgentState },
+    { MemoryStore },
+    { decodeVcClaims },
+  ] = await Promise.all([
+    import('./agent-provisioning.js'),
+    import('./operator-store.js'),
+    import('./agent-state-sync.js'),
+    import('./memory-store.js'),
+    import('./vc-claims.js'),
+  ]);
   const idpUrl = loaded.idpUrl ?? env.LASTID_IDP_URL ?? 'https://human.lastid.co';
   const { signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed);
   const store = new OperatorStore(scope);
+  // Memory store for cross-session/host reconcile: agent-authored memories
+  // (and memory revokes) from the IdP land here, so a memory written on
+  // another host/session shows up locally.
+  const claims = decodeVcClaims(loaded.vcCompact) ?? {};
+  const memoryStore = new MemoryStore(scope, undefined, {
+    agentDid: claims.sub ?? loaded.agentDid ?? null,
+    parentHumanDid: claims.parent_human_did ?? null,
+  });
   return syncAgentState({
     idpUrl,
     agentDid: loaded.agentDid,
@@ -797,6 +812,7 @@ async function runAgentStateSync(loaded, scope) {
     signingKey,
     slotSeed: loaded.slotSeed,
     store,
+    memoryStore,
     fetchImpl: globalThis.fetch,
   });
 }

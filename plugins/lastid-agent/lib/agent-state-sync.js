@@ -90,6 +90,7 @@ export async function syncAgentState({
   signingKey,
   slotSeed,
   store,
+  memoryStore = null,
   fetchImpl = globalThis.fetch,
   operatorJwk = null,
   verifyRecord = null,
@@ -112,15 +113,9 @@ export async function syncAgentState({
   const all = [...rules.records, ...memories.records];
   let maxCursor = Math.max(since, rules.cursor, memories.cursor);
   const decoded = [];
+  let reconciled = 0;
   for (const rec of all) {
     if (typeof rec.cursor === 'number' && rec.cursor > maxCursor) maxCursor = rec.cursor;
-
-    // The agent's OWN authored memories live in the local memory store (written
-    // through to the IdP from there); applying them to the operator-store too
-    // would double-inject. Operator-authored — and agent drafts the operator
-    // PROMOTED — come back with author!=='agent' and DO apply here. (Cursor
-    // already advanced above, so these aren't re-fetched.)
-    if (rec.kind === 'memory' && rec.author === 'agent') continue;
 
     let storeRecord;
     let contentBytes = null;
@@ -147,11 +142,31 @@ export async function syncAgentState({
       continue;
     }
 
+    // Reconcile agent-authored memories (+ any memory revoke) into the local
+    // memory store — the cross-session/host path. The memory store decides
+    // (version-guarded; ignores operator-authored actives).
+    if (memoryStore && rec.kind === 'memory') {
+      try {
+        if (memoryStore.applySync(storeRecord, rec.author)) reconciled += 1;
+      } catch (err) {
+        safely(onReject, rec, `reconcile: ${err?.message ?? err}`);
+      }
+    }
+
+    // The agent's OWN authored memory ACTIVES live in the memory store, not the
+    // operator-store — skip them here to avoid double-injection. Revokes still
+    // flow to the operator-store (it removes the id if it holds it; harmless
+    // no-op otherwise). Operator-authored + promoted records apply normally.
+    if (rec.kind === 'memory' && rec.author === 'agent' && storeRecord.status !== 'revoked') {
+      continue;
+    }
+
     decoded.push(storeRecord);
   }
   const applied = store.applyRecords(decoded, maxCursor);
   return {
     applied,
+    reconciled,
     cursor: store.cursor,
     fetched: all.length,
     rejected: all.length - decoded.length,
