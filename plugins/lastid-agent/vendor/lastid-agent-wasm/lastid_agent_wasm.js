@@ -906,6 +906,21 @@ function sdkDenyAgentProvisioning(user_code, reason, idp_url) {
 exports.sdkDenyAgentProvisioning = sdkDenyAgentProvisioning;
 
 /**
+ * Encrypt a rule/memory record for the agent at `slot_index`. Returns a
+ * base64 LIDE SymmetricOnly envelope the agent decrypts with its slot_seed.
+ * @param {number} slot_index
+ * @param {Uint8Array} content
+ * @returns {Promise<string>}
+ */
+function sdkEncryptAgentContentForSlot(slot_index, content) {
+    const ptr0 = passArray8ToWasm0(content, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkEncryptAgentContentForSlot(slot_index, ptr0, len0);
+    return ret;
+}
+exports.sdkEncryptAgentContentForSlot = sdkEncryptAgentContentForSlot;
+
+/**
  * GET `/v1/oid4vci/agent-provision/pending/:user_code` with the
  * operator's authenticated session.
  *
@@ -1141,6 +1156,19 @@ function sdkRegisterDelegationAuthority(idp_url) {
     return ret;
 }
 exports.sdkRegisterDelegationAuthority = sdkRegisterDelegationAuthority;
+
+/**
+ * Sign an agent-state record (rule/memory) with the operator's
+ * delegation_authority. Returns a compact JWS the agent verifies before
+ * applying. `record_json` is the canonical record object.
+ * @param {any} record_json
+ * @returns {Promise<string>}
+ */
+function sdkSignAgentStateRecord(record_json) {
+    const ret = wasm.sdkSignAgentStateRecord(record_json);
+    return ret;
+}
+exports.sdkSignAgentStateRecord = sdkSignAgentStateRecord;
 
 /**
  * Sign `data` with the ML-DSA-65 operational key bound to
@@ -2239,27 +2267,27 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1251, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1262, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h07eda6f9933457e4);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 897, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 845, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1725375cb213b3e4);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 825, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 787, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hfba200ffcbc2c4fb);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 438, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 448, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h23499dd81690a033);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 984, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 932, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3c6c61154a9359bf);
             return ret;
         },

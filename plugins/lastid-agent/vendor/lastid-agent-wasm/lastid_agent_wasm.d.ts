@@ -363,6 +363,12 @@ export function sdkCreateIdentity(password: string, use_biometrics: boolean): Pr
 export function sdkDenyAgentProvisioning(user_code: string, reason: string, idp_url: string): Promise<any>;
 
 /**
+ * Encrypt a rule/memory record for the agent at `slot_index`. Returns a
+ * base64 LIDE SymmetricOnly envelope the agent decrypts with its slot_seed.
+ */
+export function sdkEncryptAgentContentForSlot(slot_index: number, content: Uint8Array): Promise<string>;
+
+/**
  * GET `/v1/oid4vci/agent-provision/pending/:user_code` with the
  * operator's authenticated session.
  *
@@ -513,6 +519,13 @@ export function sdkPutChatThread(conversation_id: string, messages_json: string)
  * the trust anchor for subsequent provisions.
  */
 export function sdkRegisterDelegationAuthority(idp_url: string): Promise<any>;
+
+/**
+ * Sign an agent-state record (rule/memory) with the operator's
+ * delegation_authority. Returns a compact JWS the agent verifies before
+ * applying. `record_json` is the canonical record object.
+ */
+export function sdkSignAgentStateRecord(record_json: any): Promise<string>;
 
 /**
  * Sign `data` with the ML-DSA-65 operational key bound to
