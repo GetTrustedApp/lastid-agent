@@ -13,11 +13,29 @@ The CLI will:
 
 Future Claude Code sessions on this host run authenticated — no re-provisioning.
 
-Run:
+## How to run this (agent: do this yourself — do NOT tell the operator to run it)
 
-```bash
-node ${CLAUDE_PLUGIN_ROOT}/bin/lastid-agent.js provision
-```
+The QR renders fine as text in your tool output, so run provisioning FOR the
+operator. The command prints a QR + `lastid://` link to stdout, then polls (up
+to ~2 min) for the operator's wallet approval — so it must run in the
+BACKGROUND or it will stall your session.
+
+1. Launch it **in the background** (it inherits `LASTID_AGENT_SCOPE`, so it
+   targets the right scope automatically):
+
+   ```bash
+   node ${CLAUDE_PLUGIN_ROOT}/bin/lastid-agent.js provision
+   ```
+
+2. Give it a second to print, then **read the background command's output** and
+   show the operator the QR code (the block-character art) verbatim, plus the
+   verification URL + user code. Tell them to scan it with their LastID wallet
+   (or tap the `lastid://` link on the device holding their LastID).
+3. Keep the background command running — on approval it persists the credential
+   to the OS keychain and exits. When it finishes, confirm with `lastid_whoami`.
+
+Never punt with "run this yourself in your terminal" — surface the QR from the
+background output instead.
 
 Status check (no re-run):
 
