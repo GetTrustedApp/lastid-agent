@@ -197,6 +197,9 @@ export class MemoryStore {
     const sensitivity = escalateSensitivity(input.sensitivity ?? 'low', claim, summary);
     return {
       id: newMemoryId(),
+      // Monotonic per-id version for the IdP agent-state record (write-through
+      // supersede). Bumped on each update.
+      version: 1,
       tier,
       agent_did: tier === 'agent' ? this.agentDid : null,
       parent_human_did: this.parentHumanDid,
@@ -253,6 +256,15 @@ export class MemoryStore {
     return this.state.records[id] ?? null;
   }
 
+  /** Persist a prebuilt record (used to roll the local cache back to a
+   *  snapshot when a live IdP write-through fails). */
+  put(obj) {
+    if (!obj || !obj.id) return null;
+    this.state.records[obj.id] = obj;
+    this.save();
+    return obj;
+  }
+
   /** Partial update. Only claim/summary/sensitivity/status/bedrock/
    *  expires_at are caller-editable (mirrors the update tool). Editing
    *  claim/summary invalidates the embedding so it gets recomputed. */
@@ -289,6 +301,7 @@ export class MemoryStore {
       m.embedding = null;
       m.embedding_model_version = null;
     }
+    m.version = (Number(m.version) || 1) + 1;
     m.updated_at = nowIso();
     this.save();
     return m;
@@ -302,6 +315,7 @@ export class MemoryStore {
       delete this.state.records[id];
     } else {
       m.status = 'forgotten';
+      m.version = (Number(m.version) || 1) + 1;
       m.updated_at = nowIso();
     }
     this.save();

@@ -18,6 +18,9 @@ import { MemoryStore } from './memory-store.js';
 import { makeEmbedder, cosine, embedMemory, EMBED_DIM, SEMANTIC_FLOOR } from './embeddings.js';
 import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
 import { appendMemoryAudit } from './memory-audit.js';
+import { publishAgentMemory } from './agent-memory-publish.js';
+
+const DEFAULT_IDP_URL = 'https://human.lastid.co';
 
 const CAP_WRITE = { resource: 'memory:write:global', action: 'Write' };
 const CAP_DRAFT = { resource: 'memory:draft:global', action: 'Draft' };
@@ -158,7 +161,8 @@ export const MEMORY_TOOL_NAMES = new Set(MEMORY_TOOLS.map((t) => t.name));
 // vectors or internal bookkeeping echoed back.
 function publicView(m) {
   if (!m) return null;
-  const { embedding, embedding_model_version, ...rest } = m;
+  // Strip internal/local-only fields (raw embedding vector, sync bookkeeping).
+  const { embedding, embedding_model_version, _unsynced, ...rest } = m;
   return rest;
 }
 
@@ -237,7 +241,7 @@ function err(message) {
  * Dispatch a memory tool. Assumes the central capability gate already ran.
  * Builds the store from the agent's identity (agent_did + parent_human_did).
  */
-export async function handleMemoryTool({ name, args = {}, scope = 'main', loadedAgent, claims }) {
+export async function handleMemoryTool({ name, args = {}, scope = 'main', loadedAgent, claims, fetchImpl }) {
   if (!loadedAgent) return err('not provisioned — run `lastid-agent provision` first');
   const agentDid = claims?.sub ?? loadedAgent.agentDid ?? null;
   const store = new MemoryStore(scope, undefined, {
@@ -258,10 +262,24 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
       process.stderr.write(`[lastid-agent] memory-audit append failed: ${e?.message ?? e}\n`);
     }
   };
+  // LIVE write-through (saas-migration §slot_seed): the IdP server store is
+  // authoritative. The tool encrypts under the agent's slot_seed and POSTs as
+  // the operation — only on a confirmed write does the local cache keep it.
+  // If the IdP write fails the local cache is rolled back and the tool reports
+  // the failure; we do NOT silently keep a local-only copy.
+  const idpUrl = loadedAgent.idpUrl ?? DEFAULT_IDP_URL;
+  const live = (memory, status) =>
+    publishAgentMemory({ idpUrl, loaded: loadedAgent, memory, status, version: memory.version, fetchImpl }).catch(() => false);
+  const notSaved = (detail) =>
+    err(`memory NOT saved — the server write failed${detail ? `: ${detail}` : ''}. Tell your operator; nothing was stored.`);
   try {
     switch (name) {
       case 'lastid_memory_write': {
-        const m = store.write(args);
+        const m = store.write(args); // local cache
+        if (!(await live(m, 'active'))) {
+          store.forget(m.id, { hard: true }); // roll back — IdP is authoritative
+          return notSaved();
+        }
         audit('AgentMemoryWritten', m.id, {
           kind: m.kind,
           tier: m.tier,
@@ -269,18 +287,24 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
           source_kind: m.source?.kind,
           sensitivity: m.sensitivity,
         });
-        return ok({ ok: true, memory: publicView(m) });
+        return ok({ ok: true, memory: publicView(store.get(m.id) ?? m) });
       }
-      case 'lastid_memory_draft':
-        // Drafts are proposals — not chained until the operator promotes them
-        // (matches the desktop semantics: the chain logs decisions, not
-        // proposals).
+      case 'lastid_memory_draft': {
+        // Drafts ride to the IdP too (content.status='drafted') so the operator
+        // sees them for review; not audit-chained until promoted (the chain
+        // logs decisions, not proposals).
+        const m = store.draft(args);
+        if (!(await live(m, 'active'))) {
+          store.forget(m.id, { hard: true });
+          return notSaved();
+        }
         return ok({
           ok: true,
           status: 'drafted',
-          note: 'Queued for operator review. Will not influence future turns until promoted.',
-          memory: publicView(store.draft(args)),
+          note: 'Saved to your operator for review. Will not influence future turns until promoted.',
+          memory: publicView(store.get(m.id) ?? m),
         });
+      }
       case 'lastid_memory_get': {
         const m = store.get(args.id);
         return m ? ok({ memory: publicView(m) }) : err(`no memory with id ${args.id}`);
@@ -296,19 +320,31 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
         return ok({ query: args.query, hits });
       }
       case 'lastid_memory_update': {
+        const before = store.get(args.id);
+        if (!before) return err(`no memory with id ${args.id}`);
+        const snapshot = structuredClone(before);
         const m = store.update(args.id, args);
-        if (!m) return err(`no memory with id ${args.id}`);
+        if (!(await live(m, 'active'))) {
+          store.put(snapshot); // roll back to pre-update
+          return notSaved();
+        }
         const fields = ['claim', 'summary', 'sensitivity', 'status', 'bedrock', 'expires_at', 'clear_expires_at']
           .filter((k) => args[k] !== undefined);
         audit('AgentMemoryUpdated', m.id, {
           fields_changed: fields.join(','),
           ...(typeof args.reason === 'string' ? { reason: args.reason } : {}),
         });
-        return ok({ ok: true, memory: publicView(m) });
+        return ok({ ok: true, memory: publicView(store.get(m.id) ?? m) });
       }
       case 'lastid_memory_forget': {
-        const done = store.forget(args.id, { hard: args.hard_delete === true });
-        if (!done) return err(`no memory with id ${args.id}`);
+        const before = store.get(args.id);
+        if (!before) return err(`no memory with id ${args.id}`);
+        const tombVersion = (Number(before.version) || 1) + 1;
+        // Revoke at the IdP first; only drop locally once the server confirms.
+        if (!(await live({ id: args.id, tier: before.tier ?? 'agent', version: tombVersion }, 'revoked'))) {
+          return notSaved('the forget did not reach the server');
+        }
+        store.forget(args.id, { hard: args.hard_delete === true });
         audit('AgentMemoryForgotten', args.id, {
           hard_delete: String(args.hard_delete === true),
           ...(typeof args.reason === 'string' ? { reason: args.reason } : {}),

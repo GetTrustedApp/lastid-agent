@@ -20,8 +20,17 @@ import {
 } from '../lib/memory-tools.js';
 import { MemoryStore } from '../lib/memory-store.js';
 
-const loadedAgent = { agentDid: 'did:lastid:agent:zTEST' };
+// slot seed present so the live write-through can encrypt + sign.
+const loadedAgent = {
+  agentDid: 'did:lastid:agent:zTEST',
+  slotSeed: Buffer.alloc(32, 7),
+  vcCompact: 'vc.jwt',
+  idpUrl: 'https://idp.test',
+};
 const claims = { sub: 'did:lastid:agent:zTEST', parent_human_did: 'did:lastid:zHUMAN' };
+// Mock IdP: writes "succeed"/"fail" without touching the network.
+const okFetch = async () => ({ ok: true, status: 200 });
+const failFetch = async () => ({ ok: false, status: 503 });
 
 function withScope() {
   const scope = `test-${randomUUID()}`;
@@ -29,8 +38,8 @@ function withScope() {
   return { scope, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-function call(name, args, scope) {
-  return handleMemoryTool({ name, args, scope, loadedAgent, claims });
+function call(name, args, scope, fetchImpl = okFetch) {
+  return handleMemoryTool({ name, args, scope, loadedAgent, claims, fetchImpl });
 }
 function body(res) {
   return JSON.parse(res.content[0].text);
@@ -168,6 +177,49 @@ test('write validation surfaces as an error result (not a throw)', async () => {
 });
 
 // ── ranking helpers ────────────────────────────────────────────────
+
+// ── live write-through: IdP is authoritative, rollback on failure ──
+
+test('LIVE: write fails when the IdP write fails — nothing kept locally', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const r = await call('lastid_memory_write', {
+      kind: 'fact', subject: ['x'], claim: 'should not persist', source_kind: 'user_explicit',
+    }, scope, failFetch);
+    assert.equal(r.isError, true);
+    assert.match(body(r).error, /NOT saved/);
+    const list = body(await call('lastid_memory_list', {}, scope));
+    assert.equal(list.memories.length, 0, 'rolled back — no local-only copy');
+  } finally {
+    cleanup();
+  }
+});
+
+test('LIVE: update rolls back to the prior value when the IdP write fails', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const w = body(await call('lastid_memory_write', { kind: 'fact', subject: ['x'], claim: 'original', source_kind: 'user_explicit' }, scope));
+    const u = await call('lastid_memory_update', { id: w.memory.id, claim: 'changed', reason: 'r' }, scope, failFetch);
+    assert.equal(u.isError, true);
+    const got = body(await call('lastid_memory_get', { id: w.memory.id }, scope));
+    assert.equal(got.memory.claim, 'original', 'reverted on failed server write');
+  } finally {
+    cleanup();
+  }
+});
+
+test('LIVE: forget does NOT drop locally when the IdP revoke fails', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const w = body(await call('lastid_memory_write', { kind: 'fact', subject: ['x'], claim: 'keep me', source_kind: 'user_explicit' }, scope));
+    const f = await call('lastid_memory_forget', { id: w.memory.id, reason: 'r' }, scope, failFetch);
+    assert.equal(f.isError, true);
+    const got = body(await call('lastid_memory_get', { id: w.memory.id }, scope));
+    assert.equal(got.memory.status, 'active', 'still active — revoke never reached the server');
+  } finally {
+    cleanup();
+  }
+});
 
 test('keywordScore: fraction of query terms present', () => {
   const m = { claim: 'use socketfirewall for npm installs', subject: ['deploy'] };

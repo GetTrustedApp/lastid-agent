@@ -115,6 +115,13 @@ export async function syncAgentState({
   for (const rec of all) {
     if (typeof rec.cursor === 'number' && rec.cursor > maxCursor) maxCursor = rec.cursor;
 
+    // The agent's OWN authored memories live in the local memory store (written
+    // through to the IdP from there); applying them to the operator-store too
+    // would double-inject. Operator-authored — and agent drafts the operator
+    // PROMOTED — come back with author!=='agent' and DO apply here. (Cursor
+    // already advanced above, so these aren't re-fetched.)
+    if (rec.kind === 'memory' && rec.author === 'agent') continue;
+
     let storeRecord;
     let contentBytes = null;
     try {

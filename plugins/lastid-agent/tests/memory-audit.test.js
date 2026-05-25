@@ -140,12 +140,13 @@ test('shipMemoryAudit: POSTs unshipped records to /audit + advances on 2xx', asy
 
 // ── memory-tools integration ───────────────────────────────────────
 
-const loadedAgent = { agentDid: 'did:lastid:agent:zT', slotSeed: Buffer.alloc(32, 7) };
+const loadedAgent = { agentDid: 'did:lastid:agent:zT', slotSeed: Buffer.alloc(32, 7), vcCompact: 'vc.jwt', idpUrl: 'https://idp.test' };
 const claims = { sub: 'did:lastid:agent:zT', parent_human_did: 'did:lastid:zH' };
+const okFetch = async () => ({ ok: true, status: 200 }); // live write-through succeeds w/o network
 
 test('memory tools append audit records (write/update/forget); draft does NOT', async () => {
   const { scope, dir } = freshScope();
-  const call = (name, args) => handleMemoryTool({ name, args, scope, loadedAgent, claims });
+  const call = (name, args) => handleMemoryTool({ name, args, scope, loadedAgent, claims, fetchImpl: okFetch });
   const body = (r) => JSON.parse(r.content[0].text);
   try {
     const w = body(await call('lastid_memory_write', { kind: 'fact', subject: ['x'], claim: 'c1', source_kind: 'user_explicit' }));
