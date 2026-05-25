@@ -16,6 +16,8 @@
  */
 import { MemoryStore } from './memory-store.js';
 import { makeEmbedder, cosine, embedMemory, EMBED_DIM, SEMANTIC_FLOOR } from './embeddings.js';
+import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
+import { appendMemoryAudit } from './memory-audit.js';
 
 const CAP_WRITE = { resource: 'memory:write:global', action: 'Write' };
 const CAP_DRAFT = { resource: 'memory:draft:global', action: 'Draft' };
@@ -237,15 +239,42 @@ function err(message) {
  */
 export async function handleMemoryTool({ name, args = {}, scope = 'main', loadedAgent, claims }) {
   if (!loadedAgent) return err('not provisioned — run `lastid-agent provision` first');
+  const agentDid = claims?.sub ?? loadedAgent.agentDid ?? null;
   const store = new MemoryStore(scope, undefined, {
-    agentDid: claims?.sub ?? loadedAgent.agentDid ?? null,
+    agentDid,
     parentHumanDid: claims?.parent_human_did ?? null,
   });
+  // Agent-side audit chain: sign every memory CUD with the agent's key.
+  let signingKey = null;
+  try {
+    ({ signingKey } = deriveAgentEd25519Keypair(loadedAgent.slotSeed));
+  } catch {
+    /* unsigned audit if key derivation fails — still hash-linked */
+  }
+  const audit = (eventType, memoryId, metadata) => {
+    try {
+      appendMemoryAudit({ scope, signingKey, agentDid, eventType, memoryId, metadata });
+    } catch (e) {
+      process.stderr.write(`[lastid-agent] memory-audit append failed: ${e?.message ?? e}\n`);
+    }
+  };
   try {
     switch (name) {
-      case 'lastid_memory_write':
-        return ok({ ok: true, memory: publicView(store.write(args)) });
+      case 'lastid_memory_write': {
+        const m = store.write(args);
+        audit('AgentMemoryWritten', m.id, {
+          kind: m.kind,
+          tier: m.tier,
+          bedrock: String(m.bedrock === true),
+          source_kind: m.source?.kind,
+          sensitivity: m.sensitivity,
+        });
+        return ok({ ok: true, memory: publicView(m) });
+      }
       case 'lastid_memory_draft':
+        // Drafts are proposals — not chained until the operator promotes them
+        // (matches the desktop semantics: the chain logs decisions, not
+        // proposals).
         return ok({
           ok: true,
           status: 'drafted',
@@ -262,19 +291,29 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
         const hits = await searchMemories(store, args.query, {
           limit: Number.isInteger(args.limit) ? args.limit : 8,
           excludeBedrock: args.exclude_bedrock === true,
-          embedder: makeEmbedder(),
+          embedder: makeEmbedder({ scope }),
         });
         return ok({ query: args.query, hits });
       }
       case 'lastid_memory_update': {
         const m = store.update(args.id, args);
-        return m ? ok({ ok: true, memory: publicView(m) }) : err(`no memory with id ${args.id}`);
+        if (!m) return err(`no memory with id ${args.id}`);
+        const fields = ['claim', 'summary', 'sensitivity', 'status', 'bedrock', 'expires_at', 'clear_expires_at']
+          .filter((k) => args[k] !== undefined);
+        audit('AgentMemoryUpdated', m.id, {
+          fields_changed: fields.join(','),
+          ...(typeof args.reason === 'string' ? { reason: args.reason } : {}),
+        });
+        return ok({ ok: true, memory: publicView(m) });
       }
       case 'lastid_memory_forget': {
         const done = store.forget(args.id, { hard: args.hard_delete === true });
-        return done
-          ? ok({ ok: true, id: args.id, hard_delete: args.hard_delete === true })
-          : err(`no memory with id ${args.id}`);
+        if (!done) return err(`no memory with id ${args.id}`);
+        audit('AgentMemoryForgotten', args.id, {
+          hard_delete: String(args.hard_delete === true),
+          ...(typeof args.reason === 'string' ? { reason: args.reason } : {}),
+        });
+        return ok({ ok: true, id: args.id, hard_delete: args.hard_delete === true });
       }
       default:
         return err(`unknown memory tool: ${name}`);

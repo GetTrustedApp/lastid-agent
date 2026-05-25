@@ -15,6 +15,7 @@
  */
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { connect } from 'node:net';
 import { memoryEmbeddingText } from './memory-store.js';
 
 export const EMBED_MODEL = 'Xenova/all-MiniLM-L6-v2';
@@ -27,6 +28,55 @@ export const SEMANTIC_FLOOR = 0.2;
 
 export function modelCacheDir() {
   return join(homedir(), '.lastid-agent', 'models');
+}
+
+/** Unix socket the listener's embedding daemon listens on. */
+export function embedSocketPath(scope = 'main') {
+  return join(homedir(), '.lastid-agent', scope ?? 'main', 'embed.sock');
+}
+
+/**
+ * Ask the warm embedding daemon (running in the listener) to embed `text`.
+ * Newline-delimited JSON over a unix socket: send {text}, read {vector} or
+ * {error}. Returns the vector, or null if the daemon isn't running / errors
+ * / times out (caller falls back to in-process or keyword). Fast path — the
+ * model is already loaded in the listener, so this avoids per-spawn init.
+ */
+export function embedViaListener(scope, text, timeoutMs = 2500) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      try { sock.destroy(); } catch { /* ignore */ }
+      resolve(v);
+    };
+    let sock;
+    try {
+      sock = connect(embedSocketPath(scope));
+    } catch {
+      return resolve(null);
+    }
+    const timer = setTimeout(() => done(null), timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    let buf = '';
+    sock.on('error', () => done(null)); // ENOENT/ECONNREFUSED → no daemon
+    sock.on('connect', () => {
+      sock.write(`${JSON.stringify({ text })}\n`);
+    });
+    sock.on('data', (chunk) => {
+      buf += chunk.toString('utf-8');
+      const nl = buf.indexOf('\n');
+      if (nl === -1) return;
+      clearTimeout(timer);
+      try {
+        const msg = JSON.parse(buf.slice(0, nl));
+        done(Array.isArray(msg?.vector) && msg.vector.length === EMBED_DIM ? msg.vector : null);
+      } catch {
+        done(null);
+      }
+    });
+  });
 }
 
 let _pipelinePromise = null; // shared across makeEmbedder() callers
@@ -68,24 +118,44 @@ export async function embeddingsInstalled() {
   }
 }
 
+/** In-process embed: load the model in THIS process and embed. ~0.2s on a
+ *  warm disk cache. Used as the fallback when the listener daemon isn't up,
+ *  and BY the daemon itself. */
+export async function embedInProcess(text) {
+  if (!text || typeof text !== 'string') return null;
+  const extractor = await loadPipeline();
+  if (!extractor) return null;
+  try {
+    const out = await extractor(text, { pooling: 'mean', normalize: true });
+    return Array.from(out.data);
+  } catch (err) {
+    process.stderr.write(`[lastid-agent] embed failed: ${err?.message ?? err}\n`);
+    return null;
+  }
+}
+
 /**
- * Returns an async embedder fn (text → number[384]) or, when embeddings are
- * unavailable, a fn that resolves null. Always returns a function so callers
- * can `await embedder(text)` and branch on null. Mean-pooled + L2-normalized,
- * matching the desktop's embedding text composition.
+ * Returns an async embedder fn (text → number[384] | null). Always a function
+ * so callers can `await embedder(text)` and branch on null.
+ *
+ * Resolution order:
+ *   1. the warm embedding daemon in the listener (fast, one shared model) —
+ *      tried when `scope` is given;
+ *   2. in-process load (~0.2s warm cache) — unless `daemonOnly`;
+ *   3. null → caller falls back to keyword.
+ *
+ * The MCP server / CLI spawns get warm embeddings for free when the listener
+ * is running; otherwise they pay the one-time in-process load.
  */
-export function makeEmbedder() {
+export function makeEmbedder({ scope = null, daemonOnly = false } = {}) {
   return async function embed(text) {
     if (!text || typeof text !== 'string') return null;
-    const extractor = await loadPipeline();
-    if (!extractor) return null;
-    try {
-      const out = await extractor(text, { pooling: 'mean', normalize: true });
-      return Array.from(out.data);
-    } catch (err) {
-      process.stderr.write(`[lastid-agent] embed failed: ${err?.message ?? err}\n`);
-      return null;
+    if (scope) {
+      const viaDaemon = await embedViaListener(scope, text);
+      if (Array.isArray(viaDaemon)) return viaDaemon;
     }
+    if (daemonOnly) return null;
+    return embedInProcess(text);
   };
 }
 

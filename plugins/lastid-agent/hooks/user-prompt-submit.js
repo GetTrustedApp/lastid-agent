@@ -55,7 +55,9 @@ const result = spawnSync(
   [cliPath, 'memory-retrieve', '--prompt', userPrompt],
   {
     encoding: 'utf-8',
-    timeout: 1_800,
+    // Generous enough for a warm-daemon embed (~tens of ms) OR a one-time
+    // in-process model load (~0.2s) on the topical path; still imperceptible.
+    timeout: 5_000,
     input: '',
   },
 );

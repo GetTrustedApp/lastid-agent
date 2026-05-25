@@ -18,7 +18,8 @@
  * get last_confirmed_at bumped via store.confirm().
  */
 import { MemoryStore } from './memory-store.js';
-import { searchMemories } from './memory-tools.js';
+import { searchMemories, keywordScore } from './memory-tools.js';
+import { cosine, SEMANTIC_FLOOR } from './embeddings.js';
 
 const PACKET_PREAMBLE =
   'The following memories are ground truth about the operator and project. ' +
@@ -54,6 +55,59 @@ function renderItem(m) {
 }
 
 /**
+ * Topically rank operator-authored (synced) memories that are NOT bedrock
+ * (bedrock is always injected separately). Operator-store records carry no
+ * persisted embedding, so we embed their text on the fly when an embedder is
+ * available (the warm daemon makes this cheap), else keyword. Returns hits in
+ * the same shape as searchMemories.
+ */
+async function topicalOperatorMemories(operatorStore, query, embedder, limit) {
+  if (!operatorStore || typeof operatorStore.listMemories !== 'function' || !query) return [];
+  let candidates;
+  try {
+    candidates = operatorStore
+      .listMemories()
+      .filter((r) => r?.content && r.content.bedrock !== true && typeof r.content.claim === 'string' && r.content.claim.length > 0)
+      .map((r) => ({
+        id: r.id,
+        claim: r.content.claim,
+        summary: typeof r.content.summary === 'string' ? r.content.summary : undefined,
+        subject: Array.isArray(r.content.subject) ? r.content.subject : [],
+      }));
+  } catch {
+    return [];
+  }
+  if (candidates.length === 0) return [];
+
+  let scored = null;
+  if (typeof embedder === 'function') {
+    const qvec = await embedder(query);
+    if (Array.isArray(qvec)) {
+      scored = [];
+      for (const c of candidates) {
+        const text = [c.claim, c.summary, ...(c.subject ?? [])].filter(Boolean).join('\n');
+        const v = await embedder(text);
+        const score = Array.isArray(v) ? cosine(qvec, v) : 0;
+        if (score >= SEMANTIC_FLOOR) scored.push({ c, score });
+      }
+    }
+  }
+  if (!scored) {
+    scored = candidates
+      .map((c) => ({ c, score: keywordScore(query, c) }))
+      .filter((x) => x.score > 0);
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map(({ c, score }) => ({
+    memory_id: c.id,
+    claim: c.claim,
+    ...(c.summary ? { summary: c.summary } : {}),
+    subject: c.subject,
+    score: Number(score.toFixed(4)),
+  }));
+}
+
+/**
  * Build the bedrock + topical retrieval packet for `prompt`. Returns
  * { markdown, injectedIds }. Empty markdown ('') when there's nothing.
  */
@@ -71,11 +125,16 @@ export async function retrievePacket({
 
   const bedrock = [...mem.bedrockMemories().map((m) => ({ id: m.id, claim: m.claim, summary: m.summary })), ...operatorBedrock(operatorStore)];
 
-  const topical = await searchMemories(mem, prompt ?? '', {
-    limit: topicalLimit,
-    excludeBedrock: true,
-    embedder,
-  });
+  // Topical = agent-authored + operator-authored (non-bedrock), ranked
+  // together. Each side scores on the same cosine/keyword basis, so merging
+  // by score is apples-to-apples.
+  const [agentTopical, opTopical] = await Promise.all([
+    searchMemories(mem, prompt ?? '', { limit: topicalLimit, excludeBedrock: true, embedder }),
+    topicalOperatorMemories(operatorStore, prompt ?? '', embedder, topicalLimit),
+  ]);
+  const topical = [...agentTopical, ...opTopical]
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+    .slice(0, topicalLimit);
 
   if (bedrock.length === 0 && topical.length === 0) {
     return { markdown: '', injectedIds: [] };

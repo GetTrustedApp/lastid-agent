@@ -483,7 +483,7 @@ async function cmdMemoryRetrieve(flags) {
     const { OperatorStore } = await import('./operator-store.js');
     const { makeEmbedder } = await import('./embeddings.js').catch(() => ({}));
     const claims = decodeVcClaims(loaded.vcCompact) ?? {};
-    const embedder = typeof makeEmbedder === 'function' ? makeEmbedder() : null;
+    const embedder = typeof makeEmbedder === 'function' ? makeEmbedder({ scope }) : null;
     const { markdown } = await retrievePacket({
       scope,
       agentDid: claims.sub ?? loaded.agentDid ?? null,
@@ -568,7 +568,7 @@ async function cmdMemorySearch(flags) {
     const { retrieveSearchBlock } = await import('./memory-retrieve.js');
     const { makeEmbedder } = await import('./embeddings.js').catch(() => ({}));
     const claims = decodeVcClaims(loaded.vcCompact) ?? {};
-    const embedder = typeof makeEmbedder === 'function' ? makeEmbedder() : null;
+    const embedder = typeof makeEmbedder === 'function' ? makeEmbedder({ scope }) : null;
     const block = await retrieveSearchBlock({
       scope,
       agentDid: claims.sub ?? loaded.agentDid ?? null,
@@ -986,6 +986,20 @@ async function cmdListen(flags) {
   process.stderr.write(`[lastid-agent] listening as ${loaded.agentDid} on ${idpUrl}\n`);
   ws.start();
 
+  // Embedding daemon: load the memory-search model ONCE here (warm) and serve
+  // it over a unix socket so per-prompt CLI spawns (memory-retrieve/-search)
+  // get fast embeddings instead of re-initializing. No-op when the opt-in
+  // embeddings dep isn't installed (clients fall back to in-process/keyword).
+  let embedServer = null;
+  try {
+    const { startEmbeddingServer } = await import('./embedding-listener.js');
+    const r = await startEmbeddingServer({ scope });
+    embedServer = r.server ?? null;
+    process.stderr.write(`[lastid-agent] embedding daemon: ${r.status}\n`);
+  } catch (err) {
+    process.stderr.write(`[lastid-agent] embedding daemon failed (non-fatal): ${err?.message ?? err}\n`);
+  }
+
   // Outbox drain loop. The listener is the single MLS-state writer,
   // so it is the only process that encrypts + sends. Claude's
   // `lastid_send_message` tool (a separate MCP process) only appends
@@ -1022,6 +1036,7 @@ async function cmdListen(flags) {
     process.stderr.write('[lastid-agent] shutting down\n');
     clearInterval(drainTimer);
     ws.stop();
+    if (embedServer) { try { embedServer.close(); } catch { /* ignore */ } }
     try { mls.free(); } catch { /* ignore */ }
     exit(0);
   };

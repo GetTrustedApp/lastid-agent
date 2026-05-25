@@ -65,6 +65,21 @@ test('retrievePacket: includes operator-store bedrock memories', async () => {
   assert.doesNotMatch(markdown, /should be skipped/);
 });
 
+test('retrievePacket: operator non-bedrock memories surface topically (keyword)', async () => {
+  const s = freshStore()
+  const operatorStore = {
+    listMemories: () => [
+      { id: "mem_opA", content: { bedrock: false, claim: "deploy with kubernetes helm charts", subject: ["deploy"] } },
+      { id: "mem_opB", content: { bedrock: true, claim: "always inject this", subject: [] } },
+    ],
+  }
+  const { markdown } = await retrievePacket({ prompt: "kubernetes helm", store: s, operatorStore })
+  assert.match(markdown, /## Relevant to this turn/)
+  assert.match(markdown, /\[mem_opA\] deploy with kubernetes helm/)
+  // the bedrock operator memory goes in the Bedrock section, not topical
+  assert.match(markdown, /\[mem_opB\] always inject this/)
+})
+
 test('retrieveSearchBlock: ambient hits, excludes bedrock', async () => {
   const s = freshStore();
   s.write({ kind: 'fact', subject: ['deploy'], claim: 'socketfirewall scans packages', source_kind: 'user_explicit', bedrock: true });

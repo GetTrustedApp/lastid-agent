@@ -132,6 +132,31 @@ try {
   process.stderr.write(`[lastid-agent] sync kick failed: ${err.message}\n`);
 }
 
+// Encourage semantic memory. The local-embeddings stack (~137MB + model) is
+// opt-in — deliberately kept out of the fast bootstrap — but it's a big
+// quality win over keyword search, so unless the operator opted out we kick a
+// detached `memory-setup` to install + warm it in the background (the first
+// seconds), non-blocking. Idempotent: once installed, embeddingsInstalled()
+// is true and this no-ops. Opt out with LASTID_AGENT_NO_EMBEDDINGS=1.
+if (!process.env.LASTID_AGENT_NO_EMBEDDINGS) {
+  try {
+    const { embeddingsInstalled } = await import('../lib/embeddings.js');
+    if (!(await embeddingsInstalled())) {
+      process.stderr.write(
+        '[lastid-agent] enabling semantic memory in the background (one-time, ~1–2 min). ' +
+          'Set LASTID_AGENT_NO_EMBEDDINGS=1 to skip; until it finishes, memory uses keyword search.\n',
+      );
+      const setup = spawn('node', [cliPath, 'memory-setup', '--scope', status.scope ?? 'main'], {
+        detached: true,
+        stdio: 'ignore',
+      });
+      setup.unref();
+    }
+  } catch (err) {
+    process.stderr.write(`[lastid-agent] embeddings check failed: ${err.message}\n`);
+  }
+}
+
 emit(context);
 process.exit(0);
 
