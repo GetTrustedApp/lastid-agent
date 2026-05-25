@@ -902,6 +902,24 @@ function sdkDecryptAgentContentForSlot(slot_index, enc_b64) {
 exports.sdkDecryptAgentContentForSlot = sdkDecryptAgentContentForSlot;
 
 /**
+ * Decrypt a project-tier memory envelope (base64 LIDE SymmetricOnly) by its
+ * `routing_id`. Operator read-back so the console can show project memories
+ * authored from the browser or by an agent. The seed never crosses into JS.
+ * @param {string} routing_id
+ * @param {string} enc_b64
+ * @returns {Promise<Uint8Array>}
+ */
+function sdkDecryptProjectContent(routing_id, enc_b64) {
+    const ptr0 = passStringToWasm0(routing_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(enc_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkDecryptProjectContent(ptr0, len0, ptr1, len1);
+    return ret;
+}
+exports.sdkDecryptProjectContent = sdkDecryptProjectContent;
+
+/**
  * POST `/v1/oid4vci/agent-provision/deny` with a reason. Used by
  * the approve page's Deny button. Caller must already have
  * fetched `/pending` (which attached the row to their DID) — the
@@ -924,6 +942,22 @@ function sdkDenyAgentProvisioning(user_code, reason, idp_url) {
 exports.sdkDenyAgentProvisioning = sdkDenyAgentProvisioning;
 
 /**
+ * Derive the opaque per-project routing id for a project (git remote) from
+ * the operator's wallet. Lets the console group/list a repo's project
+ * memories without the IdP ever learning the repo name. The project_root_seed
+ * is derived in-WASM from ai_agent_seed and never crosses into JS.
+ * @param {string} project_key
+ * @returns {Promise<string>}
+ */
+function sdkDeriveProjectRoutingId(project_key) {
+    const ptr0 = passStringToWasm0(project_key, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkDeriveProjectRoutingId(ptr0, len0);
+    return ret;
+}
+exports.sdkDeriveProjectRoutingId = sdkDeriveProjectRoutingId;
+
+/**
  * Encrypt a rule/memory record for the agent at `slot_index`. Returns a
  * base64 LIDE SymmetricOnly envelope the agent decrypts with its slot_seed.
  * @param {number} slot_index
@@ -937,6 +971,27 @@ function sdkEncryptAgentContentForSlot(slot_index, content) {
     return ret;
 }
 exports.sdkEncryptAgentContentForSlot = sdkEncryptAgentContentForSlot;
+
+/**
+ * Encrypt a project-tier memory the operator authors in the browser, for a
+ * given project (git remote). Derives the operator's project_root_seed from
+ * the wallet's ai_agent_seed, computes the opaque routing_id, and seals the
+ * content in a LIDE SymmetricOnly envelope that ANY of the operator's agents
+ * decrypts via the same derivation (project-crypto.js). The seed never
+ * crosses into JS. Returns `{ routing_id, enc_b64 }`.
+ * @param {string} project_key
+ * @param {Uint8Array} content
+ * @returns {Promise<any>}
+ */
+function sdkEncryptProjectContent(project_key, content) {
+    const ptr0 = passStringToWasm0(project_key, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(content, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkEncryptProjectContent(ptr0, len0, ptr1, len1);
+    return ret;
+}
+exports.sdkEncryptProjectContent = sdkEncryptProjectContent;
 
 /**
  * GET `/v1/oid4vci/agent-provision/pending/:user_code` with the
@@ -2285,27 +2340,27 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1270, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1289, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h07eda6f9933457e4);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 853, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 872, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1725375cb213b3e4);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 795, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 814, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hfba200ffcbc2c4fb);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 453, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 468, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h23499dd81690a033);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 940, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 959, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3c6c61154a9359bf);
             return ret;
         },

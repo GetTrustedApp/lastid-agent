@@ -364,6 +364,13 @@ export function sdkCreateIdentity(password: string, use_biometrics: boolean): Pr
 export function sdkDecryptAgentContentForSlot(slot_index: number, enc_b64: string): Promise<Uint8Array>;
 
 /**
+ * Decrypt a project-tier memory envelope (base64 LIDE SymmetricOnly) by its
+ * `routing_id`. Operator read-back so the console can show project memories
+ * authored from the browser or by an agent. The seed never crosses into JS.
+ */
+export function sdkDecryptProjectContent(routing_id: string, enc_b64: string): Promise<Uint8Array>;
+
+/**
  * POST `/v1/oid4vci/agent-provision/deny` with a reason. Used by
  * the approve page's Deny button. Caller must already have
  * fetched `/pending` (which attached the row to their DID) — the
@@ -372,10 +379,28 @@ export function sdkDecryptAgentContentForSlot(slot_index: number, enc_b64: strin
 export function sdkDenyAgentProvisioning(user_code: string, reason: string, idp_url: string): Promise<any>;
 
 /**
+ * Derive the opaque per-project routing id for a project (git remote) from
+ * the operator's wallet. Lets the console group/list a repo's project
+ * memories without the IdP ever learning the repo name. The project_root_seed
+ * is derived in-WASM from ai_agent_seed and never crosses into JS.
+ */
+export function sdkDeriveProjectRoutingId(project_key: string): Promise<string>;
+
+/**
  * Encrypt a rule/memory record for the agent at `slot_index`. Returns a
  * base64 LIDE SymmetricOnly envelope the agent decrypts with its slot_seed.
  */
 export function sdkEncryptAgentContentForSlot(slot_index: number, content: Uint8Array): Promise<string>;
+
+/**
+ * Encrypt a project-tier memory the operator authors in the browser, for a
+ * given project (git remote). Derives the operator's project_root_seed from
+ * the wallet's ai_agent_seed, computes the opaque routing_id, and seals the
+ * content in a LIDE SymmetricOnly envelope that ANY of the operator's agents
+ * decrypts via the same derivation (project-crypto.js). The seed never
+ * crosses into JS. Returns `{ routing_id, enc_b64 }`.
+ */
+export function sdkEncryptProjectContent(project_key: string, content: Uint8Array): Promise<any>;
 
 /**
  * GET `/v1/oid4vci/agent-provision/pending/:user_code` with the
