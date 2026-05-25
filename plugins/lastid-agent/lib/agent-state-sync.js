@@ -17,7 +17,11 @@
  */
 import { mintDpopJwt } from './dpop.js';
 import { decryptContent } from './agent-content-crypto.js';
-import { decryptProjectContent } from './project-crypto.js';
+import {
+  decryptProjectContent,
+  deriveProjectRoutingId,
+  GLOBAL_SHARED_PROJECT_KEY,
+} from './project-crypto.js';
 import { verifyRecordSignature } from './agent-sig-verify.js';
 
 export const RULES_PATH = '/v1/agent-state/rules';
@@ -30,10 +34,31 @@ export const MEMORIES_PATH = '/v1/agent-state/memories';
  * store record plus the raw decrypted bytes (for signature/hash checks).
  */
 export function decodeRecord(record, slotSeed, projectRootSeed = null) {
+  // A shared record (wire target 'project') whose routing_id matches the
+  // operator's GLOBAL routing is a global memory OR rule riding the project
+  // Option-B rails — retarget it to 'global' so it injects/enforces ALWAYS
+  // (operator-store global tier), not repo-gated like a real project record.
+  // Kind-agnostic: a global rule and a global memory share this routing and are
+  // told apart by `record.kind` downstream. The routing is derived from the
+  // project_root_seed already sealed to this agent, so no new key + no
+  // re-provision. DECRYPTION still keys off the WIRE target below (the record is
+  // sealed under the project content key either way), and signature
+  // verification runs on the wire record (target 'project') upstream — so this
+  // only changes where the decoded record lands locally.
+  let target = record.target ?? null;
+  if (record.target === 'project' && Buffer.isBuffer(projectRootSeed) && typeof record.routing_id === 'string') {
+    try {
+      if (record.routing_id === deriveProjectRoutingId(projectRootSeed, GLOBAL_SHARED_PROJECT_KEY)) {
+        target = 'global';
+      }
+    } catch {
+      /* derivation failed — leave as project */
+    }
+  }
   const base = {
     id: record.id,
     kind: record.kind,
-    target: record.target ?? null,
+    target,
     version: Number(record.version) || 0,
     updated_at: record.updated_at ?? null,
   };

@@ -38,6 +38,27 @@ export const PROJECT_CONTENT_KEY_INFO = 'lastid/project-content-enc/v1';
 export const PROJECT_ROUTING_INFO = 'lastid/project-routing/v1';
 export const KEY_LEN = 32;
 
+/**
+ * Reserved "project key" for the GLOBAL tier (memories AND rules). Global
+ * operator memories/rules are shared across ALL the operator's agents —
+ * semantically the same shape as a project memory, but injected/enforced ALWAYS
+ * rather than repo-gated. So they ride the project Option-B rails (one shared
+ * record under a key derived from project_root_seed), keyed by this reserved
+ * routing id instead of a repo. The record's `kind` (rule|memory) — not the
+ * routing — distinguishes them downstream, so both tiers reuse this one key.
+ *
+ * A real project_key is a normalized git remote ("host/org/repo"); this
+ * reserved value has no host or slash, so it can never be one and its routing
+ * id can't collide with any repo's. (It's only ever HMAC input — the
+ * project_key itself is never serialized or sent, only the hex routing id.) The
+ * browser console MUST use the byte-identical sentinel (lastid.co
+ * agent-state.ts GLOBAL_SHARED_PROJECT_KEY) so both sides derive the same global
+ * routing id. Changing it orphans every shared-global record — wire constant.
+ * Kept visible/ASCII on purpose: an invisible char here would be a silent
+ * cross-repo mismatch waiting to happen.
+ */
+export const GLOBAL_SHARED_PROJECT_KEY = '__lastid_global_v1__';
+
 function assertSeed(seed) {
   if (!Buffer.isBuffer(seed) || seed.length !== 32) {
     throw new TypeError('projectRootSeed must be a 32-byte Buffer');

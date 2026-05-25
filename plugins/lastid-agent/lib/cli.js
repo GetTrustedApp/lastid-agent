@@ -872,7 +872,11 @@ async function cmdPolicyCheck(flags) {
   // saas-migration.md §2.3.
   try {
     const { OperatorStore } = await import('./operator-store.js');
-    const local = new OperatorStore(resolveScope(flags)).policyDecision(tool, input);
+    // Pass this agent's own DID so per-agent rule EXEMPTIONS are honored — a
+    // global rule the operator opted THIS agent out of won't fire here.
+    const local = new OperatorStore(resolveScope(flags)).policyDecision(tool, input, {
+      selfDid: loaded.agentDid,
+    });
     if (local) {
       process.stdout.write(JSON.stringify(local));
       process.exit(0);

@@ -182,11 +182,19 @@ export class OperatorStore {
     // an operator message that merely mentions X. Only rules the operator
     // deliberately scoped to `message_in` apply there.
     const exactToolOnly = opts.exactToolOnly === true;
+    // This agent's own DID — used to honor per-agent EXEMPTIONS. A global rule
+    // applies to every one of the operator's agents EXCEPT those the operator
+    // opted out (content.exempt_agents). Default (no selfDid, or DID not listed)
+    // = governed — so a freshly reissued agent with a brand-new DID is governed
+    // by every global rule until the operator explicitly exempts it (safe).
+    const selfDid = typeof opts.selfDid === 'string' ? opts.selfDid : '';
     const flat = flattenInput(toolInput);
     let best = null;
     let bestUpdatedAt = '';
     for (const r of this.listRules()) {
       const c = r.content || {};
+      // Per-agent opt-out: skip a rule this agent is exempt from.
+      if (selfDid && Array.isArray(c.exempt_agents) && c.exempt_agents.includes(selfDid)) continue;
       const tool = normalizeTool(c.tool);
       const pattern = c.pattern ?? '';
       // A rule with neither a tool nor a pattern is a no-op (avoid a
@@ -233,8 +241,8 @@ export class OperatorStore {
    *   - never synced (cursor 0)   → return null, signalling the caller to
    *     fall back to the desktop /policy/check (transition / cold start).
    */
-  policyDecision(toolName, toolInput) {
-    const local = this.matchRules(toolName, toolInput);
+  policyDecision(toolName, toolInput, opts = {}) {
+    const local = this.matchRules(toolName, toolInput, opts);
     if (local.allow === false) return local;
     if (this.cursor > 0) return { allow: true };
     return null;
