@@ -940,6 +940,24 @@ async function cmdListen(flags) {
       })
       .catch(() => {});
 
+  // Ship locally-recorded rule-hit metrics (the PreToolUse hook appends them).
+  // Best-effort + off the latency path; the ship cursor only advances on a 2xx.
+  const shipRuleHitsBestEffort = () =>
+    import('./rule-metrics-ship.js')
+      .then((m) =>
+        m.shipRuleMetrics({
+          idpUrl,
+          scope,
+          agentDid: loaded.agentDid,
+          vcCompact: loaded.vcCompact,
+          signingKey,
+        }),
+      )
+      .then((n) => {
+        if (n > 0) process.stderr.write(`[lastid-agent] shipped ${n} rule-hit metric(s) to IdP\n`);
+      })
+      .catch(() => {});
+
   const mls = await MlsClient.open({
     agentDid: loaded.agentDid,
     slotSeed: loaded.slotSeed,
@@ -1038,6 +1056,7 @@ async function cmdListen(flags) {
       // operator can view the agent's memory CUD from browser/desktop/mobile.
       // Offline-safe — the ship cursor only advances on success.
       void shipAuditBestEffort();
+      void shipRuleHitsBestEffort();
     },
     // Doorbell events trigger a sync and are not MLS frames; everything
     // else goes to the MLS dispatcher.
@@ -1124,9 +1143,10 @@ async function cmdListen(flags) {
       .finally(() => {
         draining = false;
       });
-    // Piggyback: flush any memory-audit records appended by the MCP tool
-    // process since the last connect. Cheap when nothing's pending.
+    // Piggyback: flush any memory-audit records + rule-hit metrics appended by
+    // the MCP tool / PreToolUse hook since the last connect. Cheap when empty.
     void shipAuditBestEffort();
+    void shipRuleHitsBestEffort();
   }, OUTBOX_POLL_MS);
   if (typeof drainTimer.unref === 'function') drainTimer.unref();
 

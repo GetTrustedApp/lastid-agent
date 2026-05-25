@@ -33,6 +33,7 @@ import { fileURLToPath } from 'node:url';
 import { applyRewrite } from '../lib/operator-store.js';
 import { projectKeyForPath, operativePathFromToolInput } from '../lib/project-key.js';
 import { writeLastProject } from '../lib/project-sticky.js';
+import { recordRuleHit } from '../lib/rule-metrics.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
@@ -61,6 +62,22 @@ if (toolName) {
   const decision = runPolicyCheck(toolName, toolInput);
   if (decision?.allow === false && decision?.matched) {
     const m = decision.matched;
+    // Record the fire for metrics (local append, shipped by the listener).
+    // Best-effort + off the latency path; no command/pattern text — only the
+    // rule id, severity, tool category, and curated provenance.
+    try {
+      recordRuleHit({
+        scope: 'main',
+        ruleId: m.memory_id,
+        severity: m.severity,
+        tool: m.tool,
+        curated: m.curated === true,
+        pack: m.pack ?? null,
+        rule: m.rule ?? null,
+      });
+    } catch {
+      /* metrics are best-effort — never block a tool call */
+    }
     if (m.severity === 'deny') {
       // Hard deny — refuse the tool call. The agent sees the reason
       // and the memory id; can surface to the operator.
