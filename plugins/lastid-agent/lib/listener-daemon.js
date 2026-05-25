@@ -210,6 +210,81 @@ export async function ensureListenerRunning({ scope = 'main', cliPath } = {}) {
 }
 
 /**
+ * Pure: decide whether a STARTING listener should evict the listener
+ * currently recorded in the pid file. Evict iff there is a recorded pid,
+ * it is alive, and it isn't us (the daemon supervisor pre-writes the
+ * child's own pid before the child runs, so seeing our own pid is normal
+ * and must NOT trigger a self-kill). Exported for unit tests.
+ */
+export function shouldEvictListener({ existingPid, selfPid, alive }) {
+  return Boolean(existingPid) && existingPid !== selfPid && alive === true;
+}
+
+/**
+ * Single-instance enforcement for the listener process itself — independent
+ * of how it was launched (daemon-supervised OR a manual `lastid-agent listen`
+ * for dev/testing).
+ *
+ * Why this is load-bearing: the listener is the SINGLE MLS-state writer AND
+ * the sole owner of the agent-state sync cursor for its scope. Two listeners
+ * on one scope race on shared on-disk state — both receive a `rules.changed`/
+ * `memory.changed` doorbell, both pull `?since=<cursor>`, and whichever wins
+ * advances the shared cursor so the other applies nothing. Worse, a listener
+ * from an OLDER build (e.g. a stray dev run that predates memory sync) eats
+ * the cursor advance while dropping the memory records entirely — so published
+ * memories silently never reach the agent. (Root-caused live: a manual dev
+ * listener coexisting with the installed daemon listener did exactly this.)
+ *
+ * `ensureListenerRunning` only tracks listeners IT spawned; a manually-run
+ * listener was invisible to it and coexisted. So enforce the invariant in the
+ * listener itself: on startup become the sole listener for the scope by
+ * evicting any OTHER live listener holding the pid file (takeover — the
+ * most-recently-started listener wins, matching the human's intent when they
+ * run `listen`) and claiming the pid file + meta for ourselves.
+ */
+export async function acquireListenerLock({
+  scope = 'main',
+  selfPid = process.pid,
+  selfPath = process.argv[1],
+} = {}) {
+  const dir = dataDirFor(scope);
+  await mkdir(dir, { recursive: true });
+  const existing = await readPid(scope);
+  let evicted = null;
+  if (shouldEvictListener({ existingPid: existing, selfPid, alive: isAlive(existing) })) {
+    try {
+      process.kill(existing); // SIGTERM — let it release cleanly
+      evicted = existing;
+    } catch {
+      // already gone / not ours — fall through and claim the slot anyway
+    }
+  }
+  await writeFile(listenerPidPath(scope), String(selfPid), 'utf-8');
+  await writeMeta(scope, {
+    pid: selfPid,
+    cliPath: selfPath,
+    startedAt: new Date().toISOString(),
+  });
+  return { pid: selfPid, evicted };
+}
+
+/**
+ * Release the listener lock on shutdown — but ONLY if it's still ours. If
+ * another listener took over while we were running (its `acquireListenerLock`
+ * overwrote the pid file with its own pid), leave its lock intact so we don't
+ * delete a live owner's pid file out from under it.
+ */
+export async function releaseListenerLock({ scope = 'main', selfPid = process.pid } = {}) {
+  const cur = await readPid(scope);
+  if (cur === selfPid) {
+    await clearStalePid(scope);
+    await clearMeta(scope);
+    return { released: true };
+  }
+  return { released: false };
+}
+
+/**
  * Stop the listener if running. Used by an explicit `listener stop`
  * subcommand; SessionStart never calls this.
  */

@@ -867,6 +867,7 @@ async function cmdListen(flags) {
     { MlsDispatcher },
     { drainOutbox },
     { makeDoorbellHandler },
+    { acquireListenerLock, releaseListenerLock },
   ] = await Promise.all([
     import('./agent-provisioning.js'),
     import('./mls-client.js'),
@@ -874,7 +875,20 @@ async function cmdListen(flags) {
     import('./mls-dispatch.js'),
     import('./agent-send.js'),
     import('./agent-state-sync.js'),
+    import('./listener-daemon.js'),
   ]);
+
+  // Single-instance enforcement. The listener is the single MLS-state writer
+  // and the sole owner of the agent-state sync cursor for this scope; a second
+  // listener races the shared cursor and silently drops rules/memories (see
+  // acquireListenerLock). Become the sole listener before opening MLS state —
+  // evict any other live listener (manual or daemon-spawned) and claim the lock.
+  const lock = await acquireListenerLock({ scope });
+  if (lock.evicted) {
+    process.stderr.write(
+      `[lastid-agent] evicted a pre-existing listener (pid ${lock.evicted}) on scope=${scope} — single MLS writer enforced\n`,
+    );
+  }
 
   // Agent-state doorbell: a content-free `rules.changed` / `memory.changed`
   // WS event triggers a (debounced) incremental pull from the IdP into the
@@ -1026,6 +1040,35 @@ async function cmdListen(flags) {
   process.stderr.write(`[lastid-agent] listening as ${loaded.agentDid} on ${idpUrl}\n`);
   ws.start();
 
+  // Event-loop liveness monitor. A blocked event loop is exactly what kills
+  // this listener: a synchronous CPU burst (MLS wasm, embedding model) delays
+  // the WS ping/pong, the IdP liveness check (server.ts: isAlive===false →
+  // terminate, every ~30s) fires, and the socket drops 1006. So measure it
+  // directly — schedule a 1s tick and report how far PAST schedule it actually
+  // fired. `lag` ≈ how long the loop was blocked. Watch this over several
+  // minutes (longer than the ~30s terminate window): healthy = lag near 0;
+  // any multi-second lag is a stall that can cost us the connection.
+  const LOOP_TICK_MS = 1_000;
+  let loopTicks = 0;
+  let lastTick = Date.now();
+  let maxLag = 0;
+  const loopMonitor = setInterval(() => {
+    const now = Date.now();
+    const lag = now - lastTick - LOOP_TICK_MS;
+    lastTick = now;
+    loopTicks += 1;
+    if (lag > maxLag) maxLag = lag;
+    // Heartbeat every 60s (liveness + cumulative max lag), plus an immediate
+    // line whenever a single tick slips >200ms — a real event-loop stall, the
+    // condition that can delay the WS pong and cost us the connection.
+    if (loopTicks % 60 === 0 || lag > 200) {
+      process.stderr.write(
+        `[lastid-agent] loop tick #${loopTicks} lag=${lag}ms (max ${maxLag}ms) ws=${wsOpen ? 'up' : 'down'}\n`,
+      );
+    }
+  }, LOOP_TICK_MS);
+  if (typeof loopMonitor.unref === 'function') loopMonitor.unref();
+
   // Embedding daemon: load the memory-search model ONCE here (warm) and serve
   // it over a unix socket so per-prompt CLI spawns (memory-retrieve/-search)
   // get fast embeddings instead of re-initializing. No-op when the opt-in
@@ -1078,9 +1121,13 @@ async function cmdListen(flags) {
   const shutdown = () => {
     process.stderr.write('[lastid-agent] shutting down\n');
     clearInterval(drainTimer);
+    clearInterval(loopMonitor);
     ws.stop();
     if (embedServer) { try { embedServer.close(); } catch { /* ignore */ } }
     try { mls.free(); } catch { /* ignore */ }
+    // Release the single-instance lock if it's still ours (a listener that
+    // took over from us already claimed it — don't delete a live owner's pid).
+    void releaseListenerLock({ scope }).catch(() => {});
     exit(0);
   };
   process.on('SIGINT', shutdown);

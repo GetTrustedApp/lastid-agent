@@ -254,6 +254,12 @@ export class LastIdWsClient {
       return;
     }
     const type = typeof parsed?.type === 'string' ? parsed.type : '(missing)';
+    // Opt-in frame trace: set LASTID_WS_TRACE=1 to log EVERY inbound frame
+    // type (used to confirm doorbell events reach the agent). Off by default
+    // so the listener log stays lean.
+    if (process.env.LASTID_WS_TRACE === '1') {
+      process.stderr.write(`[lastid-agent] ws RAW type=${type}\n`);
+    }
     if (KNOWN_EVENT_TYPES.has(type)) {
       // Known type — info log so timing is correlatable with
       // dispatcher behaviour.
