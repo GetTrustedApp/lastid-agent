@@ -2,30 +2,31 @@
  * Agent-state sync client.
  *
  * saas-migration.md §2.3/§6: the agent pulls its slot_seed-encrypted
- * rules + memories from the IdP agent-state store, decrypts them
- * locally, and applies them to the OperatorStore. The same incremental
- * `?since=<cursor>` GET serves both real-time (triggered by the WS
- * doorbell) and bootstrap/catch-up (a fresh or long-offline agent pulls
- * from cursor 0). One code path; no separate "apply live message" logic.
+ * rules + memories from the IdP agent-state store, VERIFIES the operator's
+ * delegation_authority signature, decrypts locally, and applies them to
+ * the OperatorStore. The same incremental `?since=<cursor>` GET serves
+ * both real-time (WS doorbell) and bootstrap/catch-up.
  *
- * Auth mirrors ws-client.js: the agent VC SD-JWT as a `Bearer` token
- * plus a fresh `DPoP` proof per request (htu = origin+path, RFC-9449
- * style, query excluded — the IdP verifier compares the same).
+ * Auth mirrors ws-client.js: agent VC SD-JWT as a `Bearer` token + a
+ * fresh `DPoP` proof per request (htu = origin+path).
  *
- * The server returns only records this agent is scoped for (its own
- * per-agent records + the global-tier copies that were encrypted to
- * THIS agent's slot_seed), so every `enc_b64` is decryptable here.
+ * The IdP embeds the operator's delegation_authority public key
+ * (`operator_delegation_jwk`) in the response so the agent can verify
+ * each record's signature without a separate fetch (same precedent as
+ * approval rows). RULES are fail-closed — an unverified rule is dropped.
  */
 import { mintDpopJwt } from './dpop.js';
-import { decryptJson } from './agent-content-crypto.js';
+import { decryptContent } from './agent-content-crypto.js';
+import { verifyRecordSignature } from './agent-sig-verify.js';
 
 export const RULES_PATH = '/v1/agent-state/rules';
 export const MEMORIES_PATH = '/v1/agent-state/memories';
 
 /**
  * Decode one wire record into the OperatorStore shape. Revoked /
- * forgotten records carry no ciphertext — they pass through so the
- * store removes them. Active records decrypt their JSON content.
+ * forgotten records carry no ciphertext — they pass through so the store
+ * removes them. Active records decrypt their JSON content. Returns the
+ * store record plus the raw decrypted bytes (for signature/hash checks).
  */
 export function decodeRecord(record, slotSeed) {
   const base = {
@@ -36,9 +37,11 @@ export function decodeRecord(record, slotSeed) {
     updated_at: record.updated_at ?? null,
   };
   if (record.status && record.status !== 'active') {
-    return { ...base, status: record.status };
+    return { storeRecord: { ...base, status: record.status }, contentBytes: null };
   }
-  return { ...base, status: 'active', content: decryptJson(slotSeed, record.enc_b64) };
+  const contentBytes = decryptContent(slotSeed, record.enc_b64);
+  const content = JSON.parse(contentBytes.toString('utf8'));
+  return { storeRecord: { ...base, status: 'active', content }, contentBytes };
 }
 
 async function fetchKind({ idpUrl, path, since, agentDid, vcCompact, signingKey, fetchImpl }) {
@@ -58,11 +61,12 @@ async function fetchKind({ idpUrl, path, since, agentDid, vcCompact, signingKey,
   return {
     records: Array.isArray(body?.records) ? body.records : [],
     cursor: typeof body?.cursor === 'number' ? body.cursor : since,
+    operatorJwk: body?.operator_delegation_jwk ?? null,
   };
 }
 
 /**
- * Pull incremental agent-state and apply it to the local store.
+ * Pull incremental agent-state, verify provenance, and apply it locally.
  *
  * @param {Object} deps
  * @param {string} deps.idpUrl
@@ -72,9 +76,10 @@ async function fetchKind({ idpUrl, path, since, agentDid, vcCompact, signingKey,
  * @param {Buffer} deps.slotSeed           - 32-byte content-decryption seed
  * @param {import('./operator-store.js').OperatorStore} deps.store
  * @param {Function} [deps.fetchImpl]      - injectable fetch (default global)
- * @param {(record) => boolean} [deps.verifyRecord] - provenance gate; return
- *        true to accept. Should return true for kinds it does not gate
- *        (e.g. unsigned memories). A throw or falsy result rejects the record.
+ * @param {{x_b64u,y_b64u}} [deps.operatorJwk] - override operator key (tests)
+ * @param {Function} [deps.verifyRecord]   - override the provenance check (tests);
+ *        (record, contentBytes) => true | { ok, reason }. Defaults to the built-in
+ *        delegation_authority verification.
  * @param {(record, reason) => void} [deps.onReject] - observability hook.
  * @returns {Promise<{applied:number, cursor:number, fetched:number, rejected:number}>}
  */
@@ -86,6 +91,7 @@ export async function syncAgentState({
   slotSeed,
   store,
   fetchImpl = globalThis.fetch,
+  operatorJwk = null,
   verifyRecord = null,
   onReject = null,
 }) {
@@ -98,31 +104,43 @@ export async function syncAgentState({
     fetchKind({ idpUrl, path: MEMORIES_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }),
   ]);
 
+  // Operator delegation key for signature verification (IdP-embedded).
+  const opJwk = operatorJwk ?? rules.operatorJwk ?? memories.operatorJwk ?? null;
+  const verify =
+    verifyRecord ?? ((rec, contentBytes) => verifyRecordSignature(rec, contentBytes, opJwk));
+
   const all = [...rules.records, ...memories.records];
   let maxCursor = Math.max(since, rules.cursor, memories.cursor);
   const decoded = [];
   for (const rec of all) {
     if (typeof rec.cursor === 'number' && rec.cursor > maxCursor) maxCursor = rec.cursor;
-    if (verifyRecord) {
-      let ok = false;
-      try {
-        ok = verifyRecord(rec) === true;
-      } catch {
-        ok = false;
-      }
-      if (!ok) {
-        safely(onReject, rec, 'signature');
-        continue;
-      }
-    }
+
+    let storeRecord;
+    let contentBytes = null;
     try {
-      decoded.push(decodeRecord(rec, slotSeed));
+      const d = decodeRecord(rec, slotSeed);
+      storeRecord = d.storeRecord;
+      contentBytes = d.contentBytes;
     } catch (err) {
-      // A record we can't decrypt (wrong key / corrupt) is skipped, not
-      // fatal — the rest of the batch still applies and the cursor still
-      // advances past it (it won't be re-fetched). Surfaced via onReject.
+      // Undecryptable (wrong key / corrupt) — skip, don't fail the batch.
       safely(onReject, rec, `decrypt: ${err?.message ?? err}`);
+      continue;
     }
+
+    // Provenance gate (rules fail-closed; memories verify-if-signed).
+    let v;
+    try {
+      v = verify(rec, contentBytes);
+    } catch (err) {
+      v = { ok: false, reason: `verify: ${err?.message ?? err}` };
+    }
+    const ok = v === true || (v && v.ok === true);
+    if (!ok) {
+      safely(onReject, rec, (v && v.reason) || 'rejected');
+      continue;
+    }
+
+    decoded.push(storeRecord);
   }
   const applied = store.applyRecords(decoded, maxCursor);
   return {
@@ -147,9 +165,6 @@ function safely(fn, ...args) {
  * events into a (debounced) sync pull. The doorbell carries only a
  * cursor — no content — so all it does is trigger the same incremental
  * GET used for catch-up. Returns true if it handled the event.
- *
- * Debounced so a burst of changes collapses into a single pull; the
- * timer is unref'd so it never keeps the process alive on its own.
  */
 export function makeDoorbellHandler(triggerSync, { debounceMs = 250 } = {}) {
   const CHANGED = new Set(['rules.changed', 'memory.changed', 'agent_state.changed']);

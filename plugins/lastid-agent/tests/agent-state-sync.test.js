@@ -37,6 +37,10 @@ const auth = {
   vcCompact: 'eyJ.agent.vc',
   signingKey,
   slotSeed: SEED,
+  // These tests exercise sync mechanics (fetch/decrypt/cursor); real
+  // signature verification is covered in agent-sig-verify.test.js, so
+  // bypass the provenance gate here. The provenance test overrides this.
+  verifyRecord: () => ({ ok: true }),
 };
 
 function freshStore() {
@@ -160,7 +164,7 @@ test('verifyRecord rejects records that fail the provenance gate', async () => {
     ...auth,
     store,
     fetchImpl: idp.fetchImpl,
-    verifyRecord: (rec) => rec.id !== 'forged',
+    verifyRecord: (rec) => (rec.id === 'forged' ? { ok: false, reason: 'signature' } : { ok: true }),
     onReject: (rec, reason) => rejected.push([rec.id, reason]),
   });
   assert.equal(res.applied, 1);
@@ -197,16 +201,17 @@ test('a non-OK response throws', async () => {
   );
 });
 
-test('decodeRecord: active decrypts, revoked passes through', () => {
+test('decodeRecord: active decrypts (with bytes), revoked passes through', () => {
   const active = rule('r1', { tool: 'Bash', pattern: 'p', severity: 'deny' }, 1);
   const d = decodeRecord(active, SEED);
-  assert.equal(d.status, 'active');
-  assert.equal(d.content.pattern, 'p');
+  assert.equal(d.storeRecord.status, 'active');
+  assert.equal(d.storeRecord.content.pattern, 'p');
+  assert.ok(Buffer.isBuffer(d.contentBytes));
 
   const rev = revoked('rule', 'r1', 2, 2);
   const d2 = decodeRecord(rev, SEED);
-  assert.equal(d2.status, 'revoked');
-  assert.equal(d2.content, undefined);
+  assert.equal(d2.storeRecord.status, 'revoked');
+  assert.equal(d2.contentBytes, null);
 });
 
 test('doorbell handler triggers a (debounced) sync on changed events and ignores others', async () => {
