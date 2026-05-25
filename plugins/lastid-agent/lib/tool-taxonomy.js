@@ -26,7 +26,18 @@ export const CANONICAL_TOOLS = [
   'notebook', // edit a notebook
   'plan', // todo / plan updates
   'mcp', // any MCP server tool
+  // Channel surface (the operator↔agent MLS conversation). Distinct from
+  // `mcp` so a rule can target the chat specifically without also catching
+  // vault_use / http_fetch / the memory tools:
+  'message_out', // agent → operator: the `lastid_send_message` tool call
+  'message_in', //  operator → agent: an inbound decrypted channel message
 ];
+
+// The plugin's outbound-channel tool. Its MCP-namespaced form is
+// `mcp__plugin_lastid-agent_lastid-agent__lastid_send_message`; we match
+// on the bare tool suffix so the namespacing prefix (which encodes the
+// plugin install path) can't shift it out from under the rule.
+const SEND_MESSAGE_TOOL_RE = /(^|__)lastid_send_message$/i;
 
 // Claude Code (this plugin's runtime) literal tool name -> canonical.
 // Keys are lowercased; lookups lowercase the incoming name.
@@ -88,14 +99,23 @@ const CODEX_TOOL_MAP = {
 };
 
 /**
- * Normalize a runtime tool name to a canonical category. MCP tools
- * (`mcp__server__tool`) collapse to `mcp`. Unknown names fall through
- * lowercased so an operator could still target a literal name if needed.
+ * Normalize a runtime tool name to a canonical category. The agent's own
+ * `lastid_send_message` resolves to `message_out` (so a channel rule can
+ * target it precisely); all other MCP tools (`mcp__server__tool`) collapse
+ * to `mcp`. Unknown names fall through lowercased so an operator could
+ * still target a literal name if needed.
+ *
+ * Note: because the send tool now resolves to `message_out`, a rule that
+ * targets the broad `mcp` category no longer also catches it — the two are
+ * deliberately distinct surfaces (DLP on the chat vs gating arbitrary MCP
+ * tools). `message_in` is never produced here (inbound channel messages
+ * aren't tool calls); it's applied at the inbox enforcement point.
  */
 export function canonicalTool(runtimeToolName) {
   if (!runtimeToolName || typeof runtimeToolName !== 'string') return '';
   const t = runtimeToolName.trim();
   if (!t) return '';
+  if (SEND_MESSAGE_TOOL_RE.test(t)) return 'message_out';
   if (t.startsWith('mcp__')) return 'mcp';
   const lower = t.toLowerCase();
   return CLAUDE_TOOL_MAP[lower] ?? CODEX_TOOL_MAP[lower] ?? lower;

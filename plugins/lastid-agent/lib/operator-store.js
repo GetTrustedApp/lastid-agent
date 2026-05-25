@@ -147,7 +147,14 @@ export class OperatorStore {
    * Most-restrictive-wins: deny > rewrite > warn; ties broken by the
    * more recently updated rule.
    */
-  matchRules(toolName, toolInput) {
+  matchRules(toolName, toolInput, opts = {}) {
+    // exactToolOnly: skip tool-agnostic ("any tool") rules and require an
+    // explicit canonical-category match. The channel-input surface uses
+    // this — an inbound message isn't a tool call, so a generic "deny X on
+    // any tool" rule (meant for tool execution) must NOT silently withhold
+    // an operator message that merely mentions X. Only rules the operator
+    // deliberately scoped to `message_in` apply there.
+    const exactToolOnly = opts.exactToolOnly === true;
     const flat = flattenInput(toolInput);
     let best = null;
     let bestUpdatedAt = '';
@@ -158,6 +165,7 @@ export class OperatorStore {
       // A rule with neither a tool nor a pattern is a no-op (avoid a
       // footgun that would match every call).
       if (!tool && !pattern) continue;
+      if (exactToolOnly && !tool) continue;
       if (!ruleAppliesToTool(tool, toolName)) continue;
       if (!patternMatches(pattern, c.is_regex === true, flat)) continue;
 
@@ -167,6 +175,7 @@ export class OperatorStore {
         memory_id: r.id,
         reason: c.reason ?? '',
         pattern,
+        is_regex: c.is_regex === true,
         tool: tool || '*',
         replacement: c.replacement,
       };
@@ -253,5 +262,32 @@ export function patternMatches(pattern, isRegexFlag, text) {
     return new RegExp(src, 'i').test(text);
   } catch {
     return false;
+  }
+}
+
+/**
+ * Globally replace every match of `pattern` in `text` with `replacement`
+ * (default "[redacted]"). Used for `rewrite`-severity rules on the channel
+ * surface — the outbound PreToolUse path has its own rewriteToolInput; this
+ * is the inbound twin, redacting matched spans of a decrypted operator
+ * message before the agent sees it. Same pattern grammar as patternMatches
+ * (literal by default, "regex:" prefix or isRegexFlag for a regex source;
+ * `$1`/`$&` backrefs honoured in the replacement). A malformed regex fails
+ * closed — returns the text unchanged rather than throwing.
+ */
+export function redactMatches(text, pattern, replacement, isRegexFlag) {
+  if (typeof text !== 'string' || !pattern) return text;
+  const repl = typeof replacement === 'string' && replacement.length > 0
+    ? replacement
+    : '[redacted]';
+  const isRegex = isRegexFlag === true || pattern.startsWith('regex:');
+  const rawSrc = pattern.startsWith('regex:')
+    ? pattern.slice('regex:'.length)
+    : pattern;
+  const src = isRegex ? rawSrc : rawSrc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  try {
+    return text.replace(new RegExp(src, 'gi'), repl);
+  } catch {
+    return text;
   }
 }

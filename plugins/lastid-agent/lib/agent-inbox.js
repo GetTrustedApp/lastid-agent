@@ -25,6 +25,7 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { OperatorStore, redactMatches } from './operator-store.js';
 
 function inboxPath(scope) {
   return join(homedir(), '.lastid-agent', scope ?? 'main', 'operator-inbox.jsonl');
@@ -75,6 +76,18 @@ export async function readUnreadMessages({ scope } = {}) {
     return [];
   }
 
+  // Load the operator's synced rule set once for inbound channel
+  // enforcement (the `message_in` surface). Best-effort: if the store
+  // is unreadable / never synced, `store` stays null and every message
+  // surfaces unfiltered (fail open — a rule subsystem hiccup must never
+  // silently swallow the operator's messages).
+  let store = null;
+  try {
+    store = new OperatorStore(scope ?? 'main');
+  } catch {
+    store = null;
+  }
+
   const fresh = lines.slice(consumed);
   const items = [];
   for (const line of fresh) {
@@ -94,10 +107,12 @@ export async function readUnreadMessages({ scope } = {}) {
           ? env.payload
           : null;
     if (!text) continue;
+    const enforced = enforceInbound(store, text);
     items.push({
       group_id: rec.group_id_b64 ?? rec.idp_group_id ?? '?',
       received_at: rec.received_at ?? '',
-      text,
+      text: enforced.text,
+      ...(enforced.policy_action ? { policy_action: enforced.policy_action } : {}),
     });
   }
 
@@ -105,4 +120,57 @@ export async function readUnreadMessages({ scope } = {}) {
   // entries aren't re-scanned forever.
   await writeCursor(scope, lines.length);
   return items;
+}
+
+/**
+ * Apply the operator's inbound channel rules (`message_in`) to one
+ * decrypted message before the agent sees it. Returns the (possibly
+ * transformed) text plus the action taken:
+ *
+ *   - deny    → withhold the content; surface a policy notice instead so
+ *               the agent knows a message was blocked (and can ask the
+ *               operator) rather than acting on phantom content.
+ *   - warn    → surface the message, prefixed with a caution banner.
+ *   - rewrite → redact the matched span(s) before surfacing.
+ *   - (no match / no store / error) → surface unchanged.
+ *
+ * Only rules the operator explicitly scoped to `message_in` apply here
+ * (exactToolOnly) — a generic "deny X on any tool" rule is about tool
+ * execution and must not silently swallow a message that mentions X.
+ * Wrapped so any matcher error fails open to the original text.
+ */
+export function enforceInbound(store, text) {
+  if (!store) return { text };
+  let decision;
+  try {
+    decision = store.matchRules('message_in', text, { exactToolOnly: true });
+  } catch {
+    return { text }; // matcher error → fail open
+  }
+  if (!decision || decision.allow !== false || !decision.matched) return { text };
+  const m = decision.matched;
+  const tag = `[${m.memory_id}]${m.reason ? `: ${m.reason}` : ''}`;
+  if (m.severity === 'deny') {
+    return {
+      text:
+        `⛔ A message from your operator was withheld by their own inbound ` +
+        `channel rule ${tag}. The content matched a pattern they configured ` +
+        `to block before it reaches you. If you need it, reply via ` +
+        `lastid_send_message and ask them to rephrase.`,
+      policy_action: 'deny',
+    };
+  }
+  if (m.severity === 'rewrite') {
+    return {
+      text: redactMatches(text, m.pattern, m.replacement, m.is_regex),
+      policy_action: 'rewrite',
+    };
+  }
+  // warn (and any unknown severity) — surface with a caution banner.
+  return {
+    text:
+      `⚠ Operator inbound channel policy ${tag} — treat the message below ` +
+      `with caution:\n\n${text}`,
+    policy_action: 'warn',
+  };
 }

@@ -161,7 +161,10 @@ if (toolName && AMBIENT_RETRIEVE_TOOLS.has(toolName)) {
 //     JS native `String.replace` honours `$1`, `$2`, `$&`, etc.
 function rewriteToolInput(toolInput, pattern, replacement) {
   if (!pattern || !toolInput || typeof toolInput !== 'object') return null;
-  const rewritable = ['command', 'description'];
+  // `command`/`description` cover shell tools; `text` covers the outbound
+  // channel tool (lastid_send_message) so a `message_out` rewrite rule can
+  // redact the message body before it's sent to the operator.
+  const rewritable = ['command', 'description', 'text'];
   const next = { ...toolInput };
   let changed = false;
   const isRegex = pattern.startsWith('regex:');
