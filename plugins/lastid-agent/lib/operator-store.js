@@ -178,6 +178,12 @@ export class OperatorStore {
         is_regex: c.is_regex === true,
         tool: tool || '*',
         replacement: c.replacement,
+        // Curated provenance (stamped at publish from a rule pack). Lets the
+        // hook meter a curated-pack hit (cumulative, shared) distinctly from a
+        // private operator rule, and the console attribute + offer updates.
+        ...(c.curated === true
+          ? { curated: true, pack: c.pack ?? null, rule: c.rule ?? null, pack_version: c.pack_version ?? null }
+          : {}),
       };
       const better =
         !best ||
