@@ -27,6 +27,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { canonicalTool } from './tool-taxonomy.js';
 
 // Most-restrictive-wins precedence when several rules match one call.
 const SEVERITY_RANK = { deny: 3, rewrite: 2, warn: 1 };
@@ -226,7 +227,12 @@ function normalizeTool(tool) {
 
 function ruleAppliesToTool(normalizedRuleTool, toolName) {
   if (!normalizedRuleTool) return true; // applies to any tool
-  return normalizedRuleTool === String(toolName ?? '').toLowerCase();
+  // Rules store a CANONICAL tool category (e.g. "shell"); normalize the
+  // runtime's literal tool name ("Bash") to canonical before matching so
+  // a rule is portable across runtimes (Claude `Bash`, Codex `shell`, …).
+  // Also accept a literal-name match for any legacy raw-name rules.
+  const raw = String(toolName ?? '').toLowerCase();
+  return normalizedRuleTool === canonicalTool(toolName) || normalizedRuleTool === raw;
 }
 
 /**

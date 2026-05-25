@@ -172,3 +172,35 @@ test('policyDecision: never synced (cursor 0) → null, defer to desktop fallbac
   assert.equal(s.cursor, 0);
   assert.equal(s.policyDecision('Bash', { command: 'anything' }), null);
 });
+
+test('matchRules: canonical tool categories match across runtime names', () => {
+  // A rule authored against the canonical "shell" category matches
+  // Claude's `Bash` AND a Codex-style `local_shell` — no name mismatch.
+  const shellStore = freshStore();
+  shellStore.upsert(rule('r_shell', { tool: 'shell', pattern: 'git stash', severity: 'deny' }));
+  assert.equal(shellStore.matchRules('Bash', { command: 'git stash' }).allow, false);
+  assert.equal(shellStore.matchRules('local_shell', { command: 'git stash' }).allow, false);
+
+  // "file_edit" covers Edit + MultiEdit, but not Read (file_read).
+  const editStore = freshStore();
+  editStore.upsert(rule('r_edit', { tool: 'file_edit', pattern: 'secret', severity: 'warn' }));
+  assert.equal(editStore.matchRules('Edit', { file_text: 'secret' }).allow, false);
+  assert.equal(editStore.matchRules('MultiEdit', { file_text: 'secret' }).allow, false);
+  assert.equal(editStore.matchRules('Read', { file_path: 'secret.txt' }).allow, true);
+
+  // "search" covers Grep + Glob.
+  const searchStore = freshStore();
+  searchStore.upsert(rule('r_search', { tool: 'search', pattern: 'pw', severity: 'warn' }));
+  assert.equal(searchStore.matchRules('Grep', { pattern: 'pw' }).allow, false);
+  assert.equal(searchStore.matchRules('Glob', { pattern: 'pw' }).allow, false);
+
+  // Any MCP tool collapses to "mcp".
+  const mcpStore = freshStore();
+  mcpStore.upsert(rule('r_mcp', { tool: 'mcp', pattern: 'x', severity: 'warn' }));
+  assert.equal(mcpStore.matchRules('mcp__pencil__batch_design', { x: 'x' }).allow, false);
+
+  // A legacy raw-name rule ("bash") still matches its literal name.
+  const legacyStore = freshStore();
+  legacyStore.upsert(rule('r_legacy', { tool: 'Bash', pattern: 'rm', severity: 'deny' }));
+  assert.equal(legacyStore.matchRules('Bash', { command: 'rm -rf' }).allow, false);
+});
