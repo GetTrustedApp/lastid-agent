@@ -16,7 +16,11 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { connect } from 'node:net';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { memoryEmbeddingText } from './memory-store.js';
+
+const require = createRequire(import.meta.url);
 
 export const EMBED_MODEL = 'Xenova/all-MiniLM-L6-v2';
 export const EMBED_MODEL_VERSION = 'all-MiniLM-L6-v2';
@@ -28,6 +32,42 @@ export const SEMANTIC_FLOOR = 0.2;
 
 export function modelCacheDir() {
   return join(homedir(), '.lastid-agent', 'models');
+}
+
+/**
+ * Stable, version-independent home for the embeddings runtime dependency
+ * (@xenova/transformers). It used to install into the plugin's PER-VERSION
+ * node_modules, so every `/plugin update` orphaned it — the model cache
+ * (modelCacheDir, global) survived, but the code to run it didn't, silently
+ * dropping semantic search to keyword until memory-setup re-ran. Installing
+ * here (via `npm --prefix`) survives updates. memory-setup installs into this
+ * dir; resolveTransformers() loads from it.
+ */
+export function embeddingsRuntimeDir() {
+  return join(homedir(), '.lastid-agent', 'embeddings-runtime');
+}
+
+/**
+ * Resolve @xenova/transformers's entry file — the stable runtime dir FIRST (so
+ * it survives plugin updates), then default resolution (dev checkout, or a
+ * legacy install in the plugin's own node_modules). Returns the path, or null
+ * if not installed anywhere. @xenova/transformers is a plain ESM package
+ * (type:module, `main`, no `exports` map), so require.resolve gives the ESM
+ * main and a dynamic import of that path loads the same module as a bare
+ * import. `runtimeDir` overrides the stable dir (tests only).
+ */
+function resolveTransformers({ runtimeDir } = {}) {
+  const stable = join(runtimeDir ?? embeddingsRuntimeDir(), 'node_modules');
+  try {
+    return require.resolve('@xenova/transformers', { paths: [stable] });
+  } catch {
+    /* not in the stable dir — fall through to default resolution */
+  }
+  try {
+    return require.resolve('@xenova/transformers');
+  } catch {
+    return null;
+  }
 }
 
 /** Unix socket the listener's embedding daemon listens on. */
@@ -88,7 +128,9 @@ async function loadPipeline() {
   _pipelinePromise = (async () => {
     let transformers;
     try {
-      transformers = await import('@xenova/transformers');
+      const entry = resolveTransformers();
+      if (!entry) throw new Error('@xenova/transformers not installed');
+      transformers = await import(pathToFileURL(entry).href);
     } catch {
       _unavailable = true;
       return null; // dep not installed → keyword fallback
@@ -107,15 +149,11 @@ async function loadPipeline() {
   return _pipelinePromise;
 }
 
-/** Is the embeddings dependency importable (installed)? Cheap check for
- *  memory-setup + status, doesn't load the model. */
-export async function embeddingsInstalled() {
-  try {
-    await import('@xenova/transformers');
-    return true;
-  } catch {
-    return false;
-  }
+/** Is the embeddings dependency installed? Cheap resolve (no heavy import / no
+ *  model load) — checks the stable runtime dir first, then default resolution.
+ *  `opts.runtimeDir` overrides the stable dir (tests only). */
+export async function embeddingsInstalled(opts = {}) {
+  return resolveTransformers(opts) !== null;
 }
 
 /** In-process embed: load the model in THIS process and embed. ~0.2s on a

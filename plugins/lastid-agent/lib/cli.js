@@ -780,25 +780,32 @@ async function cmdMemorySearch(flags) {
  * the model, then backfills embeddings for the agent's local memories.
  */
 async function cmdMemorySetup(flags) {
-  const { dirname, join } = await import('node:path');
-  const { fileURLToPath } = await import('node:url');
   const { spawnSync } = await import('node:child_process');
-  const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const { mkdirSync } = await import('node:fs');
 
-  const { embeddingsInstalled } = await import('./embeddings.js');
+  const { embeddingsInstalled, embeddingsRuntimeDir } = await import('./embeddings.js');
+  // Install into a STABLE, version-independent dir (~/.lastid-agent/
+  // embeddings-runtime), NOT the per-version plugin node_modules — otherwise
+  // every `/plugin update` orphans the dep and silently drops semantic memory
+  // to keyword until this re-runs. The dir + the global model cache both
+  // survive updates, so semantic memory keeps working across versions.
   if (!(await embeddingsInstalled())) {
-    process.stdout.write('Installing local embeddings (@xenova/transformers, ~137MB)…\n');
+    const runtimeDir = embeddingsRuntimeDir();
+    mkdirSync(runtimeDir, { recursive: true });
+    process.stdout.write(
+      `Installing local embeddings (@xenova/transformers, ~137MB) into ${runtimeDir}…\n`,
+    );
     const r = spawnSync(
       'npm',
-      ['install', '@xenova/transformers', '--omit=dev', '--no-audit', '--no-fund'],
-      { cwd: pluginRoot, stdio: ['ignore', process.stderr, process.stderr] },
+      ['install', '@xenova/transformers', '--prefix', runtimeDir, '--omit=dev', '--no-audit', '--no-fund'],
+      { stdio: ['ignore', process.stderr, process.stderr] },
     );
     if (r.status !== 0) {
       process.stderr.write(`memory-setup: dependency install failed (exit ${r.status ?? 'n/a'})\n`);
       process.exit(1);
     }
   } else {
-    process.stdout.write('Embeddings dependency already installed.\n');
+    process.stdout.write('Embeddings dependency already installed (survives plugin updates).\n');
   }
 
   // Warm the model (downloads on first use, caches under ~/.lastid-agent/models).
