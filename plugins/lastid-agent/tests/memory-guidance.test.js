@@ -6,7 +6,11 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { memoryGuidanceLines } from '../lib/memory-guidance.js';
+import {
+  memoryGuidanceLines,
+  hostMemoryWritePath,
+  hostMemoryWriteWarning,
+} from '../lib/memory-guidance.js';
 
 const text = () => memoryGuidanceLines().join('\n');
 
@@ -51,4 +55,54 @@ test('preserves the write-vs-draft distinction', () => {
   assert.match(t, /EXPLICITLY asked you to/);
   assert.match(t, /YOU inferred something durable/);
   assert.match(t, /source_quote/);
+});
+
+test('asserts precedence over the host file memory', () => {
+  const t = text();
+  assert.match(t, /machine-local scratch/i);
+  assert.match(t, /never LastID/i);
+  assert.match(t, /THIS WINS/);
+});
+
+test('makes drafting the reflex for inferred durable facts', () => {
+  const t = text();
+  assert.match(t, /REFLEX/);
+  assert.match(t, /every time/);
+});
+
+test('nudges ToolSearch to close the tool-loading friction gap', () => {
+  const t = text();
+  assert.match(t, /ToolSearch/);
+});
+
+// ── host file-memory write warning (warn, never block) ─────────────
+
+const MEM = '/Users/matt/.claude/projects/-Users-matt/memory/foo.md';
+const MEM_INDEX = '/Users/matt/.claude/projects/-Users-matt/memory/MEMORY.md';
+const REPO_FILE = '/Users/matt/Documents/GitHub/LastID/lastid.co/src/lib/x.ts';
+
+test('flags a Write to the host memory dir + names the LastID tool', () => {
+  assert.equal(hostMemoryWritePath('Write', { file_path: MEM }), MEM);
+  const w = hostMemoryWriteWarning('Write', { file_path: MEM });
+  assert.ok(w);
+  assert.match(w, /lastid_memory_draft/);
+  assert.match(w, /Proceeding with the write/); // it WARNS, does not block
+});
+
+test('flags Edit/MultiEdit/NotebookEdit to the host memory store', () => {
+  assert.ok(hostMemoryWriteWarning('Edit', { file_path: MEM_INDEX }));
+  assert.ok(hostMemoryWriteWarning('MultiEdit', { file_path: MEM }));
+  assert.ok(hostMemoryWriteWarning('NotebookEdit', { notebook_path: MEM.replace('.md', '.ipynb') }));
+});
+
+test('does NOT flag normal repo files, .claude config, CLAUDE.md, or non-write tools', () => {
+  assert.equal(hostMemoryWritePath('Write', { file_path: REPO_FILE }), null);
+  // Under .claude but not the memory store.
+  assert.equal(hostMemoryWritePath('Write', { file_path: '/Users/matt/.claude/settings.json' }), null);
+  // CLAUDE.md is legit project instructions, not a memory record — left alone.
+  assert.equal(hostMemoryWritePath('Edit', { file_path: '/Users/matt/Documents/GitHub/LastID/CLAUDE.md' }), null);
+  // Non-write tools and missing paths.
+  assert.equal(hostMemoryWritePath('Bash', { command: 'echo hi' }), null);
+  assert.equal(hostMemoryWritePath('Write', {}), null);
+  assert.equal(hostMemoryWriteWarning('Read', { file_path: MEM }), null);
 });

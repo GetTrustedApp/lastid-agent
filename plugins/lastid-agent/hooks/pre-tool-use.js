@@ -34,6 +34,7 @@ import { applyRewrite } from '../lib/operator-store.js';
 import { projectKeyForPath, operativePathFromToolInput } from '../lib/project-key.js';
 import { writeLastProject } from '../lib/project-sticky.js';
 import { recordRuleHit } from '../lib/rule-metrics.js';
+import { hostMemoryWriteWarning } from '../lib/memory-guidance.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
@@ -132,7 +133,20 @@ if (toolName) {
   }
 }
 
-// ─── 1b. Ambient memory injection ──────────────────────────────────
+// ─── 1b. Host file-memory write warning (warn, never block) ────────
+//
+// The runtime's own memory prompt nudges the agent to record durable facts in
+// a host file-memory store (`~/.claude/.../memory/`). Those facts belong in
+// LastID memory (provable, synced, governed, auto-injected). When a tool call
+// targets that store, surface a hint to route it to `lastid_memory_draft`
+// instead — but ALLOW the write: a hook deny can't be overridden by the
+// operator, and host-local scratch is occasionally legitimate.
+if (toolName) {
+  const warning = hostMemoryWriteWarning(toolName, toolInput);
+  if (warning) contextParts.push(warning);
+}
+
+// ─── 1c. Ambient memory injection ──────────────────────────────────
 //
 // For high-signal tools, semantic-search the operator's memory store
 // using the flattened tool input as the query and surface the
