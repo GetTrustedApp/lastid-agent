@@ -25,11 +25,14 @@
  * the other survives. The PID file write itself uses O_EXCL so only
  * one process wins the slot.
  */
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { mkdir, readFile, writeFile, unlink, open, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 const PID_LOCKFILE_FLAGS = 'wx'; // exclusive create — fails if exists
 
@@ -117,49 +120,141 @@ async function clearStalePid(scope) {
 }
 
 /**
+ * Parse `ps` output lines ("<pid> <full command>") into the PIDs of live
+ * processes running `lastid-agent.js listen` for EXACTLY `scope`.
+ *
+ * Why enumeration (not just the pid-lock): the lock holds ONE pid. A listener
+ * from a PREVIOUS plugin version has a different cliPath, was never recorded in
+ * the current lock, and so survives `/plugin update` + every SessionStart —
+ * then it races the current listener on the scope's shared MLS state + sync
+ * cursor. Two listeners both decrypt the same inbound group message and advance
+ * the MLS ratchet, desyncing the epoch so `processInbound` throws and operator
+ * channel messages are "delivered" but never surface. Reaping by enumeration
+ * kills those strays the lock can't see.
+ *
+ * SCOPE-ISOLATED: only matches `--scope <scope>` (absent → 'main'), so reaping
+ * 'main' never touches a 'lastid'-scope listener. Pure + injectable for tests.
+ */
+export function parseScopeListenerPids(psLines, scope) {
+  const out = [];
+  for (const raw of psLines) {
+    const line = String(raw);
+    const m = line.match(/^\s*(\d+)\s+(.+)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    const cmd = m[2];
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    // Our listener subcommand specifically — NOT `serve` (MCP) or `sync`.
+    if (!/lastid-agent\.js['"]?\s+listen(?:\s|$)/.test(cmd)) continue;
+    const sm = cmd.match(/--scope\s+(\S+)/);
+    const cmdScope = sm ? sm[1] : 'main';
+    if (cmdScope !== scope) continue;
+    out.push(pid);
+  }
+  return out;
+}
+
+async function defaultPsLines() {
+  // `-A` all procs, `-o pid + full command`. Works on macOS + Linux. Best-
+  // effort: any failure → no enumeration (the pid-lock stays the primary guard).
+  const { stdout } = await execFileAsync('ps', ['-Ao', 'pid=,command='], {
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  return stdout.split('\n').filter((l) => l.trim().length > 0);
+}
+
+/** Live PIDs of `listen --scope <scope>` processes. `psImpl` injectable. */
+export async function findScopeListeners(scope, { psImpl } = {}) {
+  let lines;
+  try {
+    lines = psImpl ? await psImpl() : await defaultPsLines();
+  } catch {
+    return [];
+  }
+  return parseScopeListenerPids(lines, scope);
+}
+
+/**
+ * SIGTERM every `listen --scope <scope>` process except `keep` (and never the
+ * caller itself). Returns { found, reaped }. `psImpl`/`killImpl` injectable.
+ */
+export async function reapScopeListeners({ scope, keep = null, psImpl, killImpl } = {}) {
+  const found = await findScopeListeners(scope, { psImpl });
+  const kill =
+    killImpl ??
+    ((pid) => {
+      try {
+        process.kill(pid, 'SIGTERM');
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  const reaped = [];
+  for (const pid of found) {
+    if (keep !== null && pid === keep) continue;
+    if (pid === process.pid) continue; // never reap the caller
+    if (kill(pid)) reaped.push(pid);
+  }
+  return { found, reaped };
+}
+
+/**
  * Idempotent. Returns { status: 'already-running'|'spawned'|'skipped', pid? }.
  *
  * `cliPath` is the absolute path to `bin/lastid-agent.js`. The caller
  * supplies it because hooks live in a sibling dir and Node resolution
  * via `import.meta.url` is awkward to pre-thread.
  */
-export async function ensureListenerRunning({ scope = 'main', cliPath } = {}) {
+export async function ensureListenerRunning({ scope = 'main', cliPath, parentPid = null } = {}) {
   if (!cliPath || !existsSync(cliPath)) {
     return { status: 'skipped', reason: `cliPath missing: ${cliPath}` };
   }
   const dir = dataDirFor(scope);
   await mkdir(dir, { recursive: true });
 
+  // Singleton enforcement by PROCESS ENUMERATION, not just the pid-lock. The
+  // lock tracks one pid; a listener left from a previous plugin version (or any
+  // untracked stray) is invisible to it and races on the scope's MLS state +
+  // sync cursor (the channel-desync bug). Converge to exactly ONE
+  // current-version listener for this scope.
   const existing = await readPid(scope);
-  if (existing && isAlive(existing)) {
-    // A listener is alive — but is it THIS plugin version? Compare
-    // the recorded spawn cliPath to the current one. If it matches,
-    // leave it. If it differs (the plugin updated) OR there's no
-    // meta (a pre-meta / pre-fix daemon), recycle: kill the stale
-    // listener so we respawn from the current version. This is what
-    // guarantees a *fresh* listener after an update instead of an
-    // old one surviving on superseded code.
-    const meta = await readMeta(scope);
-    if (meta && meta.cliPath === cliPath) {
-      return { status: 'already-running', pid: existing };
-    }
-    try {
-      process.kill(existing);
-    } catch {
-      // already gone / not ours — fall through to respawn
-    }
-    await clearStalePid(scope);
-    await clearMeta(scope);
-  } else if (existing) {
-    await clearStalePid(scope);
-    await clearMeta(scope);
+  const meta = await readMeta(scope);
+  const procs = await findScopeListeners(scope);
+  const lockedIsCurrent =
+    existing &&
+    isAlive(existing) &&
+    meta &&
+    meta.cliPath === cliPath &&
+    procs.includes(existing);
+
+  if (lockedIsCurrent) {
+    // Keep the valid current-version listener; reap every OTHER stray
+    // (old-version / untracked) listener for THIS scope.
+    await reapScopeListeners({ scope, keep: existing });
+    return { status: 'already-running', pid: existing };
   }
+
+  // No valid current listener — reap EVERY listener for this scope (current
+  // lock holder, stale-version strays, manual dev runs), then respawn fresh.
+  await reapScopeListeners({ scope, keep: null });
+  // A SIGTERM'd listener releases its own lock/meta, but a stray that never
+  // wrote this lock won't — clear it ourselves so the fresh spawn owns it.
+  await clearStalePid(scope);
+  await clearMeta(scope);
 
   // Open the log file as appended sink for the detached child.
   // Both fds are owned by the child after spawn — parent closes
   // its copy via `unref` semantics.
   const logFh = await open(listenerLogPath(scope), 'a');
-  const child = spawn(process.execPath, [cliPath, 'listen', '--scope', scope], {
+  // `--parent-pid` ties the detached listener's life to the Claude session
+  // that spawned it: the listener watchdogs this pid and self-exits when it's
+  // gone (covers Ctrl-C-twice / hard-kill, where SessionEnd never fires).
+  const listenArgs = [cliPath, 'listen', '--scope', scope];
+  if (Number.isInteger(parentPid) && parentPid > 0) {
+    listenArgs.push('--parent-pid', String(parentPid));
+  }
+  const child = spawn(process.execPath, listenArgs, {
     detached: true,
     stdio: ['ignore', logFh.fd, logFh.fd],
     env: { ...process.env },
@@ -201,6 +296,7 @@ export async function ensureListenerRunning({ scope = 'main', cliPath } = {}) {
     pid: child.pid,
     cliPath,
     startedAt: new Date().toISOString(),
+    ...(Number.isInteger(parentPid) && parentPid > 0 ? { parentPid } : {}),
   });
 
   // Detach. The child now owns the log fd; parent can exit freely.
@@ -246,6 +342,9 @@ export async function acquireListenerLock({
   scope = 'main',
   selfPid = process.pid,
   selfPath = process.argv[1],
+  parentPid = null,
+  psImpl,
+  killImpl,
 } = {}) {
   const dir = dataDirFor(scope);
   await mkdir(dir, { recursive: true });
@@ -259,13 +358,19 @@ export async function acquireListenerLock({
       // already gone / not ours — fall through and claim the slot anyway
     }
   }
+  // Defense in depth: the lock holds ONE pid, but other `listen --scope <scope>`
+  // strays (a previous plugin version, a manual dev run) won't be in it. Reap
+  // every other listener for THIS scope so we truly become the sole MLS-state
+  // writer — the lock-holder eviction above only covers the recorded pid.
+  const { reaped } = await reapScopeListeners({ scope, keep: selfPid, psImpl, killImpl });
   await writeFile(listenerPidPath(scope), String(selfPid), 'utf-8');
   await writeMeta(scope, {
     pid: selfPid,
     cliPath: selfPath,
     startedAt: new Date().toISOString(),
+    ...(Number.isInteger(parentPid) && parentPid > 0 ? { parentPid } : {}),
   });
-  return { pid: selfPid, evicted };
+  return { pid: selfPid, evicted, reaped };
 }
 
 /**

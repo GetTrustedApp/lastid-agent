@@ -36,6 +36,8 @@ const {
   acquireListenerLock,
   releaseListenerLock,
   listenerPidPath,
+  parseScopeListenerPids,
+  reapScopeListeners,
 } = await import('../lib/listener-daemon.js');
 
 after(() => {
@@ -141,4 +143,95 @@ test('REGRESSION: releaseListenerLock does NOT delete a successor owner pid', as
   const r = await releaseListenerLock({ scope, selfPid: 5555 });
   assert.equal(r.released, false);
   assert.equal(pidOf(scope), '6666', "successor's lock is untouched");
+});
+
+// ── parseScopeListenerPids (pure, scope-isolated) ──────────────────
+//
+// THE BUG (root-caused live): three listeners ran for one identity — a v0.10.1
+// listener plus a 4h-old v0.8.29 ORPHAN on the same scope (left over across
+// /plugin updates, never in the current pid-lock). Two listeners raced the
+// scope's MLS ratchet so inbound operator messages "delivered" but never
+// decoded (processInbound threw). The pid-lock only tracks one pid; enumeration
+// reaps the strays it can't see — but MUST stay scoped (never touch another
+// scope's listener).
+
+test('parseScopeListenerPids: matches `listen` for the EXACT scope only', () => {
+  const lines = [
+    '  100 /usr/bin/node /c/lastid-agent/0.10.1/bin/lastid-agent.js listen --scope main',
+    '  101 /usr/bin/node /c/lastid-agent/0.8.29/bin/lastid-agent.js listen --scope main', // old version, same scope
+    '  102 /usr/bin/node /c/lastid-agent/0.9.0/bin/lastid-agent.js listen --scope lastid', // OTHER scope
+    '  103 /usr/bin/node /c/lastid-agent/0.10.1/bin/lastid-agent.js serve', // MCP server, not a listener
+    '  104 /usr/bin/node /c/lastid-agent/0.10.1/bin/lastid-agent.js sync --scope main', // sync, not listen
+    '  105 node -e setInterval(()=>{},1e9)', // unrelated process
+  ];
+  assert.deepEqual(parseScopeListenerPids(lines, 'main').sort((a, b) => a - b), [100, 101]);
+  assert.deepEqual(parseScopeListenerPids(lines, 'lastid'), [102]);
+});
+
+test('parseScopeListenerPids: a `listen` with no --scope flag counts as main', () => {
+  const lines = ['  200 /c/bin/lastid-agent.js listen'];
+  assert.deepEqual(parseScopeListenerPids(lines, 'main'), [200]);
+  assert.deepEqual(parseScopeListenerPids(lines, 'lastid'), []);
+});
+
+// ── reapScopeListeners (injectable ps + kill — no real processes) ──
+
+test('reapScopeListeners: SIGTERMs every scope listener except `keep`', async () => {
+  const lines = [
+    '  300 /c/0.10.1/bin/lastid-agent.js listen --scope main',
+    '  301 /c/0.8.29/bin/lastid-agent.js listen --scope main', // stray old version
+    '  302 /c/0.9.0/bin/lastid-agent.js listen --scope lastid', // other scope — untouched
+  ];
+  const killed = [];
+  const r = await reapScopeListeners({
+    scope: 'main',
+    keep: 300,
+    psImpl: async () => lines,
+    killImpl: (pid) => (killed.push(pid), true),
+  });
+  assert.deepEqual(r.found.sort((a, b) => a - b), [300, 301], 'only main-scope listeners found');
+  assert.deepEqual(killed, [301], 'kept 300, killed the stray');
+  assert.deepEqual(r.reaped, [301]);
+});
+
+test('REGRESSION: reaping `main` never kills a `lastid`-scope listener', async () => {
+  const lines = [
+    '  400 /c/bin/lastid-agent.js listen --scope main',
+    '  401 /c/bin/lastid-agent.js listen --scope lastid',
+  ];
+  const killed = [];
+  await reapScopeListeners({
+    scope: 'main',
+    keep: null,
+    psImpl: async () => lines,
+    killImpl: (p) => (killed.push(p), true),
+  });
+  assert.deepEqual(killed, [400], 'only main reaped; lastid listener untouched');
+});
+
+test('reapScopeListeners: never reaps the caller (process.pid)', async () => {
+  const lines = [`  ${process.pid} /c/bin/lastid-agent.js listen --scope main`];
+  const killed = [];
+  const r = await reapScopeListeners({
+    scope: 'main',
+    keep: null,
+    psImpl: async () => lines,
+    killImpl: (p) => (killed.push(p), true),
+  });
+  assert.deepEqual(killed, [], 'self skipped');
+  assert.deepEqual(r.reaped, []);
+});
+
+test('reapScopeListeners: ps failure → no reap (best-effort; pid-lock stays the guard)', async () => {
+  const killed = [];
+  const r = await reapScopeListeners({
+    scope: 'main',
+    keep: null,
+    psImpl: async () => {
+      throw new Error('no ps');
+    },
+    killImpl: (p) => (killed.push(p), true),
+  });
+  assert.deepEqual(r.found, []);
+  assert.deepEqual(killed, []);
 });

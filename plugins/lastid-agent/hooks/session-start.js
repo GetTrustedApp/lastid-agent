@@ -109,10 +109,34 @@ process.stderr.write(
 // memory-update / rule-update broadcasts even between Claude Code
 // sessions. Idempotent — if a prior session already spawned the
 // daemon and it's still alive, this returns immediately.
+// Resolve the PID of the Claude session that owns this hook so the detached
+// listener can watchdog it and self-exit when the session ends (covers
+// Ctrl-C-twice / hard-kill, where SessionEnd never fires). Command hooks run
+// shell-form (`sh -c …`), so process.ppid is that TRANSIENT shell — its parent
+// (our grandparent) is the long-lived Claude process. Best-effort: null on any
+// failure, in which case the listener simply skips the watchdog and relies on
+// reap-on-SessionStart + the SessionEnd hook.
+function resolveOwningSessionPid() {
+  const shellPid = process.ppid;
+  if (!Number.isInteger(shellPid) || shellPid <= 1) return null;
+  try {
+    const r = spawnSync('ps', ['-o', 'ppid=', '-p', String(shellPid)], {
+      encoding: 'utf-8',
+      timeout: 1500,
+    });
+    if (r.status !== 0) return null;
+    const grandparent = Number.parseInt((r.stdout || '').trim(), 10);
+    return Number.isInteger(grandparent) && grandparent > 1 ? grandparent : null;
+  } catch {
+    return null;
+  }
+}
+
 try {
   const result = await ensureListenerRunning({
     scope: sessionScope,
     cliPath,
+    parentPid: resolveOwningSessionPid(),
   });
   process.stderr.write(
     `[lastid-agent] listener: ${result.status}${

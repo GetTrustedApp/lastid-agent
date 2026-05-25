@@ -1296,6 +1296,36 @@ async function cmdListen(flags) {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
+  // Parent-session watchdog. The detached listener is tied to the Claude Code
+  // session that spawned it: the SessionStart hook resolves that session's PID
+  // and passes it as --parent-pid. Poll it; when the session is gone — INCLUDING
+  // the Ctrl-C-twice / hard-kill cases where SessionEnd never fires — self-exit
+  // gracefully so we never linger as a stray racing the next session's listener
+  // on the scope's MLS state. Fail-safe: only arms for a valid pid; if none was
+  // passed we simply don't watchdog (reap-on-SessionStart + SessionEnd still
+  // clean up).
+  const parentPid = Number.parseInt(String(flags['parent-pid'] ?? ''), 10);
+  if (Number.isInteger(parentPid) && parentPid > 1) {
+    process.stderr.write(`[lastid-agent] parent-session watchdog armed: pid ${parentPid}\n`);
+    const WATCHDOG_MS = 5_000;
+    const watchdog = setInterval(() => {
+      let alive = true;
+      try {
+        process.kill(parentPid, 0); // signal 0 = existence probe, no signal sent
+      } catch (err) {
+        alive = err.code === 'EPERM'; // exists but not ours = still alive
+      }
+      if (!alive) {
+        process.stderr.write(
+          `[lastid-agent] owning session (pid ${parentPid}) is gone — self-terminating\n`,
+        );
+        clearInterval(watchdog);
+        shutdown();
+      }
+    }, WATCHDOG_MS);
+    if (typeof watchdog.unref === 'function') watchdog.unref();
+  }
+
   // Resolve never — the WS client + signal handlers keep the
   // process alive.
   await new Promise(() => {});
