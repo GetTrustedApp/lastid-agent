@@ -43,7 +43,9 @@ import {
   createPrivateKey,
   createPublicKey,
   diffieHellman,
+  createCipheriv,
   createDecipheriv,
+  randomBytes,
   sign as cryptoSign,
   hkdfSync,
 } from 'node:crypto';
@@ -295,6 +297,81 @@ function aesGcmDecrypt(key, nonce, ciphertextAndTag) {
   const decipher = createDecipheriv('aes-256-gcm', key, nonce);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ct), decipher.final()]);
+}
+
+function aesGcmEncrypt(key, nonce, plaintext) {
+  const cipher = createCipheriv('aes-256-gcm', key, nonce);
+  const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return Buffer.concat([ct, cipher.getAuthTag()]);
+}
+
+/**
+ * Inverse of `unsealSlotSeed`: seal a 32-byte slot seed into a
+ * base64url LIDE envelope (EcdhP256Only suite) for a recipient's P-256
+ * public JWK.
+ *
+ * This is the wallet/IdP side of the handshake — in production the
+ * agent only ever UNSEALS. It lives here, next to `unsealSlotSeed` and
+ * sharing the same wire-format constants, so the two halves can never
+ * drift; it is exposed only via `_internal` for the end-to-end
+ * provisioning test, which stands up a mock IdP that must produce
+ * envelopes the real `unsealSlotSeed` accepts.
+ */
+function sealSlotSeed(slotSeed, recipientPublicJwk) {
+  if (!Buffer.isBuffer(slotSeed) || slotSeed.length !== 32) {
+    throw new TypeError('slotSeed must be a 32-byte Buffer');
+  }
+  const payloadLen = slotSeed.length + TAG_SIZE; // ciphertext + GCM tag
+
+  // Header — must match unsealSlotSeed's parser exactly.
+  const header = Buffer.alloc(HEADER_SIZE);
+  ENVELOPE_MAGIC.copy(header, 0);
+  header.writeUInt16LE(ENVELOPE_VERSION, 4);
+  header.writeUInt16LE(SUITE_ECDH_P256_ONLY, 6);
+  header[8] = 0; // flags: no compression / AAD
+  header[9] = 1; // exactly one recipient
+  header.writeUInt32LE(payloadLen, 10);
+
+  // Sender ephemeral P-256 keypair; ECDH against the recipient pubkey.
+  const sender = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const sndJwk = sender.publicKey.export({ format: 'jwk' });
+  const sndEphSec1 = Buffer.concat([
+    Buffer.from([0x04]),
+    b64urlDecode(sndJwk.x),
+    b64urlDecode(sndJwk.y),
+  ]);
+  const sharedSecret = diffieHellman({
+    privateKey: sender.privateKey,
+    publicKey: createPublicKey({ key: recipientPublicJwk, format: 'jwk' }),
+  });
+
+  // wrapKey = HKDF-SHA256(salt=header, ikm=shared_secret, info=DEK_WRAP).
+  const wrapKey = Buffer.from(
+    hkdfSync('sha256', sharedSecret, header, ECDH_DEK_WRAP_INFO, 32),
+  );
+
+  const dek = randomBytes(DEK_SIZE);
+  const wrapNonce = randomBytes(NONCE_SIZE);
+  const wrappedDek = aesGcmEncrypt(wrapKey, wrapNonce, dek); // 32 + 16
+  const payloadNonce = randomBytes(NONCE_SIZE);
+  const payloadCt = aesGcmEncrypt(dek, payloadNonce, slotSeed); // 32 + 16
+
+  // encap: [65B sender SEC1] [12B wrap nonce] [48B wrapped DEK]
+  const encap = Buffer.concat([sndEphSec1, wrapNonce, wrappedDek]);
+  // recipient block: [1B type] [2B key_id_len=0] [2B encap_len] [encap]
+  const recipientBlock = Buffer.alloc(1 + 2 + 2);
+  recipientBlock[0] = RECIPIENT_TYPE_ECDH_P256;
+  recipientBlock.writeUInt16LE(0, 1); // key_id_len
+  recipientBlock.writeUInt16LE(encap.length, 3); // encap_len
+
+  const env = Buffer.concat([
+    header,
+    recipientBlock,
+    encap,
+    payloadNonce,
+    payloadCt,
+  ]);
+  return b64url(env);
 }
 
 /**
@@ -597,6 +674,7 @@ export const _internal = {
   b64urlJson,
   b64urlDecode,
   unsealSlotSeed,
+  sealSlotSeed,
   deriveAgentEd25519Keypair,
   agentDidFromPublicJwk,
   base58btcEncode,
