@@ -71,6 +71,33 @@ const PLUGIN_TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'lastid_report_bug',
+    description:
+      'Report a bug in the LastID plugin to the LastID team. CONSENT-FIRST — only call this AFTER you have asked the operator: (1) do they want to report this bug, and (2) do they want to include their email for follow-up (optional). Reassure them that ONLY their description (and their email if they opt in), plus the plugin version, are sent — NO files, NO logs, NO system info, NO identity. Write a clear one-line `summary` of what went wrong; put error text / steps / expected-vs-actual in `details`. Never paste secrets, tokens, or system paths. Use when you hit a plugin/agent bug worth surfacing to the maintainers.',
+    requiredCapability: null, // anyone can report a bug — even before provisioning
+    inputSchema: {
+      type: 'object',
+      properties: {
+        summary: {
+          type: 'string',
+          description: 'One-line description of the bug, approved by the operator.',
+        },
+        details: {
+          type: 'string',
+          description:
+            'Optional: steps to reproduce, error text, expected vs actual. No secrets or system paths.',
+        },
+        email: {
+          type: 'string',
+          description:
+            "Optional: the operator's email for follow-up. Include ONLY if they explicitly agreed.",
+        },
+      },
+      required: ['summary'],
+      additionalProperties: false,
+    },
+  },
   // Memory tools — served locally against the agent's own memory store
   // (lib/memory-store.js). These names override any same-named desktop
   // tools in the tools/list merge below, so memory is local-first.
@@ -226,6 +253,42 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
         },
       ],
     };
+  }
+  if (name === 'lastid_report_bug') {
+    // Plain POST to the IdP — not secret, not encrypted, no identity. Works
+    // even unprovisioned (a provisioning bug is exactly when there's no agent).
+    const { submitBugReport } = await import('./bug-report.js');
+    const idpUrl = loadedAgent?.idpUrl ?? 'https://human.lastid.co';
+    try {
+      const res = await submitBugReport({
+        idpUrl,
+        report: { summary: _args?.summary, details: _args?.details, email: _args?.email },
+      });
+      const includedEmail = typeof _args?.email === 'string' && _args.email.trim().length > 0;
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                ok: true,
+                ...(res.id ? { report_id: res.id } : {}),
+                note:
+                  `Sent to the LastID team. Included: your description${includedEmail ? ' + your email' : ''} ` +
+                  `and the plugin version — nothing else (no files, logs, system info, or identity).`,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: `could not send bug report: ${err?.message ?? err}` }) }],
+        isError: true,
+      };
+    }
   }
   throw new Error(`unknown plugin tool: ${name}`);
 }
