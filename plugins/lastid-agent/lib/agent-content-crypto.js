@@ -1,122 +1,181 @@
 /**
- * Agent content crypto — slot_seed-derived symmetric encryption for the
- * rules/memories an operator distributes to THIS agent.
+ * Agent content crypto — slot_seed-keyed encryption for the rules/
+ * memories an operator distributes to THIS agent.
  *
- * Design: saas-migration.md §3. The operator (any of their devices) and
- * this agent share the agent's 32-byte slot_seed:
- *   - the operator re-derives it via
- *     `derive_agent_slot_seed(ai_agent_seed, slot_index)`,
- *   - the agent holds it in the OS keychain (see keychain.js).
- * A domain-separated HKDF off that seed yields an AES-256 content key,
- * independent of the Ed25519 signing key the slot_seed also derives
- * (`AgentKeypair::from_seed`, info "lastid/agent-keypair/v1" — distinct
- * from ours, so no derivation collision).
+ * Wire format: the canonical **LastID envelope, SymmetricOnly suite
+ * (0x0003)** from `lastid-envelope` — so the operator side is a thin
+ * wrapper over the existing Rust `envelope_encrypt` (reuse the SDK, no
+ * bespoke crypto), and this is the Node peer that reads it. The agent
+ * already reimplements the LIDE EcdhP256 suite (agent-provisioning.js
+ * `unsealSlotSeed`); this is the same machinery for the Symmetric suite.
  *
- * Both ends MUST agree on these primitives byte-for-byte (the operator
- * side runs in Rust/WASM via lastid-envelope; this is the Node decrypt
- * peer):
- *   KDF:    HKDF-SHA512, salt = empty, info = CONTENT_KEY_INFO, 32 bytes
- *   cipher: AES-256-GCM, 12-byte nonce, 16-byte tag
- *   wire:   nonce(12) || ciphertext || tag(16)
+ * Keying (saas-migration.md §3): the symmetric KEK is derived from the
+ * agent's 32-byte slot_seed — shared by the operator (re-derives it via
+ * `derive_agent_slot_seed`) and the agent (holds it in the keychain):
+ *   KEK = HKDF-SHA512(slot_seed, salt=empty, info=CONTENT_KEY_INFO, 32)
+ * independent of the Ed25519 signing key (info "lastid/agent-keypair/v1").
  *
- * Empty salt here equals Rust's `Hkdf::<Sha512>::new(None, ikm)`:
- * RFC-5869 treats an absent salt as HashLen zero bytes, and HMAC pads
- * any sub-block key with zeros, so empty and HashLen-zero salts produce
- * the same PRK.
+ * Envelope layout (must match lastid-envelope/src/{envelope,recipient,format}.rs):
+ *   header(14): "LIDE" | version(2 LE)=1 | suite(2 LE)=0x0003 | flags(1)
+ *               | recipient_count(1) | payload_len(4 LE)=len(ct+tag)
+ *   recipient:  type(1)=0x04 Symmetric | key_id_len(2 LE) | key_id
+ *               | encap_len(2 LE) | encap
+ *     encap:    salt(16) | wrap_nonce(12) | AES-256-GCM(KEK, wrap_nonce, DEK)=48
+ *   payload:    payload_nonce(12) | AES-256-GCM(DEK, payload_nonce, content)
+ * DEK is a random 32-byte data key; the KEK wraps it (KEK is used as the
+ * AES key directly — Symmetric suite does NOT HKDF over the header).
  *
- * Pure node:crypto — no SDK/WASM dependency, so the decrypt path works
- * with nothing else running.
+ * Pure node:crypto — decryption runs at sync time with nothing else up.
  */
 import crypto from 'node:crypto';
 
 export const CONTENT_KEY_INFO = 'lastid/agent-content-enc/v1';
+export const KEY_LEN = 32;
 export const NONCE_LEN = 12;
 export const TAG_LEN = 16;
-export const KEY_LEN = 32;
+export const DEK_LEN = 32;
+export const SALT_LEN = 16;
 
-/**
- * Derive the 32-byte AES content key from a 32-byte slot_seed.
- * Deterministic; callers may cache the result for the session.
- */
+// LIDE envelope wire constants (lastid-envelope/src/format.rs).
+const ENVELOPE_MAGIC = Buffer.from([0x4c, 0x49, 0x44, 0x45]); // "LIDE"
+const ENVELOPE_VERSION = 0x0001;
+const SUITE_SYMMETRIC_ONLY = 0x0003;
+const RECIPIENT_TYPE_SYMMETRIC = 0x04;
+const HEADER_SIZE = 14;
+// key_id is opaque to decryption (we resolve the KEK from the slot_seed,
+// not the id). A stable label keeps operator-side envelopes self-describing.
+const KEY_ID = 'agent-content/v1';
+
+/** Derive the 32-byte symmetric KEK from a 32-byte slot_seed. */
 export function deriveContentKey(slotSeed) {
   if (!Buffer.isBuffer(slotSeed) || slotSeed.length !== 32) {
     throw new TypeError('slotSeed must be a 32-byte Buffer');
   }
-  // hkdfSync returns an ArrayBuffer. salt = empty buffer matches the
-  // Rust `None` salt (see header note).
-  const out = crypto.hkdfSync(
-    'sha512',
-    slotSeed,
-    Buffer.alloc(0),
-    Buffer.from(CONTENT_KEY_INFO, 'utf8'),
-    KEY_LEN,
+  return Buffer.from(
+    crypto.hkdfSync('sha512', slotSeed, Buffer.alloc(0), Buffer.from(CONTENT_KEY_INFO, 'utf8'), KEY_LEN),
   );
-  return Buffer.from(out);
+}
+
+function u16le(n) {
+  const b = Buffer.alloc(2);
+  b.writeUInt16LE(n, 0);
+  return b;
+}
+
+function gcmEncrypt(key, nonce, plaintext) {
+  const c = crypto.createCipheriv('aes-256-gcm', key, nonce);
+  const ct = Buffer.concat([c.update(plaintext), c.final()]);
+  return Buffer.concat([ct, c.getAuthTag()]); // ciphertext || 16B tag
+}
+
+function gcmDecrypt(key, nonce, ctAndTag) {
+  if (ctAndTag.length < TAG_LEN) throw new Error('ciphertext shorter than GCM tag');
+  const ct = ctAndTag.subarray(0, ctAndTag.length - TAG_LEN);
+  const tag = ctAndTag.subarray(ctAndTag.length - TAG_LEN);
+  const d = crypto.createDecipheriv('aes-256-gcm', key, nonce);
+  d.setAuthTag(tag);
+  return Buffer.concat([d.update(ct), d.final()]);
 }
 
 /**
- * Encrypt plaintext under the slot_seed content key.
- * Returns the packed wire buffer: nonce(12) || ciphertext || tag(16).
- *
- * `opts.nonce` is for tests/known-answer vectors only — production
- * callers omit it so a fresh random nonce is used per message.
- * `opts.key` lets a caller pass a pre-derived content key (e.g. the
- * operator encrypting N global copies) instead of a slot_seed.
+ * Encrypt content into a LIDE SymmetricOnly envelope. Returns the packed
+ * envelope Buffer. `opts.key` supplies a pre-derived KEK; `opts.dek` /
+ * `opts.payloadNonce` / `opts.wrapNonce` are for deterministic test
+ * vectors only (production uses fresh random values, like the Rust side).
  */
 export function encryptContent(slotSeed, plaintext, opts = {}) {
-  const key = opts.key ? Buffer.from(opts.key) : deriveContentKey(slotSeed);
+  const kek = opts.key ? Buffer.from(opts.key) : deriveContentKey(slotSeed);
+  const dek = opts.dek ?? crypto.randomBytes(DEK_LEN);
+  const payloadNonce = opts.payloadNonce ?? crypto.randomBytes(NONCE_LEN);
+  const wrapNonce = opts.wrapNonce ?? crypto.randomBytes(NONCE_LEN);
   try {
-    const iv = opts.nonce ?? crypto.randomBytes(NONCE_LEN);
-    if (!Buffer.isBuffer(iv) || iv.length !== NONCE_LEN) {
-      throw new TypeError(`nonce must be a ${NONCE_LEN}-byte Buffer`);
-    }
-    const pt = Buffer.isBuffer(plaintext)
-      ? plaintext
-      : Buffer.from(String(plaintext), 'utf8');
-    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    if (opts.aad != null) {
-      cipher.setAAD(Buffer.isBuffer(opts.aad) ? opts.aad : Buffer.from(opts.aad, 'utf8'));
-    }
-    const ct = Buffer.concat([cipher.update(pt), cipher.final()]);
-    const tag = cipher.getAuthTag();
-    return Buffer.concat([iv, ct, tag]);
+    const pt = Buffer.isBuffer(plaintext) ? plaintext : Buffer.from(String(plaintext), 'utf8');
+    const ciphertext = gcmEncrypt(dek, payloadNonce, pt); // ct || tag
+
+    const header = Buffer.alloc(HEADER_SIZE);
+    ENVELOPE_MAGIC.copy(header, 0);
+    header.writeUInt16LE(ENVELOPE_VERSION, 4);
+    header.writeUInt16LE(SUITE_SYMMETRIC_ONLY, 6);
+    header[8] = 0; // flags
+    header[9] = 1; // recipient_count
+    header.writeUInt32LE(ciphertext.length, 10);
+
+    const wrappedDek = gcmEncrypt(kek, wrapNonce, dek); // 48
+    const encap = Buffer.concat([Buffer.alloc(SALT_LEN, 0), wrapNonce, wrappedDek]); // 16+12+48
+    const keyId = Buffer.from(KEY_ID, 'utf8');
+    const recipientBlock = Buffer.concat([
+      Buffer.from([RECIPIENT_TYPE_SYMMETRIC]),
+      u16le(keyId.length),
+      keyId,
+      u16le(encap.length),
+      encap,
+    ]);
+
+    return Buffer.concat([header, recipientBlock, payloadNonce, ciphertext]);
   } finally {
-    key.fill(0);
+    kek.fill(0);
+    if (!opts.dek) dek.fill(0);
   }
 }
 
 /**
- * Decrypt a packed wire buffer (nonce||ct||tag), or a base64 string of
- * one, under the slot_seed content key. Throws on auth failure (wrong
- * key, tampering, truncation).
+ * Decrypt a LIDE SymmetricOnly envelope (Buffer or base64 string) under
+ * the slot_seed KEK. Iterates recipient blocks and unwraps the first
+ * Symmetric one. Throws on a bad envelope, wrong key, or tampering.
  */
 export function decryptContent(slotSeed, packed, opts = {}) {
-  const buf = Buffer.isBuffer(packed) ? packed : Buffer.from(String(packed), 'base64');
-  if (buf.length < NONCE_LEN + TAG_LEN) {
-    throw new Error('ciphertext too short');
+  const env = Buffer.isBuffer(packed) ? packed : Buffer.from(String(packed), 'base64');
+  if (env.length < HEADER_SIZE) throw new Error('envelope shorter than header');
+  if (!env.subarray(0, 4).equals(ENVELOPE_MAGIC)) {
+    throw new Error(`bad envelope magic: ${env.subarray(0, 4).toString('hex')}`);
   }
-  const iv = buf.subarray(0, NONCE_LEN);
-  const tag = buf.subarray(buf.length - TAG_LEN);
-  const ct = buf.subarray(NONCE_LEN, buf.length - TAG_LEN);
-  const key = opts.key ? Buffer.from(opts.key) : deriveContentKey(slotSeed);
+  if (env.readUInt16LE(4) !== ENVELOPE_VERSION) {
+    throw new Error(`unsupported envelope version: ${env.readUInt16LE(4)}`);
+  }
+  if (env.readUInt16LE(6) !== SUITE_SYMMETRIC_ONLY) {
+    throw new Error(`unsupported suite for content: 0x${env.readUInt16LE(6).toString(16)} (expected SymmetricOnly)`);
+  }
+  const recipientCount = env[9];
+  const payloadLen = env.readUInt32LE(10);
+
+  const kek = opts.key ? Buffer.from(opts.key) : deriveContentKey(slotSeed);
   try {
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-    if (opts.aad != null) {
-      decipher.setAAD(Buffer.isBuffer(opts.aad) ? opts.aad : Buffer.from(opts.aad, 'utf8'));
+    let cursor = HEADER_SIZE;
+    let dek = null;
+    for (let i = 0; i < recipientCount; i += 1) {
+      const rtype = env[cursor];
+      cursor += 1;
+      const keyIdLen = env.readUInt16LE(cursor);
+      cursor += 2 + keyIdLen; // skip key_id (KEK comes from slot_seed)
+      const encapLen = env.readUInt16LE(cursor);
+      cursor += 2;
+      const encap = env.subarray(cursor, cursor + encapLen);
+      cursor += encapLen;
+      if (rtype === RECIPIENT_TYPE_SYMMETRIC && dek === null) {
+        const wrapNonce = encap.subarray(SALT_LEN, SALT_LEN + NONCE_LEN);
+        const wrappedDek = encap.subarray(SALT_LEN + NONCE_LEN);
+        dek = gcmDecrypt(kek, wrapNonce, wrappedDek);
+      }
     }
-    decipher.setAuthTag(tag);
-    return Buffer.concat([decipher.update(ct), decipher.final()]);
+    if (!dek) throw new Error('no symmetric recipient block');
+    const payloadNonce = env.subarray(cursor, cursor + NONCE_LEN);
+    const ciphertext = env.subarray(cursor + NONCE_LEN, cursor + NONCE_LEN + payloadLen);
+    try {
+      return gcmDecrypt(dek, payloadNonce, ciphertext);
+    } finally {
+      dek.fill(0);
+    }
   } finally {
-    key.fill(0);
+    kek.fill(0);
   }
 }
 
-/** Encrypt a JSON-serialisable object; returns the packed wire buffer. */
+/** Encrypt a JSON-serialisable object; returns the packed envelope buffer. */
 export function encryptJson(slotSeed, obj, opts = {}) {
   return encryptContent(slotSeed, Buffer.from(JSON.stringify(obj), 'utf8'), opts);
 }
 
-/** Decrypt a packed buffer / base64 string back into a parsed object. */
+/** Decrypt a packed envelope / base64 string back into a parsed object. */
 export function decryptJson(slotSeed, packed, opts = {}) {
   return JSON.parse(decryptContent(slotSeed, packed, opts).toString('utf8'));
 }

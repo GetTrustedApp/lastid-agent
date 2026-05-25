@@ -1,18 +1,20 @@
 /**
  * Tests for the slot_seed content crypto (lib/agent-content-crypto.js).
  *
- * Two jobs:
- *   1. Correctness + safety of the Node encrypt/decrypt path.
- *   2. LOCK the cross-language interop vectors. The operator side
- *      (Rust/WASM via lastid-envelope) must reproduce these exact bytes
- *      from the same inputs, or browser-authored content won't decrypt
- *      on the agent. If you change the KDF/cipher params and these
- *      vectors move, the Rust side must move in lockstep.
+ * The wire format is the canonical LastID envelope, SymmetricOnly suite
+ * (0x0003) — the operator side produces it via the Rust
+ * `lastid-envelope::envelope_encrypt`, and this Node peer reads it. These
+ * tests:
+ *   1. lock the content-KEK derivation (HKDF-SHA512 off the slot_seed),
+ *   2. lock the Node envelope output for a fixed (dek, nonces) vector so
+ *      the format can't silently drift,
+ *   3. cover round-trip + the safety surface (wrong key, tamper, truncation).
+ *
+ * Cross-language interop (decrypt a Rust-`envelope_encrypt`-produced
+ * envelope) is anchored alongside the WASM export that emits it.
  *
  * Locked vectors (seed = 32 bytes of 0x07):
  *   contentKey = 7143c0f24a4736a7d31d3d3b508e171da3e923319c38211acce7486b439aa6f0
- *   encrypt(seed, "{\"hello\":\"world\"}", nonce = 12 bytes of 0x00)
- *     = base64 "AAAAAAAAAAAAAAAAFeQVvjDw96xpdLE0m6GFMDZWvMElO+mI4elmXzwslRq8"
  */
 import { test } from 'node:test';
 import assert from 'node:assert';
@@ -23,8 +25,6 @@ import {
   decryptContent,
   encryptJson,
   decryptJson,
-  NONCE_LEN,
-  TAG_LEN,
 } from '../lib/agent-content-crypto.js';
 
 const SEED7 = Buffer.alloc(32, 7);
@@ -33,15 +33,18 @@ const SEED8 = Buffer.alloc(32, 8);
 const KAT_KEY_HEX =
   '7143c0f24a4736a7d31d3d3b508e171da3e923319c38211acce7486b439aa6f0';
 const KAT_PLAINTEXT = '{"hello":"world"}';
-const KAT_PACKED_B64 =
-  'AAAAAAAAAAAAAAAAFeQVvjDw96xpdLE0m6GFMDZWvMElO+mI4elmXzwslRq8';
+// Deterministic envelope for SEED7 / content above with dek=32×0xAB,
+// payloadNonce=12×0x00, wrapNonce=12×0x00. Locks the Node LIDE
+// SymmetricOnly serialization.
+const KAT_DET = { dek: Buffer.alloc(32, 0xab), payloadNonce: Buffer.alloc(12, 0), wrapNonce: Buffer.alloc(12, 0) };
+const KAT_ENVELOPE_B64 =
+  'TElERQEAAwAAASEAAAAEEABhZ2VudC1jb250ZW50L3YxTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxW3WcPc3MyX4/W3wQmZKueCm60ugkCz7RTphOYqlcpsKGDnMen1GjDJCN0yylJXvAAAAAAAAAAAAAAAAih88ILboNA9tcyRaZ5P/bCjlz5IcULzfYH1VozkBTD1b';
 
 test('deriveContentKey is deterministic, 32 bytes, and matches the locked vector', () => {
   const k1 = deriveContentKey(SEED7);
-  const k2 = deriveContentKey(SEED7);
   assert.equal(k1.length, 32);
-  assert.ok(k1.equals(k2), 'derivation must be deterministic');
-  assert.equal(k1.toString('hex'), KAT_KEY_HEX, 'interop vector drifted');
+  assert.ok(k1.equals(deriveContentKey(SEED7)));
+  assert.equal(k1.toString('hex'), KAT_KEY_HEX, 'content-KEK derivation drifted');
 });
 
 test('deriveContentKey rejects a non-32-byte seed', () => {
@@ -55,64 +58,52 @@ test('different slot seeds derive different keys', () => {
 
 test('round-trips a string', () => {
   const msg = 'never run `git stash`';
-  const packed = encryptContent(SEED7, msg);
-  assert.equal(decryptContent(SEED7, packed).toString('utf8'), msg);
+  assert.equal(decryptContent(SEED7, encryptContent(SEED7, msg)).toString('utf8'), msg);
 });
 
 test('round-trips a JSON object', () => {
   const obj = { type: 'rule', pattern: 'git stash', severity: 'deny' };
-  const packed = encryptJson(SEED7, obj);
-  assert.deepEqual(decryptJson(SEED7, packed), obj);
+  assert.deepEqual(decryptJson(SEED7, encryptJson(SEED7, obj)), obj);
 });
 
-test('KAT: decrypts the locked cross-language ciphertext', () => {
-  // The interop anchor — the Rust/WASM operator side must produce this
-  // exact base64 for (seed=32x07, nonce=0, plaintext=KAT_PLAINTEXT).
-  const out = decryptContent(SEED7, KAT_PACKED_B64);
-  assert.equal(out.toString('utf8'), KAT_PLAINTEXT);
+test('emits a LIDE SymmetricOnly envelope (suite 0x0003, Symmetric recipient 0x04)', () => {
+  const env = encryptContent(SEED7, 'x');
+  assert.equal(env.subarray(0, 4).toString('ascii'), 'LIDE');
+  assert.equal(env.readUInt16LE(4), 1); // version
+  assert.equal(env.readUInt16LE(6), 0x0003); // SymmetricOnly
+  assert.equal(env[9], 1); // recipient_count
+  assert.equal(env[14], 0x04); // first recipient type = Symmetric
 });
 
-test('encrypt with a fixed nonce reproduces the locked ciphertext', () => {
-  const packed = encryptContent(SEED7, KAT_PLAINTEXT, { nonce: Buffer.alloc(NONCE_LEN, 0) });
-  assert.equal(packed.toString('base64'), KAT_PACKED_B64);
+test('KAT: deterministic encrypt reproduces the locked envelope (format lock)', () => {
+  const env = encryptContent(SEED7, KAT_PLAINTEXT, KAT_DET);
+  assert.equal(env.toString('base64'), KAT_ENVELOPE_B64, 'envelope format drifted');
 });
 
-test('wire layout is nonce(12) || ciphertext || tag(16)', () => {
-  const nonce = Buffer.from('0123456789ab', 'utf8'); // 12 bytes
-  const pt = 'abc';
-  const packed = encryptContent(SEED7, pt, { nonce });
-  assert.equal(packed.length, NONCE_LEN + Buffer.byteLength(pt) + TAG_LEN);
-  assert.ok(packed.subarray(0, NONCE_LEN).equals(nonce));
+test('KAT: decrypts the locked envelope', () => {
+  assert.equal(decryptContent(SEED7, KAT_ENVELOPE_B64).toString('utf8'), KAT_PLAINTEXT);
 });
 
 test('decrypt with the wrong slot seed is rejected', () => {
-  const packed = encryptContent(SEED7, 'secret-ish content');
-  assert.throws(() => decryptContent(SEED8, packed));
+  const env = encryptContent(SEED7, 'secret-ish content');
+  assert.throws(() => decryptContent(SEED8, env));
 });
 
-test('tampering with the ciphertext is rejected (auth tag)', () => {
-  const packed = encryptContent(SEED7, 'integrity matters');
-  const tampered = Buffer.from(packed);
-  tampered[NONCE_LEN] ^= 0x01; // flip a ciphertext byte
-  assert.throws(() => decryptContent(SEED7, tampered));
+test('tampering with the payload is rejected (auth tag)', () => {
+  const env = Buffer.from(encryptContent(SEED7, 'integrity matters'));
+  env[env.length - 1] ^= 0x01; // flip a byte in the payload GCM tag
+  assert.throws(() => decryptContent(SEED7, env));
 });
 
-test('truncated input is rejected', () => {
-  assert.throws(() => decryptContent(SEED7, Buffer.alloc(NONCE_LEN + TAG_LEN - 1, 0)));
+test('a non-LIDE / truncated buffer is rejected', () => {
+  assert.throws(() => decryptContent(SEED7, Buffer.alloc(8, 0)));
+  assert.throws(() => decryptContent(SEED7, Buffer.from('not an envelope', 'utf8')));
 });
 
-test('random nonces make repeated encryptions of the same plaintext differ', () => {
+test('random dek/nonces make repeated encryptions differ but both decrypt', () => {
   const a = encryptContent(SEED7, 'same plaintext');
   const b = encryptContent(SEED7, 'same plaintext');
-  assert.ok(!a.equals(b), 'nonce must be random per message');
-  // ...but both still decrypt.
+  assert.ok(!a.equals(b), 'fresh dek/nonce per message');
   assert.equal(decryptContent(SEED7, a).toString('utf8'), 'same plaintext');
   assert.equal(decryptContent(SEED7, b).toString('utf8'), 'same plaintext');
-});
-
-test('AAD mismatch is rejected', () => {
-  const packed = encryptContent(SEED7, 'bound to aad', { aad: 'ctx-A' });
-  assert.equal(decryptContent(SEED7, packed, { aad: 'ctx-A' }).toString('utf8'), 'bound to aad');
-  assert.throws(() => decryptContent(SEED7, packed, { aad: 'ctx-B' }));
-  assert.throws(() => decryptContent(SEED7, packed)); // missing aad
 });
