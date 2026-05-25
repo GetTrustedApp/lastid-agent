@@ -878,6 +878,26 @@ async function cmdListen(flags) {
   });
 
   const { signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed);
+
+  // Flush the local memory-audit chain to the IdP (operator-visible
+  // cross-device). The listener is the single shipper (the MCP tool process
+  // only appends locally); offline-safe via the ship cursor.
+  const shipAuditBestEffort = () =>
+    import('./memory-audit-ship.js')
+      .then((m) =>
+        m.shipMemoryAudit({
+          idpUrl,
+          scope,
+          agentDid: loaded.agentDid,
+          vcCompact: loaded.vcCompact,
+          signingKey,
+        }),
+      )
+      .then((n) => {
+        if (n > 0) process.stderr.write(`[lastid-agent] shipped ${n} memory-audit record(s) to IdP\n`);
+      })
+      .catch(() => {});
+
   const mls = await MlsClient.open({
     agentDid: loaded.agentDid,
     slotSeed: loaded.slotSeed,
@@ -972,6 +992,10 @@ async function cmdListen(flags) {
         .catch((err) =>
           process.stderr.write(`[lastid-agent] agent-state sync on connect failed: ${err?.message ?? err}\n`),
         );
+      // Ship any unshipped local memory-audit records to the IdP so the
+      // operator can view the agent's memory CUD from browser/desktop/mobile.
+      // Offline-safe — the ship cursor only advances on success.
+      void shipAuditBestEffort();
     },
     // Doorbell events trigger a sync and are not MLS frames; everything
     // else goes to the MLS dispatcher.
@@ -1029,6 +1053,9 @@ async function cmdListen(flags) {
       .finally(() => {
         draining = false;
       });
+    // Piggyback: flush any memory-audit records appended by the MCP tool
+    // process since the last connect. Cheap when nothing's pending.
+    void shipAuditBestEffort();
   }, OUTBOX_POLL_MS);
   if (typeof drainTimer.unref === 'function') drainTimer.unref();
 

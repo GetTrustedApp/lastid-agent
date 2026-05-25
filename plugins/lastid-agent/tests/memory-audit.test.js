@@ -21,6 +21,8 @@ import {
   shipUnshipped,
 } from '../lib/memory-audit.js';
 import { handleMemoryTool } from '../lib/memory-tools.js';
+import { shipMemoryAudit } from '../lib/memory-audit-ship.js';
+import { deriveAgentEd25519Keypair } from '../lib/agent-provisioning.js';
 
 function freshScope() {
   const scope = `test-${randomUUID()}`;
@@ -99,6 +101,36 @@ test('ship cursor: unshipped → ship advances → none left', async () => {
     // A failed post must NOT advance the cursor.
     appendMemoryAudit({ scope, signingKey: privateKey, eventType: 'AgentMemoryForgotten', memoryId: 'm1' });
     const n2 = await shipUnshipped(scope, async () => false);
+    assert.equal(n2, 0);
+    assert.equal(unshippedEntries(scope).length, 1, 'still pending after failed ship');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── IdP shipping ───────────────────────────────────────────────────
+
+test('shipMemoryAudit: POSTs unshipped records to /audit + advances on 2xx', async () => {
+  const { scope, dir } = freshScope();
+  const { signingKey } = deriveAgentEd25519Keypair(Buffer.alloc(32, 9));
+  try {
+    appendMemoryAudit({ scope, signingKey, agentDid: 'did:a', eventType: 'AgentMemoryWritten', memoryId: 'm1' });
+    let posted = null;
+    const okFetch = async (url, opts) => {
+      posted = { url, headers: opts.headers, body: JSON.parse(opts.body) };
+      return { ok: true, status: 200 };
+    };
+    const n = await shipMemoryAudit({ idpUrl: 'https://idp.example', scope, agentDid: 'did:a', vcCompact: 'vc.jwt', signingKey, fetchImpl: okFetch });
+    assert.equal(n, 1);
+    assert.match(posted.url, /\/v1\/agent-state\/audit$/);
+    assert.equal(posted.headers.Authorization, 'Bearer vc.jwt');
+    assert.ok(typeof posted.headers.DPoP === 'string' && posted.headers.DPoP.length > 0, 'DPoP proof attached');
+    assert.equal(posted.body.records.length, 1);
+    assert.equal(unshippedEntries(scope).length, 0, 'cursor advanced');
+
+    // A 500 must NOT advance the cursor.
+    appendMemoryAudit({ scope, signingKey, agentDid: 'did:a', eventType: 'AgentMemoryForgotten', memoryId: 'm1' });
+    const n2 = await shipMemoryAudit({ idpUrl: 'https://idp.example', scope, agentDid: 'did:a', vcCompact: 'vc.jwt', signingKey, fetchImpl: async () => ({ ok: false, status: 500 }) });
     assert.equal(n2, 0);
     assert.equal(unshippedEntries(scope).length, 1, 'still pending after failed ship');
   } finally {
