@@ -18,7 +18,7 @@
  * context (no interactive stdin); the heavy lifting belongs in the
  * CLI.
  */
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -116,6 +116,20 @@ try {
   process.stderr.write(
     `[lastid-agent] listener spawn failed: ${err.message}\n`,
   );
+}
+
+// Kick an agent-state sync in the background so this session starts with
+// the operator's current rules/memories (the listener also syncs on
+// connect; this covers the case where it was already running). Detached +
+// unref + ignored stdio so it never delays the session start.
+try {
+  const sync = spawn('node', [cliPath, 'sync', '--scope', status.scope ?? 'main'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  sync.unref();
+} catch (err) {
+  process.stderr.write(`[lastid-agent] sync kick failed: ${err.message}\n`);
 }
 
 emit(context);

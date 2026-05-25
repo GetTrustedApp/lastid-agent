@@ -647,6 +647,55 @@ async function cmdPolicyCheck(flags) {
 }
 
 /**
+ * Pull the operator's rules/memories from the IdP agent-state store and
+ * apply them to the local operator-store (saas-migration.md §6). Shared
+ * by `cmdSync` (CLI / session-start kick) and the listener's doorbell +
+ * on-connect triggers. Returns the sync result; throws on transport
+ * errors (callers fail open).
+ */
+async function runAgentStateSync(loaded, scope) {
+  const [{ deriveAgentEd25519Keypair }, { OperatorStore }, { syncAgentState }] =
+    await Promise.all([
+      import('./agent-provisioning.js'),
+      import('./operator-store.js'),
+      import('./agent-state-sync.js'),
+    ]);
+  const idpUrl = loaded.idpUrl ?? env.LASTID_IDP_URL ?? 'https://human.lastid.co';
+  const { signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed);
+  const store = new OperatorStore(scope);
+  return syncAgentState({
+    idpUrl,
+    agentDid: loaded.agentDid,
+    vcCompact: loaded.vcCompact,
+    signingKey,
+    slotSeed: loaded.slotSeed,
+    store,
+    fetchImpl: globalThis.fetch,
+  });
+}
+
+/**
+ * `lastid-agent sync [--scope main]` — pull operator rules/memories now.
+ * Invoked by the SessionStart hook (so a fresh session has current
+ * state) and available for manual/debug use. Fail-open: any error exits
+ * 0 with a stderr note so it never blocks a session.
+ */
+async function cmdSync(flags) {
+  const scope = flags.scope ?? 'main';
+  const loaded = await loadAgentVc(scope);
+  if (!loaded) process.exit(0); // not provisioned — nothing to sync
+  try {
+    const res = await runAgentStateSync(loaded, scope);
+    process.stderr.write(
+      `[lastid-agent] sync: applied ${res.applied} (fetched ${res.fetched}, rejected ${res.rejected}), cursor ${res.cursor}\n`,
+    );
+  } catch (e) {
+    process.stderr.write(`[lastid-agent] sync failed: ${e?.message ?? e}\n`);
+  }
+  process.exit(0);
+}
+
+/**
  * `lastid-agent listen [--scope main]`
  *
  * Opens a persistent WebSocket to the IdP, joins MLS Welcomes the
@@ -674,13 +723,32 @@ async function cmdListen(flags) {
     { LastIdWsClient },
     { MlsDispatcher },
     { drainOutbox },
+    { makeDoorbellHandler },
   ] = await Promise.all([
     import('./agent-provisioning.js'),
     import('./mls-client.js'),
     import('./ws-client.js'),
     import('./mls-dispatch.js'),
     import('./agent-send.js'),
+    import('./agent-state-sync.js'),
   ]);
+
+  // Agent-state doorbell: a content-free `rules.changed` / `memory.changed`
+  // WS event triggers a (debounced) incremental pull from the IdP into the
+  // local operator-store, so a published rule reaches this agent without a
+  // restart. Best-effort + fail-open — a failed sync never disrupts the
+  // listener. (saas-migration.md §6.)
+  const onDoorbell = makeDoorbellHandler(() => {
+    runAgentStateSync(loaded, scope)
+      .then((r) =>
+        process.stderr.write(
+          `[lastid-agent] doorbell sync: applied ${r.applied}, cursor ${r.cursor}\n`,
+        ),
+      )
+      .catch((err) =>
+        process.stderr.write(`[lastid-agent] doorbell sync failed: ${err?.message ?? err}\n`),
+      );
+  });
 
   const { signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed);
   const mls = await MlsClient.open({
@@ -766,8 +834,24 @@ async function cmdListen(flags) {
           `[lastid-agent] fetchQueues on connect failed: ${err?.message ?? err}\n`,
         ),
       );
+      // Catch-up: pull current operator rules/memories on (re)connect, so
+      // a freshly-provisioned or long-offline agent gets up to date.
+      void runAgentStateSync(loaded, scope)
+        .then((r) =>
+          process.stderr.write(
+            `[lastid-agent] agent-state sync on connect: applied ${r.applied}, cursor ${r.cursor}\n`,
+          ),
+        )
+        .catch((err) =>
+          process.stderr.write(`[lastid-agent] agent-state sync on connect failed: ${err?.message ?? err}\n`),
+        );
     },
-    onEvent: (evt) => dispatcher.onEvent(evt),
+    // Doorbell events trigger a sync and are not MLS frames; everything
+    // else goes to the MLS dispatcher.
+    onEvent: (evt) => {
+      if (onDoorbell(evt)) return;
+      dispatcher.onEvent(evt);
+    },
     onError: (err) => process.stderr.write(`[lastid-agent] ws error: ${err.message}\n`),
   });
   wsRef = ws;
@@ -843,6 +927,9 @@ async function main() {
       break;
     case 'listen':
       await cmdListen(flags);
+      break;
+    case 'sync':
+      await cmdSync(flags);
       break;
     case 'memory-retrieve':
       await cmdMemoryRetrieve(flags);
