@@ -22,6 +22,8 @@ import {
   OperatorStore,
   compileRulePattern,
   applyRewrite,
+  patternMatches,
+  stripInlineFlags,
 } from '../lib/operator-store.js';
 
 // The exact rule the operator published (read back from the synced store).
@@ -132,6 +134,48 @@ test('applyRewrite: malformed pattern fails closed (null, no throw)', () => {
 });
 
 // ── the cross-consistency guard: match and rewrite MUST agree ──────
+
+// ── inline-flag handling: (?i) and friends ─────────────────────────
+//
+// REGRESSION: a pasted PCRE/Python regex like `(?i)…` throws "Invalid
+// group" in JS, so it used to compile to null and silently match nothing
+// — a dead security rule. compileRulePattern now folds a leading inline-
+// flag group into the RegExp flags instead.
+
+test('stripInlineFlags: folds (?i) into flags and removes the group', () => {
+  assert.deepEqual(stripInlineFlags('(?i)foo', ''), { source: 'foo', flags: 'i' });
+  assert.deepEqual(stripInlineFlags('(?im)foo', 'g'), { source: 'foo', flags: 'gim' });
+});
+
+test('stripInlineFlags: leaves unsupported flags (x) in place to fail loudly', () => {
+  // `x` (verbose) has no JS equivalent — don't silently strip it.
+  assert.deepEqual(stripInlineFlags('(?x)foo', 'i'), { source: '(?x)foo', flags: 'i' });
+});
+
+test('stripInlineFlags: no leading group is a no-op', () => {
+  assert.deepEqual(stripInlineFlags('foo(?i)bar', 'i'), { source: 'foo(?i)bar', flags: 'i' });
+});
+
+test('compileRulePattern: (?i) prefix compiles and is case-insensitive', () => {
+  const re = compileRulePattern('(?i)--force', true, 'i');
+  assert.ok(re, 'must compile, not return null');
+  assert.ok(re.test('--FORCE'));
+});
+
+test('compileRulePattern: (?x) prefix still fails closed (null)', () => {
+  assert.equal(compileRulePattern('(?x)--force', true, 'i'), null);
+});
+
+test("REGRESSION: the operator's (?i) dangerous-flags regex now matches", () => {
+  const PAT =
+    '(?i)(?:^|\\s)--?(?:danger(?:ous(?:ly)?)?|unsafe|force|bypass|skip(?:-[a-z-]+)?|disable(?:-[a-z-]+)?|ignore(?:-[a-z-]+)?|no-(?:verify|sandbox|auth|security|prompt|confirm))(?:\\s|=|$)';
+  for (const cmd of ['rm -rf --force', 'git commit --no-verify', 'DELETE --FORCE', 'tool --skip-checks']) {
+    assert.equal(patternMatches(PAT, true, `command=${cmd}`), true, `should match: ${cmd}`);
+  }
+  for (const cmd of ['ls -la', 'cargo build --release']) {
+    assert.equal(patternMatches(PAT, true, `command=${cmd}`), false, `should NOT match: ${cmd}`);
+  }
+});
 
 test('REGRESSION: matcher and rewriter agree for a checkbox-regex rule', () => {
   const s = freshStore();

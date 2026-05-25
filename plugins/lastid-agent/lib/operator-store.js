@@ -279,13 +279,42 @@ export function compileRulePattern(pattern, isRegexFlag, flags = 'i') {
   const str = String(pattern);
   const hasPrefix = str.startsWith('regex:');
   const isRegex = isRegexFlag === true || hasPrefix;
-  const rawSrc = hasPrefix ? str.slice('regex:'.length) : str;
+  let rawSrc = hasPrefix ? str.slice('regex:'.length) : str;
+  let effFlags = flags;
+  if (isRegex) {
+    // Fold a leading PCRE/Python-style inline-flag group (e.g. `(?i)`,
+    // `(?ims)`) into the RegExp flags — JS throws "Invalid group" on that
+    // bare form, so an operator pasting a `(?i)…` regex would otherwise get
+    // a silently dead rule (compiles to null → matches nothing). We already
+    // apply `i` everywhere, so `(?i)` is usually a no-op once folded.
+    const stripped = stripInlineFlags(rawSrc, effFlags);
+    rawSrc = stripped.source;
+    effFlags = stripped.flags;
+  }
   const src = isRegex ? rawSrc : rawSrc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   try {
-    return new RegExp(src, flags);
+    return new RegExp(src, effFlags);
   } catch {
     return null;
   }
+}
+
+/**
+ * Strip a LEADING inline-flag group — `(?i)`, `(?ims)`, etc. — and fold the
+ * flags into the RegExp constructor flags, merged with `baseFlags`. Only
+ * flags JS supports (i, m, s, u, y) are folded; if the group carries
+ * anything else (e.g. `x` verbose mode, which JS can't represent), it is
+ * LEFT IN PLACE so the pattern fails to compile and surfaces as invalid —
+ * better a loud failure than silently changing the regex's meaning.
+ * Returns { source, flags }.
+ */
+export function stripInlineFlags(source, baseFlags = '') {
+  if (typeof source !== 'string') return { source, flags: baseFlags };
+  const m = source.match(/^\(\?([a-zA-Z]+)\)/);
+  if (!m) return { source, flags: baseFlags };
+  if (!/^[imsuy]+$/.test(m[1])) return { source, flags: baseFlags };
+  const merged = [...new Set(`${baseFlags}${m[1]}`)].join('');
+  return { source: source.slice(m[0].length), flags: merged };
 }
 
 /**
