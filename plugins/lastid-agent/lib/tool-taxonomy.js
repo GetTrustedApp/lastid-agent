@@ -32,33 +32,59 @@ export const CANONICAL_TOOLS = [
 // Keys are lowercased; lookups lowercase the incoming name.
 const CLAUDE_TOOL_MAP = {
   bash: 'shell',
-  read: 'file_read',
+  powershell: 'shell',
+  read: 'file_read', // also handles images / PDF / notebooks
   write: 'file_write',
   edit: 'file_edit',
-  multiedit: 'file_edit',
+  multiedit: 'file_edit', // removed in current Claude Code; harmless alias
   notebookedit: 'notebook',
-  notebookread: 'notebook',
   grep: 'search',
   glob: 'search',
-  ls: 'search',
   webfetch: 'web_fetch',
   websearch: 'web_search',
-  task: 'subagent',
+  agent: 'subagent', // the subagent-spawning tool is `Agent` (NOT `Task`)
+  task: 'subagent', // legacy alias for older builds
   todowrite: 'plan',
+  taskcreate: 'plan',
+  taskupdate: 'plan',
+  tasklist: 'plan',
+  taskget: 'plan',
+  taskstop: 'plan',
+  enterplanmode: 'plan',
+  exitplanmode: 'plan',
 };
 
-// Codex (OpenAI) literal tool name -> canonical. Filled from research
-// (search-specialist) — kept here as the single cross-runtime source of
-// truth even though THIS plugin runs under Claude Code; the Codex
-// integration's pre-tool hook reuses this map. Refined per the research
-// findings.
+// Codex (OpenAI) literal tool name -> canonical, verified against the
+// openai/codex source (codex-rs tool specs). Kept here as the single
+// cross-runtime source of truth even though THIS plugin runs under Claude
+// Code; the future Codex integration's pre-tool hook reuses this map.
+//
+// Caveats baked into the mapping:
+//  - Codex exposes several exec tool names across model families
+//    (shell / shell_command / exec_command / write_stdin / unified_exec);
+//    all are the `shell` category.
+//  - `apply_patch` is a 3-in-1 (Add/Update/Delete via a freeform patch);
+//    mapped to file_edit as the dominant case. Codex also frequently runs
+//    file ops (cat/grep/even apply_patch) THROUGH the shell, so a `shell`
+//    rule catches a lot that a file_* rule would miss on Codex.
+//  - view_image / request_permissions / tool_search have no canonical
+//    category and fall through unmapped.
 const CODEX_TOOL_MAP = {
   shell: 'shell',
+  shell_command: 'shell',
+  exec_command: 'shell',
+  write_stdin: 'shell',
+  unified_exec: 'shell',
   local_shell: 'shell',
-  exec: 'shell',
+  read_file: 'file_read',
   apply_patch: 'file_edit',
   update_plan: 'plan',
+  get_goal: 'plan',
+  create_goal: 'plan',
+  update_goal: 'plan',
   web_search: 'web_search',
+  spawn_agent: 'subagent',
+  spawn_agents_on_csv: 'subagent',
 };
 
 /**

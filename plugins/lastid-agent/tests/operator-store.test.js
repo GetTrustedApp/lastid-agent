@@ -194,6 +194,12 @@ test('matchRules: canonical tool categories match across runtime names', () => {
   assert.equal(searchStore.matchRules('Grep', { pattern: 'pw' }).allow, false);
   assert.equal(searchStore.matchRules('Glob', { pattern: 'pw' }).allow, false);
 
+  // "subagent" covers Claude's `Agent` (NOT `Task`) and Codex's `spawn_agent`.
+  const subagentStore = freshStore();
+  subagentStore.upsert(rule('r_sub', { tool: 'subagent', pattern: 'x', severity: 'deny' }));
+  assert.equal(subagentStore.matchRules('Agent', { x: 'x' }).allow, false);
+  assert.equal(subagentStore.matchRules('spawn_agent', { x: 'x' }).allow, false);
+
   // Any MCP tool collapses to "mcp".
   const mcpStore = freshStore();
   mcpStore.upsert(rule('r_mcp', { tool: 'mcp', pattern: 'x', severity: 'warn' }));
