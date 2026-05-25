@@ -122,7 +122,8 @@ export async function syncAgentState({
   // Operator delegation key for signature verification (IdP-embedded).
   const opJwk = operatorJwk ?? rules.operatorJwk ?? memories.operatorJwk ?? null;
   const verify =
-    verifyRecord ?? ((rec, contentBytes) => verifyRecordSignature(rec, contentBytes, opJwk));
+    verifyRecord ??
+    ((rec, contentBytes) => verifyRecordSignature(rec, contentBytes, opJwk, { agentDid }));
 
   const all = [...rules.records, ...memories.records];
   let maxCursor = Math.max(since, rules.cursor, memories.cursor);

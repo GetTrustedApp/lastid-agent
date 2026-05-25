@@ -12,7 +12,8 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import crypto from 'node:crypto';
 
-import { verifyRecordSignature, sha256Hex } from '../lib/agent-sig-verify.js';
+import { verifyRecordSignature, sha256Hex, signAgentRecordJws } from '../lib/agent-sig-verify.js';
+import { agentDidFromPublicJwk } from '../lib/agent-provisioning.js';
 
 const b64url = (x) => Buffer.from(x).toString('base64url');
 
@@ -23,6 +24,11 @@ const OPERATOR_JWK = { x_b64u: pubJwk.x, y_b64u: pubJwk.y };
 
 // A different key, to forge with.
 const other = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+
+// An agent Ed25519 key + its did:lastid:agent DID (the agent-authored path).
+const agentKp = crypto.generateKeyPairSync('ed25519');
+const agentPubJwk = agentKp.publicKey.export({ format: 'jwk' });
+const AGENT_DID = agentDidFromPublicJwk({ kty: 'OKP', crv: 'Ed25519', x: agentPubJwk.x });
 
 function mintJws(claims, { typ = 'jwt+lastid-human-auth-v1', key = privateKey } = {}) {
   const h = b64url(JSON.stringify({ typ, alg: 'ES256' }));
@@ -103,13 +109,67 @@ test('rules are fail-closed: no operator key → rejected even if signed', () =>
   assert.match(v.reason, /no operator delegation key/);
 });
 
-test('memories are verify-if-signed: unsigned memory is allowed', () => {
+test('memories are FAIL-CLOSED: an unsigned memory is rejected', () => {
   const rec = { kind: 'memory', id: 'mem_1', target: 'global', version: 1, status: 'active' };
-  assert.deepEqual(verifyRecordSignature(rec, CONTENT, OPERATOR_JWK), { ok: true });
-  // ...but a signed memory with a bad sig is rejected.
-  const claims = { kind: 'memory', id: 'mem_1', target: 'global', version: 1, status: 'active', content_sha256: sha256Hex(CONTENT) };
-  const bad = { ...rec, sig: mintJws(claims, { key: other.privateKey }) };
-  assert.equal(verifyRecordSignature(bad, CONTENT, OPERATOR_JWK).ok, false);
+  const v = verifyRecordSignature(rec, CONTENT, OPERATOR_JWK);
+  assert.equal(v.ok, false, 'no path in without a verified signature');
+  assert.match(v.reason, /no signature/);
+});
+
+// ── agent-authored memories (EdDSA over the agent's Ed25519 key) ────────
+
+function signedAgentMemory(over = {}) {
+  const base = {
+    kind: 'memory', id: 'mem_a1', target: 'global', version: 1, status: 'active',
+    author: 'agent', author_agent_did: AGENT_DID,
+  };
+  const rec = { ...base, ...over };
+  const claims = {
+    kind: rec.kind, id: rec.id, target: rec.target, version: rec.version, status: rec.status,
+    content_sha256: sha256Hex(CONTENT),
+  };
+  return { ...rec, sig: signAgentRecordJws(claims, agentKp.privateKey) };
+}
+
+test('accepts an agent-signed memory verified against the author DID', () => {
+  assert.deepEqual(verifyRecordSignature(signedAgentMemory(), CONTENT, OPERATOR_JWK), { ok: true });
+});
+
+test('agent self-copy: verifies against the syncing agent DID when no author_agent_did', () => {
+  const rec = signedAgentMemory({ author_agent_did: undefined });
+  assert.deepEqual(
+    verifyRecordSignature(rec, CONTENT, OPERATOR_JWK, { agentDid: AGENT_DID }),
+    { ok: true },
+  );
+});
+
+test('rejects an agent memory signed by a DIFFERENT agent key', () => {
+  const otherAgent = crypto.generateKeyPairSync('ed25519');
+  const claims = {
+    kind: 'memory', id: 'mem_a1', target: 'global', version: 1, status: 'active',
+    content_sha256: sha256Hex(CONTENT),
+  };
+  const rec = {
+    kind: 'memory', id: 'mem_a1', target: 'global', version: 1, status: 'active',
+    author: 'agent', author_agent_did: AGENT_DID, sig: signAgentRecordJws(claims, otherAgent.privateKey),
+  };
+  const v = verifyRecordSignature(rec, CONTENT, OPERATOR_JWK);
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /signature/);
+});
+
+test('rejects an agent memory with tampered content', () => {
+  const v = verifyRecordSignature(signedAgentMemory(), Buffer.from('tampered'), OPERATOR_JWK);
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /content hash/);
+});
+
+test('rejects an agent memory whose sig binds a different record (replay)', () => {
+  const rec = signedAgentMemory();
+  rec.id = 'mem_other';
+  const v = verifyRecordSignature(rec, CONTENT, OPERATOR_JWK);
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /bind/);
 });
 
 test('a signed revoke (no content) verifies on its claims', () => {

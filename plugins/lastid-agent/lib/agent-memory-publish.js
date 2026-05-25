@@ -16,6 +16,7 @@
 import { encryptContent } from './agent-content-crypto.js';
 import { deriveProjectRoutingId, encryptProjectContent } from './project-crypto.js';
 import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
+import { signAgentRecordJws, sha256Hex } from './agent-sig-verify.js';
 import { mintDpopJwt } from './dpop.js';
 
 export const MEMORIES_PATH = '/v1/agent-state/memories';
@@ -61,6 +62,35 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
   const agentDid = loaded.agentDid;
   const ver = Number.isInteger(version) ? version : Number(memory.version) || 1;
 
+  // The agent signs EVERY memory write with its Ed25519 key so each carries
+  // verifiable provenance — the sync verifier is fail-closed (no sig, no
+  // apply). The sig binds the canonical record + a hash of the PLAINTEXT
+  // content (never the plaintext — the sig is stored server-side).
+  let signingKey;
+  try {
+    ({ signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed));
+  } catch {
+    return false;
+  }
+
+  const isRevoke = status === 'revoked';
+  const recStatus = isRevoke ? 'revoked' : 'active';
+  const target = memory.tier === 'project' ? 'project' : memory.tier === 'global' ? 'global' : agentDid;
+  const contentBytes = isRevoke
+    ? null
+    : Buffer.from(JSON.stringify(memorySyncContent(memory)), 'utf8');
+  const sig = signAgentRecordJws(
+    {
+      kind: 'memory',
+      id: memory.id,
+      target,
+      version: ver,
+      status: recStatus,
+      ...(contentBytes ? { content_sha256: sha256Hex(contentBytes) } : {}),
+    },
+    signingKey,
+  );
+
   let body;
   if (memory.tier === 'project') {
     // Project-tier: ONE shared record (not a per-agent copy), encrypted under
@@ -68,38 +98,34 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
     // operator's project_root_seed (sealed at provisioning) + the memory's
     // project_key. Without the seed (older agent), we can't publish → fail
     // (caller rolls back / keeps it local) rather than write an unreadable doc.
+    // author_agent_did lets a PEER agent resolve our key to verify the sig.
     if (!Buffer.isBuffer(loaded.projectRootSeed) || typeof memory.project_key !== 'string' || !memory.project_key) {
       return false;
     }
     const routingId = deriveProjectRoutingId(loaded.projectRootSeed, memory.project_key);
-    if (status === 'revoked') {
-      body = { id: memory.id, target: 'project', routing_id: routingId, status: 'revoked', version: ver };
-    } else {
-      const enc_b64 = encryptProjectContent(
-        loaded.projectRootSeed,
-        routingId,
-        Buffer.from(JSON.stringify(memorySyncContent(memory)), 'utf8'),
-      ).toString('base64');
-      body = { id: memory.id, target: 'project', routing_id: routingId, status: 'active', version: ver, enc_b64 };
-    }
+    body = isRevoke
+      ? { id: memory.id, target: 'project', routing_id: routingId, status: 'revoked', version: ver, sig, author_agent_did: agentDid }
+      : {
+          id: memory.id,
+          target: 'project',
+          routing_id: routingId,
+          status: 'active',
+          version: ver,
+          enc_b64: encryptProjectContent(loaded.projectRootSeed, routingId, contentBytes).toString('base64'),
+          sig,
+          author_agent_did: agentDid,
+        };
   } else {
-    const target = memory.tier === 'global' ? 'global' : agentDid;
-    if (status === 'revoked') {
-      body = { id: memory.id, target, status: 'revoked', version: ver, copies: [{ agent_did: agentDid }] };
-    } else {
-      const enc_b64 = encryptContent(
-        loaded.slotSeed,
-        Buffer.from(JSON.stringify(memorySyncContent(memory)), 'utf8'),
-      ).toString('base64');
-      body = { id: memory.id, target, status: 'active', version: ver, copies: [{ agent_did: agentDid, enc_b64 }] };
-    }
-  }
-
-  let signingKey;
-  try {
-    ({ signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed));
-  } catch {
-    return false;
+    body = isRevoke
+      ? { id: memory.id, target, status: 'revoked', version: ver, copies: [{ agent_did: agentDid }], sig }
+      : {
+          id: memory.id,
+          target,
+          status: 'active',
+          version: ver,
+          copies: [{ agent_did: agentDid, enc_b64: encryptContent(loaded.slotSeed, contentBytes).toString('base64') }],
+          sig,
+        };
   }
   let res;
   try {

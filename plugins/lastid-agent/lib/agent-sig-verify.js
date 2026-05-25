@@ -63,37 +63,141 @@ export function verifyEs256Jws(jwsCompact, operatorJwk) {
   return JSON.parse(b64urlToBuf(p).toString('utf8'));
 }
 
+// ── agent-authored signatures (EdDSA over the agent's Ed25519 key) ──────
+//
+// Operator records are ES256 (delegation_authority). Agent-authored records
+// (memory write-backs) are signed by the AGENT's own Ed25519 key and verified
+// against the author agent's DID-embedded public key — so every memory carries
+// verifiable provenance, not just the operator's.
+
+const AGENT_TYP = 'jwt+lastid-agent-auth-v1';
+const AGENT_DID_PREFIX = 'did:lastid:agent:z';
+const B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+function bufToB64url(buf) {
+  return Buffer.from(buf).toString('base64url');
+}
+
+/** Decode a base58btc string to a Buffer (inverse of agent-provisioning's encoder). */
+function base58btcDecode(str) {
+  const map = new Map();
+  for (let i = 0; i < B58_ALPHABET.length; i += 1) map.set(B58_ALPHABET[i], i);
+  const bytes = [0];
+  for (const ch of String(str)) {
+    const val = map.get(ch);
+    if (val === undefined) throw new Error(`invalid base58 character '${ch}'`);
+    let carry = val;
+    for (let j = 0; j < bytes.length; j += 1) {
+      carry += bytes[j] * 58;
+      bytes[j] = carry & 0xff;
+      carry = Math.floor(carry / 256);
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff);
+      carry = Math.floor(carry / 256);
+    }
+  }
+  // Leading '1' chars encode leading zero bytes.
+  for (let k = 0; k < String(str).length && str[k] === '1'; k += 1) bytes.push(0);
+  return Buffer.from(bytes.reverse());
+}
+
+/**
+ * Recover an Ed25519 public KeyObject from a `did:lastid:agent:z…` DID.
+ * The DID is `z` + base58btc(multicodec ed25519-pub 0xed01 || 32-byte pubkey).
+ * Pure node:crypto — no SDK/WASM (runs at sync time).
+ */
+export function agentEd25519PublicKeyFromDid(did) {
+  if (typeof did !== 'string' || !did.startsWith(AGENT_DID_PREFIX)) {
+    throw new Error('not a did:lastid:agent DID');
+  }
+  const decoded = base58btcDecode(did.slice(AGENT_DID_PREFIX.length));
+  if (decoded.length !== 34 || decoded[0] !== 0xed || decoded[1] !== 0x01) {
+    throw new Error('bad ed25519-pub multicodec prefix');
+  }
+  const pub = decoded.subarray(2); // 32-byte raw Ed25519 public key
+  return crypto.createPublicKey({
+    key: { kty: 'OKP', crv: 'Ed25519', x: pub.toString('base64url') },
+    format: 'jwk',
+  });
+}
+
+/**
+ * Sign agent-state record claims as a compact EdDSA JWS with the agent's
+ * Ed25519 private key. `claims` binds the record (id/kind/target/version/
+ * status) + content_sha256 — the same shape the operator's ES256 sig binds.
+ */
+export function signAgentRecordJws(claims, signingKey) {
+  const h = bufToB64url(Buffer.from(JSON.stringify({ alg: 'EdDSA', typ: AGENT_TYP }), 'utf8'));
+  const p = bufToB64url(Buffer.from(JSON.stringify(claims), 'utf8'));
+  const sig = crypto.sign(null, Buffer.from(`${h}.${p}`, 'utf8'), signingKey);
+  return `${h}.${p}.${bufToB64url(sig)}`;
+}
+
+/**
+ * Verify a compact EdDSA JWS against an Ed25519 public KeyObject. Returns the
+ * parsed claims; throws on any failure. Caller checks claim binding.
+ */
+export function verifyEdDsaJws(jwsCompact, publicKey) {
+  const parts = String(jwsCompact).split('.');
+  if (parts.length !== 3) throw new Error('sig is not a compact JWS');
+  const [h, p, s] = parts;
+  const header = JSON.parse(b64urlToBuf(h).toString('utf8'));
+  if (header.alg !== 'EdDSA') throw new Error(`unexpected alg ${header.alg}`);
+  if (header.typ !== AGENT_TYP) throw new Error(`unexpected typ ${header.typ}`);
+  const ok = crypto.verify(null, Buffer.from(`${h}.${p}`, 'utf8'), publicKey, b64urlToBuf(s));
+  if (!ok) throw new Error('EdDSA signature invalid');
+  return JSON.parse(b64urlToBuf(p).toString('utf8'));
+}
+
 /**
  * Verify an agent-state record's provenance.
  *
  * @param {object} record       - wire record { id, kind, target, version, status?, sig? }
  * @param {Buffer|null} contentBytes - decrypted content bytes (active records), else null
  * @param {{x_b64u:string,y_b64u:string}|null} operatorJwk - operator delegation key
+ * @param {{agentDid?:string}} [opts] - the syncing agent's own DID (the author
+ *        of its slot_seed self-copies, when the record carries no author_agent_did)
  * @returns {{ok:true} | {ok:false, reason:string}}
  *
- * Policy: RULES are fail-closed — no key / no sig / bad sig / hash
- * mismatch / bad binding all reject, so an unverified rule never affects
- * enforcement. MEMORIES are verify-if-signed: unsigned is allowed
- * (advisory), signed-but-invalid is rejected.
+ * Policy: FAIL-CLOSED for EVERY record — rules AND memories. No signature, no
+ * key, bad sig, hash mismatch, or bad binding all reject, so nothing without
+ * verifiable provenance ever affects the agent. Operator-authored records are
+ * ES256 (delegation_authority); agent-authored records are EdDSA over the
+ * author agent's Ed25519 key (author_agent_did for shared project records, else
+ * the syncing agent's own DID for its slot_seed self-copies).
  */
-export function verifyRecordSignature(record, contentBytes, operatorJwk) {
-  const isRule = record.kind === 'rule';
+export function verifyRecordSignature(record, contentBytes, operatorJwk, opts = {}) {
   const hasSig = typeof record.sig === 'string' && record.sig.length > 0;
-
   if (!hasSig) {
-    return isRule ? { ok: false, reason: 'rule has no signature' } : { ok: true };
-  }
-  if (!operatorJwk || !operatorJwk.x_b64u || !operatorJwk.y_b64u) {
-    return isRule
-      ? { ok: false, reason: 'no operator delegation key to verify against' }
-      : { ok: true };
+    return { ok: false, reason: `${record.kind ?? 'record'} has no signature` };
   }
 
+  const author = record.author === 'agent' ? 'agent' : 'operator';
   let claims;
-  try {
-    claims = verifyEs256Jws(record.sig, operatorJwk);
-  } catch (e) {
-    return { ok: false, reason: `signature: ${e.message}` };
+  if (author === 'agent') {
+    const authorDid = record.author_agent_did || opts.agentDid;
+    if (!authorDid) return { ok: false, reason: 'no author DID for agent signature' };
+    let key;
+    try {
+      key = agentEd25519PublicKeyFromDid(authorDid);
+    } catch (e) {
+      return { ok: false, reason: `author key: ${e.message}` };
+    }
+    try {
+      claims = verifyEdDsaJws(record.sig, key);
+    } catch (e) {
+      return { ok: false, reason: `signature: ${e.message}` };
+    }
+  } else {
+    if (!operatorJwk || !operatorJwk.x_b64u || !operatorJwk.y_b64u) {
+      return { ok: false, reason: 'no operator delegation key to verify against' };
+    }
+    try {
+      claims = verifyEs256Jws(record.sig, operatorJwk);
+    } catch (e) {
+      return { ok: false, reason: `signature: ${e.message}` };
+    }
   }
 
   // The signed claims must bind THIS record (a valid sig over a different

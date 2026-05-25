@@ -19,12 +19,16 @@ import { publishAgentMemory } from '../lib/agent-memory-publish.js';
 import { decodeRecord } from '../lib/agent-state-sync.js';
 import { MemoryStore } from '../lib/memory-store.js';
 import { deriveProjectRoutingId } from '../lib/project-crypto.js';
+import { deriveAgentEd25519Keypair, agentDidFromPublicJwk } from '../lib/agent-provisioning.js';
+import { verifyRecordSignature } from '../lib/agent-sig-verify.js';
 
 const PROJECT_ROOT_SEED = crypto.createHash('sha256').update('operator-project-root').digest(); // 32B
 const OTHER_SEED = crypto.createHash('sha256').update('a-different-operator').digest();
 const SLOT_A = crypto.createHash('sha256').update('agent-A-slot').digest();
 const SLOT_B = crypto.createHash('sha256').update('agent-B-slot').digest();
 const IDP = 'github.com/gettrustedapp/gettrusted-idp';
+// The real did:lastid:agent DID for SLOT_A's key (so its signatures verify).
+const A_DID = agentDidFromPublicJwk(deriveAgentEd25519Keypair(SLOT_A).publicJwk);
 
 const DIR = mkdtempSync(join(tmpdir(), 'lastid-projsync-'));
 import { after } from 'node:test';
@@ -134,4 +138,30 @@ test('NEGATIVE: publish refuses a project memory when the agent has no project_r
     fetchImpl: async () => ({ ok: true, status: 200 }),
   });
   assert.equal(ok, false, 'no seed → no unreadable project write');
+});
+
+test('PROVENANCE: a published project memory verifies (sig + content hash); unsigned/tampered rejected', async () => {
+  // Publish as agent A (real DID so the signature verifies).
+  let posted = null;
+  await publishAgentMemory({
+    idpUrl: 'https://human.lastid.co',
+    loaded: { agentDid: A_DID, slotSeed: SLOT_A, projectRootSeed: PROJECT_ROOT_SEED, vcCompact: 'vc' },
+    memory: projectMemory(),
+    fetchImpl: async (_u, init) => { posted = JSON.parse(init.body); return { ok: true, status: 200 }; },
+  });
+  assert.ok(posted.sig && posted.author_agent_did === A_DID, 'signed + author DID stamped');
+
+  // The record peer B receives from the IdP.
+  const rec = {
+    id: posted.id, kind: 'memory', target: 'project', routing_id: posted.routing_id,
+    version: posted.version, status: 'active', enc_b64: posted.enc_b64,
+    author: 'agent', author_agent_did: posted.author_agent_did, sig: posted.sig,
+  };
+  const { contentBytes } = decodeRecord(rec, SLOT_B, PROJECT_ROOT_SEED);
+  // Verifies: agent A's EdDSA sig over the canonical record + the content hash.
+  assert.deepEqual(verifyRecordSignature(rec, contentBytes, null, {}), { ok: true });
+  // Fail-closed: strip the signature → rejected.
+  assert.equal(verifyRecordSignature({ ...rec, sig: undefined }, contentBytes, null, {}).ok, false);
+  // Tampered content → hash mismatch → rejected.
+  assert.equal(verifyRecordSignature(rec, Buffer.from('tampered'), null, {}).ok, false);
 });
