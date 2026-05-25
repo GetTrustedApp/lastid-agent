@@ -119,8 +119,23 @@ export async function syncAgentState({
     fetchKind({ idpUrl, path: MEMORIES_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }),
   ]);
 
-  // Operator delegation key for signature verification (IdP-embedded).
-  const opJwk = operatorJwk ?? rules.operatorJwk ?? memories.operatorJwk ?? null;
+  // Operator delegation key for signature verification. TRUST-ON-FIRST-USE: the
+  // IdP supplies it embedded in the sync response, but we PIN it on the first
+  // sync and verify against the pinned key thereafter — a later response that
+  // hands over a DIFFERENT key (a compromised/forged IdP) is ignored, so it
+  // can't swap the verification key and forge operator rules/memories. (A test
+  // override via operatorJwk wins, for determinism.)
+  const supplied = operatorJwk ?? rules.operatorJwk ?? memories.operatorJwk ?? null;
+  const pinned = store.pinnedDelegationJwk;
+  let opJwk = pinned;
+  if (!pinned && supplied) {
+    store.pinDelegationJwk(supplied);
+    opJwk = supplied;
+  } else if (pinned && supplied && (supplied.x_b64u !== pinned.x_b64u || supplied.y_b64u !== pinned.y_b64u)) {
+    // Key-swap attempt — verify against the PINNED key, not the swapped one.
+    safely(onReject, { id: 'delegation-key', kind: 'rule' },
+      'operator delegation key changed since first sync — ignoring sync-supplied key, using the pinned one');
+  }
   const verify =
     verifyRecord ??
     ((rec, contentBytes) => verifyRecordSignature(rec, contentBytes, opJwk, { agentDid }));

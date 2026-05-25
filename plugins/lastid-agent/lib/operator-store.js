@@ -55,6 +55,11 @@ export class OperatorStore {
             parsed.records && typeof parsed.records === 'object'
               ? parsed.records
               : {},
+          // Trust-on-first-use pin of the operator's delegation_authority key
+          // (see pinnedDelegationJwk). Persisted so a later sync can't swap it.
+          ...(parsed.delegation_jwk && typeof parsed.delegation_jwk === 'object'
+            ? { delegation_jwk: parsed.delegation_jwk }
+            : {}),
         };
       }
     } catch {
@@ -77,6 +82,28 @@ export class OperatorStore {
   setCursor(c) {
     const n = Number(c);
     if (Number.isFinite(n) && n > this.state.cursor) this.state.cursor = n;
+  }
+
+  /**
+   * The operator's delegation_authority public key (P-256 {x_b64u,y_b64u}),
+   * PINNED on the first sync that supplied one. After that, rule/memory
+   * signatures are verified against THIS key — a later sync that hands over a
+   * different key (a compromised/forged IdP response) is ignored, so it can't
+   * substitute the verification key and forge operator records. Null until the
+   * first sync establishes it.
+   */
+  get pinnedDelegationJwk() {
+    return this.state.delegation_jwk ?? null;
+  }
+
+  /** Pin the delegation key ONCE (trust-on-first-use). No-op if already pinned
+   *  or the candidate is malformed. Returns true if it pinned now. */
+  pinDelegationJwk(jwk) {
+    if (this.state.delegation_jwk) return false;
+    if (!jwk || typeof jwk.x_b64u !== 'string' || typeof jwk.y_b64u !== 'string') return false;
+    this.state.delegation_jwk = { x_b64u: jwk.x_b64u, y_b64u: jwk.y_b64u };
+    this.save();
+    return true;
   }
 
   /**

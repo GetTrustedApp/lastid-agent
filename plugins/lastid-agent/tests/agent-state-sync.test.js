@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import crypto, { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import {
@@ -22,6 +22,7 @@ import {
 } from '../lib/agent-state-sync.js';
 import { OperatorStore } from '../lib/operator-store.js';
 import { encryptJson } from '../lib/agent-content-crypto.js';
+import { sha256Hex } from '../lib/agent-sig-verify.js';
 import {
   deriveAgentEd25519Keypair,
   agentDidFromPublicJwk,
@@ -227,4 +228,82 @@ test('doorbell handler triggers a (debounced) sync on changed events and ignores
   assert.equal(onEvent('agent_state.changed'), true); // string form
   await delay(40);
   assert.equal(calls, 2);
+});
+
+// ── Trust-on-first-use pinning of the operator delegation key (#24/2) ──────
+// The IdP supplies the delegation key embedded in the sync response. We pin it
+// on the first sync and verify against the pinned key thereafter, so a later
+// (compromised/forged) response can't swap the key and forge operator records.
+
+const K1 = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+const K2 = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+const jwkOf = (kp) => {
+  const j = kp.publicKey.export({ format: 'jwk' });
+  return { x_b64u: j.x, y_b64u: j.y };
+};
+
+function mintEs256(claims, privateKey) {
+  const h = Buffer.from(JSON.stringify({ typ: 'jwt+lastid-human-auth-v1', alg: 'ES256' })).toString('base64url');
+  const p = Buffer.from(JSON.stringify(claims)).toString('base64url');
+  const sig = crypto.sign('sha256', Buffer.from(`${h}.${p}`, 'utf8'), { key: privateKey, dsaEncoding: 'ieee-p1363' });
+  return `${h}.${p}.${sig.toString('base64url')}`;
+}
+
+function operatorSignedRule(id, content, cursor, privateKey) {
+  const contentBytes = Buffer.from(JSON.stringify(content), 'utf8');
+  const claims = { kind: 'rule', id, target: 'global', version: 1, status: 'active', content_sha256: sha256Hex(contentBytes) };
+  return {
+    id, kind: 'rule', target: 'global', status: 'active', version: 1, cursor,
+    updated_at: '2026-01-01T00:00:00Z', tool: content.tool,
+    enc_b64: encryptJson(SEED, content).toString('base64'),
+    sig: mintEs256(claims, privateKey),
+  };
+}
+
+function idpWithKey(rules, jwk) {
+  return async (url) => {
+    const u = new URL(url);
+    const since = Number(u.searchParams.get('since')) || 0;
+    const all = u.pathname.endsWith('/rules') ? rules : [];
+    const records = all.filter((r) => r.cursor > since);
+    const cursor = all.reduce((m, r) => Math.max(m, r.cursor), since);
+    return jsonResp({ records, cursor, operator_delegation_jwk: jwk });
+  };
+}
+
+const realAuth = { idpUrl: 'http://idp.test', agentDid: AGENT_DID, vcCompact: 'vc', signingKey, slotSeed: SEED };
+
+test('TOFU: first sync pins the operator delegation key', async () => {
+  const store = freshStore();
+  const r1 = operatorSignedRule('rule_1', { tool: 'shell', pattern: 'tok-a', severity: 'deny' }, 1, K1.privateKey);
+  const res = await syncAgentState({ ...realAuth, store, fetchImpl: idpWithKey([r1], jwkOf(K1)) });
+  assert.equal(res.applied, 1, 'the signed rule applies');
+  assert.deepEqual(store.pinnedDelegationJwk, jwkOf(K1), 'key pinned on first sync');
+});
+
+test('TOFU: a swapped delegation key is ignored — verification uses the PINNED key', async () => {
+  const store = freshStore();
+  const r1 = operatorSignedRule('rule_1', { tool: 'shell', pattern: 'tok-a', severity: 'deny' }, 1, K1.privateKey);
+  await syncAgentState({ ...realAuth, store, fetchImpl: idpWithKey([r1], jwkOf(K1)) });
+
+  // Second sync: the IdP now supplies K2 (swapped) and serves rule_2 signed by
+  // the SWAPPED key (forgery) + rule_3 signed by the PINNED key.
+  const forged = operatorSignedRule('rule_2', { tool: 'shell', pattern: 'tok-b', severity: 'deny' }, 2, K2.privateKey);
+  const genuine = operatorSignedRule('rule_3', { tool: 'shell', pattern: 'tok-c', severity: 'deny' }, 3, K1.privateKey);
+  await syncAgentState({ ...realAuth, store, fetchImpl: idpWithKey([forged, genuine], jwkOf(K2)) });
+
+  assert.deepEqual(store.pinnedDelegationJwk, jwkOf(K1), 'pin not overwritten by the swapped key');
+  assert.ok(store.listRules().some((r) => r.id === 'rule_3'), 'pinned-key record applies');
+  assert.ok(!store.listRules().some((r) => r.id === 'rule_2'), 'swapped-key forgery rejected');
+});
+
+test('operator-store: pinDelegationJwk pins once and persists', () => {
+  const path = join(tmpdir(), `pin-${randomUUID()}.json`);
+  const s1 = new OperatorStore('test', path);
+  assert.equal(s1.pinnedDelegationJwk, null);
+  assert.equal(s1.pinDelegationJwk(jwkOf(K1)), true, 'pins first time');
+  assert.equal(s1.pinDelegationJwk(jwkOf(K2)), false, 'no-op once pinned');
+  assert.deepEqual(s1.pinnedDelegationJwk, jwkOf(K1));
+  const s2 = new OperatorStore('test', path);
+  assert.deepEqual(s2.pinnedDelegationJwk, jwkOf(K1));
 });
