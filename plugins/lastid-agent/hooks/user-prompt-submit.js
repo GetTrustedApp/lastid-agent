@@ -25,6 +25,8 @@
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readLastProject } from '../lib/project-sticky.js';
+import { projectKeyForPath } from '../lib/project-key.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
@@ -50,9 +52,24 @@ if (typeof userPrompt !== 'string' || userPrompt.trim().length === 0) {
 // desktop handshake logic here. The CLI returns the formatted packet
 // on stdout when there's anything to inject; empty stdout means no
 // bedrock memories.
+// Resolve which repo to scope project memories to at turn-start. Session cwd
+// is unreliable (often the launch dir, e.g. ~), so prefer the sticky
+// last-project recorded by PreToolUse as the agent worked; fall back to the
+// payload cwd's repo. Null → global+agent only this turn.
+let projectKey = readLastProject('main');
+if (!projectKey && typeof payload.cwd === 'string' && payload.cwd) {
+  try {
+    projectKey = projectKeyForPath(payload.cwd);
+  } catch {
+    projectKey = null;
+  }
+}
+const retrieveArgs = [cliPath, 'memory-retrieve', '--prompt', userPrompt];
+if (projectKey) retrieveArgs.push('--project-key', projectKey);
+
 const result = spawnSync(
   'node',
-  [cliPath, 'memory-retrieve', '--prompt', userPrompt],
+  retrieveArgs,
   {
     encoding: 'utf-8',
     // Generous enough for a warm-daemon embed (~tens of ms) OR a one-time

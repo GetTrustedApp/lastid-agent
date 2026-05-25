@@ -14,6 +14,7 @@
  * agent-state record status is active (live) or revoked (tombstone).
  */
 import { encryptContent } from './agent-content-crypto.js';
+import { deriveProjectRoutingId, encryptProjectContent } from './project-crypto.js';
 import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
 import { mintDpopJwt } from './dpop.js';
 
@@ -35,6 +36,10 @@ export function memorySyncContent(m) {
     status: m.status, // the MEMORY's state (active|drafted|forgotten)
     created_at: m.created_at,
     authored_by: 'agent',
+    // Project-tier: carry the repo key INSIDE the ciphertext so a reader (who
+    // only has the plaintext routing_id) recovers which repo to scope it to
+    // after decrypting. Absent for global/agent memories.
+    ...(m.tier === 'project' && m.project_key ? { project_key: m.project_key } : {}),
   };
 }
 
@@ -54,18 +59,40 @@ function authHeaders({ idpUrl, agentDid, vcCompact, signingKey }) {
 export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'active', version, fetchImpl = globalThis.fetch }) {
   if (typeof fetchImpl !== 'function' || !idpUrl || !loaded?.slotSeed) return false;
   const agentDid = loaded.agentDid;
-  const target = memory.tier === 'global' ? 'global' : agentDid;
   const ver = Number.isInteger(version) ? version : Number(memory.version) || 1;
 
   let body;
-  if (status === 'revoked') {
-    body = { id: memory.id, target, status: 'revoked', version: ver, copies: [{ agent_did: agentDid }] };
+  if (memory.tier === 'project') {
+    // Project-tier: ONE shared record (not a per-agent copy), encrypted under
+    // the project content key all the operator's agents share. Requires the
+    // operator's project_root_seed (sealed at provisioning) + the memory's
+    // project_key. Without the seed (older agent), we can't publish → fail
+    // (caller rolls back / keeps it local) rather than write an unreadable doc.
+    if (!Buffer.isBuffer(loaded.projectRootSeed) || typeof memory.project_key !== 'string' || !memory.project_key) {
+      return false;
+    }
+    const routingId = deriveProjectRoutingId(loaded.projectRootSeed, memory.project_key);
+    if (status === 'revoked') {
+      body = { id: memory.id, target: 'project', routing_id: routingId, status: 'revoked', version: ver };
+    } else {
+      const enc_b64 = encryptProjectContent(
+        loaded.projectRootSeed,
+        routingId,
+        Buffer.from(JSON.stringify(memorySyncContent(memory)), 'utf8'),
+      ).toString('base64');
+      body = { id: memory.id, target: 'project', routing_id: routingId, status: 'active', version: ver, enc_b64 };
+    }
   } else {
-    const enc_b64 = encryptContent(
-      loaded.slotSeed,
-      Buffer.from(JSON.stringify(memorySyncContent(memory)), 'utf8'),
-    ).toString('base64');
-    body = { id: memory.id, target, status: 'active', version: ver, copies: [{ agent_did: agentDid, enc_b64 }] };
+    const target = memory.tier === 'global' ? 'global' : agentDid;
+    if (status === 'revoked') {
+      body = { id: memory.id, target, status: 'revoked', version: ver, copies: [{ agent_did: agentDid }] };
+    } else {
+      const enc_b64 = encryptContent(
+        loaded.slotSeed,
+        Buffer.from(JSON.stringify(memorySyncContent(memory)), 'utf8'),
+      ).toString('base64');
+      body = { id: memory.id, target, status: 'active', version: ver, copies: [{ agent_did: agentDid, enc_b64 }] };
+    }
   }
 
   let signingKey;

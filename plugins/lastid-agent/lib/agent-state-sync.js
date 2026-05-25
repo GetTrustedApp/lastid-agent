@@ -17,6 +17,7 @@
  */
 import { mintDpopJwt } from './dpop.js';
 import { decryptContent } from './agent-content-crypto.js';
+import { decryptProjectContent } from './project-crypto.js';
 import { verifyRecordSignature } from './agent-sig-verify.js';
 
 export const RULES_PATH = '/v1/agent-state/rules';
@@ -28,7 +29,7 @@ export const MEMORIES_PATH = '/v1/agent-state/memories';
  * removes them. Active records decrypt their JSON content. Returns the
  * store record plus the raw decrypted bytes (for signature/hash checks).
  */
-export function decodeRecord(record, slotSeed) {
+export function decodeRecord(record, slotSeed, projectRootSeed = null) {
   const base = {
     id: record.id,
     kind: record.kind,
@@ -39,7 +40,19 @@ export function decodeRecord(record, slotSeed) {
   if (record.status && record.status !== 'active') {
     return { storeRecord: { ...base, status: record.status }, contentBytes: null };
   }
-  const contentBytes = decryptContent(slotSeed, record.enc_b64);
+  // Project-tier records are encrypted under the project content key (derived
+  // from the record's plaintext routing_id + the operator's project_root_seed),
+  // NOT the agent's slot_seed. Without the project seed (older agent) we can't
+  // read them — surface as undecryptable so the caller skips, not crashes.
+  let contentBytes;
+  if (record.target === 'project') {
+    if (!Buffer.isBuffer(projectRootSeed) || typeof record.routing_id !== 'string') {
+      throw new Error('project record but no project_root_seed/routing_id');
+    }
+    contentBytes = decryptProjectContent(projectRootSeed, record.routing_id, record.enc_b64);
+  } else {
+    contentBytes = decryptContent(slotSeed, record.enc_b64);
+  }
   const content = JSON.parse(contentBytes.toString('utf8'));
   return { storeRecord: { ...base, status: 'active', content }, contentBytes };
 }
@@ -89,6 +102,7 @@ export async function syncAgentState({
   vcCompact,
   signingKey,
   slotSeed,
+  projectRootSeed = null,
   store,
   memoryStore = null,
   fetchImpl = globalThis.fetch,
@@ -120,7 +134,7 @@ export async function syncAgentState({
     let storeRecord;
     let contentBytes = null;
     try {
-      const d = decodeRecord(rec, slotSeed);
+      const d = decodeRecord(rec, slotSeed, projectRootSeed);
       storeRecord = d.storeRecord;
       contentBytes = d.contentBytes;
     } catch (err) {

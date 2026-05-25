@@ -33,6 +33,28 @@ test('generateEphemeralEnvelopeKeypair produces an EC P-256 JWK with the expecte
   assert.ok(kp.privateKey);
 });
 
+test('project_root_seed seals + unseals through the SAME envelope path as the slot seed', () => {
+  // The agent reuses unsealSlotSeed for the wallet-sealed project root seed, so
+  // a round-trip must reproduce the exact 32 bytes. This is the contract behind
+  // provisionAgent unsealing approved.sealedProjectRootSeed.
+  const { publicJwk, privateKey } = generateEphemeralEnvelopeKeypair();
+  const projectRootSeed = Buffer.alloc(32, 0x5a);
+  const sealed = _internal.sealSlotSeed(projectRootSeed, publicJwk);
+  const out = _internal.unsealSlotSeed(sealed, privateKey);
+  assert.equal(out.length, 32);
+  assert.ok(out.equals(projectRootSeed));
+});
+
+test('a project_root_seed sealed to a DIFFERENT ephemeral key fails to unseal (fail-open → no project tier)', () => {
+  // Backs the best-effort/fail-open unseal in provisionAgent: a foreign or
+  // malformed envelope throws and the agent degrades to global+agent, never
+  // crashing provisioning.
+  const a = generateEphemeralEnvelopeKeypair();
+  const b = generateEphemeralEnvelopeKeypair();
+  const sealed = _internal.sealSlotSeed(Buffer.alloc(32, 0x07), a.publicJwk);
+  assert.throws(() => _internal.unsealSlotSeed(sealed, b.privateKey));
+});
+
 test('deriveAgentEd25519Keypair is deterministic for the same slot seed', () => {
   const slotSeed = Buffer.alloc(32, 0x42);
   const a = deriveAgentEd25519Keypair(slotSeed);

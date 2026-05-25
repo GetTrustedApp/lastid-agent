@@ -120,16 +120,26 @@ export async function retrievePacket({
   operatorStore = null,
   embedder = null,
   store = null,
+  projectKey = null,
 } = {}) {
   const mem = store ?? new MemoryStore(scope, undefined, { agentDid, parentHumanDid });
 
-  const bedrock = [...mem.bedrockMemories().map((m) => ({ id: m.id, claim: m.claim, summary: m.summary })), ...operatorBedrock(operatorStore)];
+  // Bedrock = global + agent always-inject (bedrockMemories excludes project),
+  // operator-authored bedrock, PLUS this repo's project bedrock when we know
+  // which repo we're in (projectKey). Project bedrock injects every turn the
+  // agent works in that repo; it never appears for unrelated work.
+  const bedrock = [
+    ...mem.bedrockMemories().map((m) => ({ id: m.id, claim: m.claim, summary: m.summary })),
+    ...operatorBedrock(operatorStore),
+    ...mem.projectBedrockMemories(projectKey).map((m) => ({ id: m.id, claim: m.claim, summary: m.summary })),
+  ];
 
   // Topical = agent-authored + operator-authored (non-bedrock), ranked
   // together. Each side scores on the same cosine/keyword basis, so merging
-  // by score is apples-to-apples.
+  // by score is apples-to-apples. `projectKey` lets this repo's project
+  // memories into the topical pool (and keeps other repos' out).
   const [agentTopical, opTopical] = await Promise.all([
-    searchMemories(mem, prompt ?? '', { limit: topicalLimit, excludeBedrock: true, embedder }),
+    searchMemories(mem, prompt ?? '', { limit: topicalLimit, excludeBedrock: true, embedder, projectKey }),
     topicalOperatorMemories(operatorStore, prompt ?? '', embedder, topicalLimit),
   ]);
   const topical = [...agentTopical, ...opTopical]
@@ -177,11 +187,24 @@ export async function retrieveSearchBlock({
   excludeBedrock = true,
   embedder = null,
   store = null,
+  projectKey = null,
 } = {}) {
   const mem = store ?? new MemoryStore(scope, undefined, { agentDid, parentHumanDid });
-  const hits = await searchMemories(mem, query ?? '', { limit, excludeBedrock, embedder });
-  if (hits.length === 0) return '';
+  const hits = await searchMemories(mem, query ?? '', { limit, excludeBedrock, embedder, projectKey });
+  // When the agent is working in a repo, always surface that repo's project
+  // bedrock (ground truth) here too — so moving to a new repo mid-turn brings
+  // its always-inject memories immediately, not just on the next turn. These
+  // are bedrock so they're never in `hits` (which excludes bedrock) — no dup.
+  const projBedrock = projectKey ? mem.projectBedrockMemories(projectKey) : [];
+  if (hits.length === 0 && projBedrock.length === 0) return '';
   const lines = ['<lastid-memory source="ambient">'];
+  if (projBedrock.length > 0) {
+    lines.push(`Ground truth for this project (${projectKey}):`);
+    for (const m of projBedrock) {
+      lines.push(`- [${m.id}] ${m.claim}`);
+      if (m.summary && m.summary.trim().length > 0) lines.push(`  ${m.summary.trim()}`);
+    }
+  }
   for (const h of hits) {
     const score = typeof h.score === 'number' ? ` [match ${h.score.toFixed(2)}]` : '';
     const subject = Array.isArray(h.subject) && h.subject.length > 0 ? ` (subject: ${h.subject.join(', ')})` : '';

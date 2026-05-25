@@ -43,7 +43,9 @@ export const MEMORY_KINDS = [
   'artifact',
   'rule',
 ];
-export const TIERS = ['global', 'agent'];
+// 'project' = shared across all the operator's agents, scoped to one git
+// remote (project_key); injected only when an agent is working in that repo.
+export const TIERS = ['global', 'agent', 'project'];
 export const SENSITIVITIES = ['low', 'medium', 'high', 'restricted'];
 const SENSITIVITY_RANK = { low: 0, medium: 1, high: 2, restricted: 3 };
 export const DECAYS = ['none', 'slow', 'medium', 'fast'];
@@ -136,6 +138,16 @@ function validateWriteInput(input) {
   if (!MEMORY_KINDS.includes(kind)) errs.push(`kind must be one of ${MEMORY_KINDS.join('|')}`);
   const tier = input.tier ?? 'agent';
   if (!TIERS.includes(tier)) errs.push(`tier must be one of ${TIERS.join('|')}`);
+  // project_key identifies the repo a project-tier memory belongs to (a
+  // normalized git remote, e.g. github.com/org/repo). Required for tier=project
+  // and meaningless otherwise.
+  const projectKey =
+    typeof input.project_key === 'string' && input.project_key.trim().length > 0
+      ? input.project_key.trim()
+      : null;
+  if (tier === 'project' && !projectKey) {
+    errs.push('project_key is required for tier=project');
+  }
   const subject = Array.isArray(input.subject)
     ? input.subject.filter((s) => typeof s === 'string' && s.trim().length > 0)
     : [];
@@ -152,7 +164,7 @@ function validateWriteInput(input) {
   if (!SOURCE_KINDS.includes(sourceKind)) {
     errs.push(`source_kind must be one of ${SOURCE_KINDS.join('|')}`);
   }
-  return { errs, kind, tier, subject, claim, summary, sourceKind };
+  return { errs, kind, tier, projectKey, subject, claim, summary, sourceKind };
 }
 
 // ── store ────────────────────────────────────────────────────────────
@@ -187,7 +199,7 @@ export class MemoryStore {
 
   /** Build a full MemoryObject from caller input + defaults. */
   #materialize(input, status) {
-    const { errs, kind, tier, subject, claim, summary, sourceKind } = validateWriteInput(input);
+    const { errs, kind, tier, projectKey, subject, claim, summary, sourceKind } = validateWriteInput(input);
     if (errs.length > 0) {
       const e = new Error(`invalid memory: ${errs.join('; ')}`);
       e.code = 'EVALIDATION';
@@ -201,7 +213,10 @@ export class MemoryStore {
       // supersede). Bumped on each update.
       version: 1,
       tier,
+      // Agent-tier is per-agent; global + project are not bound to one agent.
       agent_did: tier === 'agent' ? this.agentDid : null,
+      // Project-tier memories carry the repo key they're scoped to; null else.
+      ...(tier === 'project' ? { project_key: projectKey } : {}),
       parent_human_did: this.parentHumanDid,
       kind,
       subject,
@@ -295,12 +310,19 @@ export class MemoryStore {
     if (author !== 'agent') return false; // operator-authored actives belong in operator-store
     const c = rec.content || {};
     if (typeof c.claim !== 'string' || c.claim.length === 0) return false;
+    // Project records (target='project') are shared across the operator's
+    // agents; they carry their repo key inside the decrypted content. A project
+    // active with no usable project_key can't be scoped, so skip it.
+    const isProject = rec.target === 'project';
+    if (isProject && (typeof c.project_key !== 'string' || c.project_key.length === 0)) return false;
     const ts = nowIso();
     this.state.records[rec.id] = {
       id: rec.id,
       version: ver,
-      tier: rec.target === 'global' ? 'global' : 'agent',
-      agent_did: rec.target === 'global' ? null : this.agentDid,
+      tier: isProject ? 'project' : rec.target === 'global' ? 'global' : 'agent',
+      // Project + global memories are not bound to one agent; agent tier is.
+      agent_did: isProject || rec.target === 'global' ? null : this.agentDid,
+      ...(isProject ? { project_key: c.project_key } : {}),
       parent_human_did: this.parentHumanDid,
       kind: MEMORY_KINDS.includes(c.kind) ? c.kind : 'fact',
       subject: Array.isArray(c.subject) ? c.subject : [],
@@ -425,9 +447,32 @@ export class MemoryStore {
     return this.all().filter((m) => m.status === 'active' && !isExpired(m, nowMs));
   }
 
-  /** Always-inject tier: active + bedrock + not expired. */
+  /**
+   * Always-inject memories: active + bedrock + not expired. EXCLUDES project-
+   * tier memories — those are scoped to a repo and inject only when the agent
+   * is working in it (see projectBedrockMemories), so they never dilute the
+   * context of unrelated work.
+   */
   bedrockMemories(nowMs = Date.now()) {
-    return this.activeMemories(nowMs).filter((m) => m.bedrock === true);
+    return this.activeMemories(nowMs).filter(
+      (m) => m.bedrock === true && m.tier !== 'project',
+    );
+  }
+
+  /** Active memories scoped to one project_key (a normalized git remote). */
+  projectMemories(projectKey, nowMs = Date.now()) {
+    if (typeof projectKey !== 'string' || projectKey.length === 0) return [];
+    return this.activeMemories(nowMs).filter(
+      (m) => m.tier === 'project' && m.project_key === projectKey,
+    );
+  }
+
+  /**
+   * Project-tier always-inject: active + bedrock + matching project_key.
+   * Injected every turn the agent operates in that repo.
+   */
+  projectBedrockMemories(projectKey, nowMs = Date.now()) {
+    return this.projectMemories(projectKey, nowMs).filter((m) => m.bedrock === true);
   }
 
   /**

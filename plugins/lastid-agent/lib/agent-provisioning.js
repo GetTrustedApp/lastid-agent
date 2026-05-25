@@ -180,6 +180,12 @@ export async function pollUntilApproved(opts) {
         return {
           credentialOfferUri: body.credential_offer_uri,
           sealedSlotSeed: body.sealed_slot_seed,
+          // Optional — present only when the wallet sealed one. Absent for
+          // older wallets; the agent then has no project-tier memories.
+          sealedProjectRootSeed:
+            typeof body.sealed_project_root_seed === 'string'
+              ? body.sealed_project_root_seed
+              : null,
           slotIndex: body.slot_index,
           agentDid: body.agent_did,
         };
@@ -631,6 +637,23 @@ export async function provisionAgent({
   const slotSeed = unsealSlotSeed(approved.sealedSlotSeed, ephemeral.privateKey);
   const { signingKey, publicJwk } = deriveAgentEd25519Keypair(slotSeed);
 
+  // Unseal the operator's project-memory root seed too, if the wallet sealed
+  // one to the same ephemeral recipient (the envelope format is identical, so
+  // `unsealSlotSeed` handles it). Best-effort + fail-open: an older wallet
+  // omits it, and a malformed/foreign envelope must NOT break provisioning —
+  // the agent simply has no project-tier memories.
+  let projectRootSeed = null;
+  if (approved.sealedProjectRootSeed) {
+    try {
+      projectRootSeed = unsealSlotSeed(approved.sealedProjectRootSeed, ephemeral.privateKey);
+    } catch (err) {
+      process.stderr.write(
+        `[lastid-agent] project root seed unseal failed (non-fatal): ${err?.message ?? err}\n`,
+      );
+      projectRootSeed = null;
+    }
+  }
+
   // Cross-check: the IdP told us the agent_did at /poll; what we
   // derived from the unsealed slot seed must match exactly. If it
   // doesn't, the seed-to-DID chain is broken and we MUST refuse to
@@ -660,6 +683,7 @@ export async function provisionAgent({
   return {
     agentDid: derivedDid,
     slotSeed,
+    projectRootSeed,
     slotIndex: approved.slotIndex,
     publicJwk,
     vcCompact: issued.credential,

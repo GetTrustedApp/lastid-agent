@@ -31,6 +31,10 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 
 const SERVICE_SLOT_SEED = 'lastid.co/agent-slot-seed';
+// Operator's project-memory root seed (base64url, 32 bytes). Shared across all
+// the operator's agents; lets this agent read/write project-tier memories.
+// Optional — absent for agents provisioned before project memories existed.
+const SERVICE_PROJECT_ROOT_SEED = 'lastid.co/agent-project-root-seed';
 const SERVICE_SLOT_INDEX = 'lastid.co/agent-slot-index';
 const SERVICE_AGENT_DID = 'lastid.co/agent-did';
 const SERVICE_VC = 'lastid.co/agent-vc';
@@ -49,8 +53,14 @@ export async function loadAgentVc(scope = 'main') {
   const slotIndexStr = await readSecret(`${SERVICE_SLOT_INDEX}:${scope}`);
   const agentDid = await readSecret(`${SERVICE_AGENT_DID}:${scope}`);
   const idpUrl = await readSecret(`${SERVICE_IDP_URL}:${scope}`);
+  const projectRootSeedB64 = await readSecret(`${SERVICE_PROJECT_ROOT_SEED}:${scope}`);
   return {
     slotSeed: Buffer.from(seedB64, 'base64url'),
+    // Optional — null for agents provisioned before project memories existed
+    // (they get global+agent memories only until re-provisioned).
+    projectRootSeed: projectRootSeedB64
+      ? Buffer.from(projectRootSeedB64, 'base64url')
+      : null,
     slotIndex: slotIndexStr ? Number.parseInt(slotIndexStr, 10) : null,
     agentDid: agentDid ?? null,
     vcCompact,
@@ -69,6 +79,14 @@ export async function loadAgentVc(scope = 'main') {
 export async function persistAgentVc(provisioned, scope = 'main') {
   const seedB64 = Buffer.from(provisioned.slotSeed).toString('base64url');
   await writeSecret(`${SERVICE_SLOT_SEED}:${scope}`, seedB64);
+  // Persist the operator's project-memory root seed when the wallet delivered
+  // one. Optional — older wallets omit it; the agent then has no project tier.
+  if (provisioned.projectRootSeed) {
+    await writeSecret(
+      `${SERVICE_PROJECT_ROOT_SEED}:${scope}`,
+      Buffer.from(provisioned.projectRootSeed).toString('base64url'),
+    );
+  }
   await writeSecret(
     `${SERVICE_SLOT_INDEX}:${scope}`,
     String(provisioned.slotIndex),
@@ -99,6 +117,7 @@ export async function persistSubAgentVc(classSlug, sub) {
  */
 export async function deleteAgentVc(scope = 'main') {
   await deleteSecret(`${SERVICE_SLOT_SEED}:${scope}`);
+  await deleteSecret(`${SERVICE_PROJECT_ROOT_SEED}:${scope}`);
   await deleteSecret(`${SERVICE_SLOT_INDEX}:${scope}`);
   await deleteSecret(`${SERVICE_AGENT_DID}:${scope}`);
   await deleteSecret(`${SERVICE_VC}:${scope}`);

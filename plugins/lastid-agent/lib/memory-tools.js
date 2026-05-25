@@ -19,6 +19,7 @@ import { makeEmbedder, cosine, embedMemory, EMBED_DIM, SEMANTIC_FLOOR } from './
 import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
 import { appendMemoryAudit } from './memory-audit.js';
 import { publishAgentMemory } from './agent-memory-publish.js';
+import { readLastProject } from './project-sticky.js';
 
 const DEFAULT_IDP_URL = 'https://human.lastid.co';
 
@@ -35,7 +36,17 @@ const writeInputSchema = {
   type: 'object',
   properties: {
     kind: { type: 'string', enum: KIND_ENUM, description: 'Memory kind.' },
-    tier: { type: 'string', enum: ['agent', 'global'], description: 'Storage tier. Default agent.' },
+    tier: {
+      type: 'string',
+      enum: ['agent', 'global', 'project'],
+      description:
+        "Storage tier. Default agent. 'project' = shared with all your operator's agents and injected only when working in that repo (use for repo-specific ground truth/decisions).",
+    },
+    project_key: {
+      type: 'string',
+      description:
+        "For tier='project': the repo (normalized git remote, e.g. github.com/org/repo). Omit to use the repo you're currently working in.",
+    },
     subject: {
       type: 'array',
       items: { type: 'string' },
@@ -191,10 +202,16 @@ export function keywordScore(query, m) {
  * falls back to keyword/subject scoring. Returns
  * [{ memory_id, claim, summary, subject, score }] sorted desc, top `limit`.
  */
-export async function searchMemories(store, query, { limit = 8, excludeBedrock = false, embedder = null } = {}) {
+export async function searchMemories(store, query, { limit = 8, excludeBedrock = false, embedder = null, projectKey = null } = {}) {
   const select = () => {
-    const c = store.activeMemories();
-    return excludeBedrock ? c.filter((m) => m.bedrock !== true) : c;
+    let c = store.activeMemories();
+    if (excludeBedrock) c = c.filter((m) => m.bedrock !== true);
+    // Project-tier memories are eligible for topical ranking ONLY when the
+    // agent is working in their repo (project_key === the active projectKey);
+    // non-project memories are always eligible. Keeps a repo's memories out of
+    // unrelated work and never leaks them across repos.
+    c = c.filter((m) => m.tier !== 'project' || m.project_key === projectKey);
+    return c;
   };
   let candidates = select();
   if (candidates.length === 0 || !query || String(query).trim().length === 0) return [];
@@ -272,6 +289,18 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
     publishAgentMemory({ idpUrl, loaded: loadedAgent, memory, status, version: memory.version, fetchImpl }).catch(() => false);
   const notSaved = (detail) =>
     err(`memory NOT saved — the server write failed${detail ? `: ${detail}` : ''}. Tell your operator; nothing was stored.`);
+  // Project-tier authoring: default project_key to the repo the agent is
+  // currently working in (the sticky last-project the PreToolUse hook records)
+  // when the model didn't name one. Without any repo context we can't scope it.
+  if ((name === 'lastid_memory_write' || name === 'lastid_memory_draft') && args.tier === 'project' && !args.project_key) {
+    const sticky = readLastProject(scope);
+    if (!sticky) {
+      return err(
+        "tier='project' needs a repo and none is in context yet — pass project_key (the repo's normalized git remote, e.g. github.com/org/repo), or act in the repo first.",
+      );
+    }
+    args = { ...args, project_key: sticky };
+  }
   try {
     switch (name) {
       case 'lastid_memory_write': {

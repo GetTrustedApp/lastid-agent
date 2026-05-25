@@ -31,6 +31,8 @@ import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applyRewrite } from '../lib/operator-store.js';
+import { projectKeyForPath, operativePathFromToolInput } from '../lib/project-key.js';
+import { writeLastProject } from '../lib/project-sticky.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
@@ -137,9 +139,20 @@ const AMBIENT_RETRIEVE_TOOLS = new Set([
   'NotebookEdit',
 ]);
 if (toolName && AMBIENT_RETRIEVE_TOOLS.has(toolName)) {
+  // Resolve the repo this tool is acting on (project memory follows the WORK,
+  // not the session cwd). Record it as the sticky last-project so the next
+  // turn's UserPromptSubmit can inject this repo's memories from message one.
+  let projectKey = null;
+  try {
+    const opPath = operativePathFromToolInput(toolInput);
+    projectKey = opPath ? projectKeyForPath(opPath) : null;
+    if (projectKey) writeLastProject('main', projectKey);
+  } catch {
+    projectKey = null; // best-effort — never block a tool on project resolution
+  }
   const query = stringifyToolInput(toolInput);
   if (query && query.length > 0) {
-    const ambient = runAmbientMemoryRetrieve(query);
+    const ambient = runAmbientMemoryRetrieve(query, projectKey);
     if (ambient && ambient.trim().length > 0) {
       contextParts.push(ambient.trim());
     }
@@ -287,23 +300,29 @@ function stringifyToolInput(obj) {
  *   - Any caught error here returns '' so the hook never blocks
  *     a tool call because of a memory subsystem hiccup.
  */
-function runAmbientMemoryRetrieve(query) {
+function runAmbientMemoryRetrieve(query, projectKey = null) {
   // Cap the query at a reasonable size — flattened tool input for
   // a big Write/Edit could otherwise be tens of KB and embedding
   // a giant string just slows the round-trip without adding
   // signal beyond the first paragraph or two.
   const truncated = query.length > 4000 ? query.slice(0, 4000) : query;
+  const args = [
+    cliPath,
+    'memory-search',
+    '--prompt',
+    truncated,
+    '--exclude-bedrock',
+    '--limit',
+    '5',
+  ];
+  // Surface THIS repo's project memories (incl. its bedrock ground truth)
+  // ambiently. Omitted when the tool isn't in a recognizable repo.
+  if (typeof projectKey === 'string' && projectKey.length > 0) {
+    args.push('--project-key', projectKey);
+  }
   const result = spawnSync(
     'node',
-    [
-      cliPath,
-      'memory-search',
-      '--prompt',
-      truncated,
-      '--exclude-bedrock',
-      '--limit',
-      '5',
-    ],
+    args,
     {
       encoding: 'utf-8',
       timeout: 5_000,

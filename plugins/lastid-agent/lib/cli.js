@@ -491,6 +491,10 @@ async function cmdMemoryRetrieve(flags) {
       prompt,
       operatorStore: new OperatorStore(scope),
       embedder,
+      // Repo the agent is working in (normalized git remote), resolved by the
+      // hook from the operative path / sticky last-project. Gates project-tier
+      // memory injection; null → global+agent only.
+      projectKey: typeof flags['project-key'] === 'string' ? flags['project-key'] : null,
     });
     if (markdown && markdown.trim().length > 0) {
       process.stdout.write(markdown);
@@ -577,6 +581,10 @@ async function cmdMemorySearch(flags) {
       limit,
       excludeBedrock,
       embedder,
+      // Repo the agent is operating in, resolved by the PreToolUse hook from
+      // the tool's operative path. Surfaces THIS repo's project memories
+      // ambiently; null → none.
+      projectKey: typeof flags['project-key'] === 'string' ? flags['project-key'] : null,
     });
     if (block && block.trim().length > 0) {
       process.stdout.write(`${block}\n`);
@@ -811,6 +819,10 @@ async function runAgentStateSync(loaded, scope) {
     vcCompact: loaded.vcCompact,
     signingKey,
     slotSeed: loaded.slotSeed,
+    // Lets the sync decrypt shared project-tier records (target='project').
+    // Null for agents provisioned before project memories → those records are
+    // skipped as undecryptable (they still get global+agent).
+    projectRootSeed: loaded.projectRootSeed ?? null,
     store,
     memoryStore,
     fetchImpl: globalThis.fetch,

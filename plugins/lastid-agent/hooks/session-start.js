@@ -23,6 +23,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureListenerRunning } from '../lib/listener-daemon.js';
+import { memoryGuidanceLines } from '../lib/memory-guidance.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
@@ -270,35 +271,7 @@ function buildOperatingContext(s) {
           'work.',
         ].join('\n'),
     '',
-    '## Memory (persistent across sessions)',
-    '',
-    'You have a persistent memory store keyed to this operator and to',
-    'you (per-agent tier). Every turn, the harness auto-injects the',
-    "operator's bedrock memories — rules of engagement that beat your",
-    'training data when they conflict. Cite a memory by id (e.g.',
-    '`[mem_abc]`) when you act on one.',
-    '',
-    'Two writing patterns:',
-    '',
-    '- `lastid_memory_write` — the operator EXPLICITLY asked you to',
-    '  remember something ("save this", "from now on", "we decided").',
-    '  Commits immediately, surfaces in retrieve, citable next turn.',
-    '- `lastid_memory_draft` — YOU inferred something durable from',
-    '  conversation but the operator did NOT explicitly ask you to',
-    '  save. Queues for review in the wallet UI. Does not influence',
-    '  future turns until the operator promotes it. Always include a',
-    '  `source_quote` from the conversation so the operator can',
-    '  evaluate the proposal.',
-    '',
-    'Heuristic for when to draft: did the operator just teach you a',
-    'preference, decision, named entity, or workflow rule that you',
-    'would want to remember next time? If yes and they did not ask',
-    'you to save it explicitly, draft it. If no, do not.',
-    '',
-    'Do NOT draft: ephemeral task state, transient debugging notes,',
-    'speculative inferences, or anything you would not want surfaced',
-    "back as ground truth. The operator's bandwidth for reviewing",
-    'drafts is finite; high signal only.',
+    ...memoryGuidanceLines(),
     '',
     '## Quick reference',
     '',
