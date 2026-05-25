@@ -602,6 +602,24 @@ async function cmdPolicyCheck(flags) {
     // way to look them up.
     process.exit(0);
   }
+
+  // Local-first: the synced operator-store IS the operator's rule set
+  // once we've pulled any state, so a SaaS-fed agent enforces rules with
+  // nothing else running. The desktop /policy/check below is the fallback
+  // only before the first sync (cold start / transition). See
+  // saas-migration.md §2.3.
+  try {
+    const { OperatorStore } = await import('./operator-store.js');
+    const local = new OperatorStore(flags.scope ?? 'main').policyDecision(tool, input);
+    if (local) {
+      process.stdout.write(JSON.stringify(local));
+      process.exit(0);
+    }
+  } catch (e) {
+    // Local store unreadable — fall through to the desktop.
+    process.stderr.write(`policy-check(local): ${e?.message ?? e}\n`);
+  }
+
   const { signingKey, signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
   const client = new DesktopMcpClient({
     agentDid: loaded.agentDid,
