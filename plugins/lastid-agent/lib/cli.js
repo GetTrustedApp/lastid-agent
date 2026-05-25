@@ -457,6 +457,24 @@ async function cmdProvision(flags) {
         `   If state looks stale, stop Claude Code and run: rm -rf ~/.lastid-agent/${scope}`,
       );
     }
+  } else {
+    // Fresh provision (no prior identity for this scope). SessionStart skipped
+    // the listener because the scope wasn't provisioned at launch — so without
+    // this, the WebSocket + MLS channel + rule/memory sync don't come up until
+    // the operator restarts Claude. Start the listener NOW so the channel is
+    // active immediately (no restart needed).
+    try {
+      const { ensureListenerRunning } = await import('./listener-daemon.js');
+      const { fileURLToPath } = await import('node:url');
+      const cliPath = fileURLToPath(new URL('../bin/lastid-agent.js', import.meta.url));
+      const started = await ensureListenerRunning({ scope, cliPath });
+      console.log(`   listener:   ${started.status} — channel + sync now active (no restart needed)`);
+    } catch (err) {
+      console.error(
+        `   listener:   start failed (${err instanceof Error ? err.message : String(err)}) — ` +
+          'restart Claude to activate the channel.',
+      );
+    }
   }
 
   // Semantic memory onboarding. The embedding model (~137MB) + dep install ONCE

@@ -185,6 +185,25 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
         ],
       };
     }
+    // Active operator rules synced to THIS scope, read from the local store
+    // the PreToolUse hook enforces. Rules aren't surfaced anywhere else the
+    // agent can see (they only show when one fires), so include a summary here
+    // so the agent can confirm what it's actually operating under.
+    let rules = { active: 0, deny: 0, warn: 0, rewrite: 0 };
+    try {
+      const { readFileSync } = await import('node:fs');
+      const { operatorStatePath } = await import('./operator-store.js');
+      const store = JSON.parse(readFileSync(operatorStatePath(scope), 'utf-8'));
+      for (const r of Object.values(store.records ?? {})) {
+        if (r.kind === 'rule' && r.status === 'active') {
+          rules.active += 1;
+          const sev = r.content?.severity;
+          if (sev === 'deny' || sev === 'warn' || sev === 'rewrite') rules[sev] += 1;
+        }
+      }
+    } catch {
+      /* no local store yet / unreadable — report zeros */
+    }
     // Reuse the claims decoded at the top of the dispatcher.
     return {
       content: [
@@ -199,6 +218,7 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
               capabilities: claims.capabilities ?? [],
               may_delegate: claims.may_delegate ?? false,
               exp: claims.exp ?? null,
+              rules,
             },
             null,
             2,
