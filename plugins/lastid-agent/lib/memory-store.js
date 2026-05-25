@@ -1,0 +1,402 @@
+/**
+ * Local agent memory store — JS port of the desktop Rust `MemoryStore`
+ * (lastid-sdk/lastid-agent-memory) for the SaaS-migrated plugin.
+ *
+ * The old TCB was a desktop SQLite store (per-human global.db + per-agent
+ * agent.db) reached over the desktop MCP. In the new model the agent keeps
+ * its own memories in a local JSON store on the agent host (this file),
+ * the SAME way operator-store.js caches operator-authored rules/memories
+ * synced from the IdP. Operator-authored bedrock memories arrive via the
+ * agent-state sync rails (operator-store); memories the AGENT writes/drafts
+ * live here. Retrieval composes both.
+ *
+ * Persistence: ~/.lastid-agent/<scope>/memory.json, mode 0600, atomic
+ * (tmp + rename) — identical posture to operator-state.json. Plaintext on
+ * the agent's own host (consistent with operator-state.json, which already
+ * stores rule patterns/reasons in the clear). The slot_seed at-rest wrap is
+ * a later hardening, not a correctness requirement.
+ *
+ * Faithful to the Rust model: MemoryObject fields, the kind/tier/sensitivity/
+ * decay/status enums, source_kind→confidence defaults, kind→decay defaults,
+ * the sensitivity auto-escalation heuristic, and the draft→promote/reject
+ * lifecycle. Embedding fields (embedding / embedding_model_version) are
+ * carried here and populated by the embeddings layer (lib/embeddings.js).
+ */
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  renameSync,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { randomBytes } from 'node:crypto';
+
+// ── enums (mirror lastid-agent-memory/src/types.rs) ──────────────────
+
+export const MEMORY_KINDS = [
+  'fact',
+  'preference',
+  'decision',
+  'open_loop',
+  'episodic',
+  'artifact',
+  'rule',
+];
+export const TIERS = ['global', 'agent'];
+export const SENSITIVITIES = ['low', 'medium', 'high', 'restricted'];
+const SENSITIVITY_RANK = { low: 0, medium: 1, high: 2, restricted: 3 };
+export const DECAYS = ['none', 'slow', 'medium', 'fast'];
+export const STATUSES = ['active', 'forgotten', 'deprecated', 'drafted'];
+export const SOURCE_KINDS = [
+  'user_explicit',
+  'inferred',
+  'tool_observation',
+  'imported',
+];
+
+// source_kind → default confidence (store.rs:182-204)
+const CONFIDENCE_BY_SOURCE = {
+  user_explicit: 0.95,
+  inferred: 0.5,
+  tool_observation: 0.7,
+  imported: 0.6,
+};
+// kind → default decay
+const DECAY_BY_KIND = {
+  fact: 'none',
+  artifact: 'none',
+  rule: 'none',
+  preference: 'slow',
+  decision: 'slow',
+  open_loop: 'medium',
+  episodic: 'medium',
+};
+
+const CLAIM_MAX = 4000;
+const SUMMARY_MAX = 600;
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+export function memoryStatePath(scope = 'main') {
+  return join(homedir(), '.lastid-agent', scope ?? 'main', 'memory.json');
+}
+
+const ULID_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'; // Crockford base32
+
+/** Minimal ULID: 48-bit ms timestamp + 80 bits random, Crockford base32.
+ *  Lexicographically sortable by creation time, like the desktop's ids. */
+function ulid(nowMs = Date.now()) {
+  let ts = nowMs;
+  const out = new Array(26);
+  for (let i = 9; i >= 0; i--) {
+    out[i] = ULID_ALPHABET[ts % 32];
+    ts = Math.floor(ts / 32);
+  }
+  const rnd = randomBytes(16);
+  for (let i = 10; i < 26; i++) {
+    out[i] = ULID_ALPHABET[rnd[i - 10] % 32];
+  }
+  return out.join('');
+}
+
+function newMemoryId() {
+  return `mem_${ulid()}`;
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+/**
+ * Auto-escalate sensitivity when the claim/summary smells like a secret.
+ * Mirrors the desktop heuristic intent: never DOWNGRADE the caller's value,
+ * only raise it. Returns the higher of caller sensitivity and the detected
+ * floor.
+ */
+export function escalateSensitivity(caller, ...texts) {
+  const base = SENSITIVITIES.includes(caller) ? caller : 'low';
+  const blob = texts.filter((t) => typeof t === 'string').join('\n').toLowerCase();
+  let floor = 'low';
+  // high: credential-ish material
+  if (
+    /\b(password|passphrase|secret|api[\s_-]?key|access[\s_-]?token|private[\s_-]?key|client[\s_-]?secret|bearer\s+[a-z0-9._-]{8,})\b/i.test(
+      blob,
+    ) ||
+    /\b(ssn|social security|credit\s?card|cvv|routing\s?number)\b/i.test(blob)
+  ) {
+    floor = 'high';
+  }
+  return SENSITIVITY_RANK[floor] > SENSITIVITY_RANK[base] ? floor : base;
+}
+
+function validateWriteInput(input) {
+  const errs = [];
+  const kind = input.kind;
+  if (!MEMORY_KINDS.includes(kind)) errs.push(`kind must be one of ${MEMORY_KINDS.join('|')}`);
+  const tier = input.tier ?? 'agent';
+  if (!TIERS.includes(tier)) errs.push(`tier must be one of ${TIERS.join('|')}`);
+  const subject = Array.isArray(input.subject)
+    ? input.subject.filter((s) => typeof s === 'string' && s.trim().length > 0)
+    : [];
+  if (subject.length === 0) errs.push('subject must be a non-empty array of strings');
+  const claim = typeof input.claim === 'string' ? input.claim.trim() : '';
+  if (!claim) errs.push('claim is required');
+  if (claim.length > CLAIM_MAX) errs.push(`claim exceeds ${CLAIM_MAX} chars`);
+  const summary =
+    typeof input.summary === 'string' && input.summary.trim().length > 0
+      ? input.summary.trim()
+      : undefined;
+  if (summary && summary.length > SUMMARY_MAX) errs.push(`summary exceeds ${SUMMARY_MAX} chars`);
+  const sourceKind = input.source_kind;
+  if (!SOURCE_KINDS.includes(sourceKind)) {
+    errs.push(`source_kind must be one of ${SOURCE_KINDS.join('|')}`);
+  }
+  return { errs, kind, tier, subject, claim, summary, sourceKind };
+}
+
+// ── store ────────────────────────────────────────────────────────────
+
+export class MemoryStore {
+  constructor(scope = 'main', path = memoryStatePath(scope), { agentDid = null, parentHumanDid = null } = {}) {
+    this.scope = scope ?? 'main';
+    this.path = path;
+    this.agentDid = agentDid;
+    this.parentHumanDid = parentHumanDid;
+    this.state = { version: 1, records: {} };
+    this.#load();
+  }
+
+  #load() {
+    try {
+      const parsed = JSON.parse(readFileSync(this.path, 'utf8'));
+      if (parsed && typeof parsed === 'object' && parsed.records && typeof parsed.records === 'object') {
+        this.state = { version: 1, records: parsed.records };
+      }
+    } catch {
+      // Missing/corrupt → empty. A corrupt local cache is not fatal.
+    }
+  }
+
+  save() {
+    mkdirSync(dirname(this.path), { recursive: true });
+    const tmp = `${this.path}.tmp`;
+    writeFileSync(tmp, JSON.stringify(this.state), { mode: 0o600 });
+    renameSync(tmp, this.path);
+  }
+
+  /** Build a full MemoryObject from caller input + defaults. */
+  #materialize(input, status) {
+    const { errs, kind, tier, subject, claim, summary, sourceKind } = validateWriteInput(input);
+    if (errs.length > 0) {
+      const e = new Error(`invalid memory: ${errs.join('; ')}`);
+      e.code = 'EVALIDATION';
+      throw e;
+    }
+    const ts = nowIso();
+    const sensitivity = escalateSensitivity(input.sensitivity ?? 'low', claim, summary);
+    return {
+      id: newMemoryId(),
+      tier,
+      agent_did: tier === 'agent' ? this.agentDid : null,
+      parent_human_did: this.parentHumanDid,
+      kind,
+      subject,
+      claim,
+      ...(summary ? { summary } : {}),
+      source: {
+        kind: sourceKind,
+        ...(typeof input.source_ref === 'string' ? { source_ref: input.source_ref } : {}),
+        ...(typeof input.source_quote === 'string' ? { quote: input.source_quote } : {}),
+      },
+      confidence:
+        typeof input.confidence === 'number'
+          ? input.confidence
+          : (CONFIDENCE_BY_SOURCE[sourceKind] ?? 0.6),
+      sensitivity,
+      bedrock: input.bedrock === true,
+      allowed_uses: Array.isArray(input.allowed_uses) ? input.allowed_uses : ['reasoning', 'style'],
+      forbidden_uses: Array.isArray(input.forbidden_uses) ? input.forbidden_uses : [],
+      status,
+      created_at: ts,
+      updated_at: ts,
+      last_confirmed_at: ts,
+      decay: DECAYS.includes(input.decay) ? input.decay : (DECAY_BY_KIND[kind] ?? 'none'),
+      ...(typeof input.expires_at === 'string' ? { expires_at: input.expires_at } : {}),
+      related: Array.isArray(input.related) ? input.related : [],
+      ...(input.references && typeof input.references === 'object'
+        ? { references: input.references }
+        : {}),
+      embedding: null,
+      embedding_model_version: null,
+    };
+  }
+
+  /** Save an explicit memory (status=active). */
+  write(input) {
+    const obj = this.#materialize(input, 'active');
+    this.state.records[obj.id] = obj;
+    this.save();
+    return obj;
+  }
+
+  /** Propose a memory for operator review (status=drafted). Does NOT
+   *  surface in retrieval until promoted. */
+  draft(input) {
+    const obj = this.#materialize(input, 'drafted');
+    this.state.records[obj.id] = obj;
+    this.save();
+    return obj;
+  }
+
+  get(id) {
+    return this.state.records[id] ?? null;
+  }
+
+  /** Partial update. Only claim/summary/sensitivity/status/bedrock/
+   *  expires_at are caller-editable (mirrors the update tool). Editing
+   *  claim/summary invalidates the embedding so it gets recomputed. */
+  update(id, patch = {}) {
+    const m = this.state.records[id];
+    if (!m) return null;
+    let embeddingDirty = false;
+    if (typeof patch.claim === 'string') {
+      const c = patch.claim.trim();
+      if (!c) throw Object.assign(new Error('claim cannot be empty'), { code: 'EVALIDATION' });
+      if (c.length > CLAIM_MAX) throw Object.assign(new Error(`claim exceeds ${CLAIM_MAX}`), { code: 'EVALIDATION' });
+      if (c !== m.claim) embeddingDirty = true;
+      m.claim = c;
+    }
+    if (patch.summary !== undefined) {
+      const s = typeof patch.summary === 'string' ? patch.summary.trim() : '';
+      if (s.length > SUMMARY_MAX) throw Object.assign(new Error(`summary exceeds ${SUMMARY_MAX}`), { code: 'EVALIDATION' });
+      if (s !== (m.summary ?? '')) embeddingDirty = true;
+      if (s) m.summary = s;
+      else delete m.summary;
+    }
+    if (patch.sensitivity !== undefined && SENSITIVITIES.includes(patch.sensitivity)) {
+      // re-run the heuristic so an edit can't quietly drop below the floor
+      m.sensitivity = escalateSensitivity(patch.sensitivity, m.claim, m.summary);
+    }
+    if (patch.status !== undefined) {
+      // the update tool only allows active|deprecated (not drafted/forgotten)
+      if (patch.status === 'active' || patch.status === 'deprecated') m.status = patch.status;
+    }
+    if (patch.bedrock !== undefined) m.bedrock = patch.bedrock === true;
+    if (patch.clear_expires_at === true) delete m.expires_at;
+    else if (typeof patch.expires_at === 'string') m.expires_at = patch.expires_at;
+    if (embeddingDirty) {
+      m.embedding = null;
+      m.embedding_model_version = null;
+    }
+    m.updated_at = nowIso();
+    this.save();
+    return m;
+  }
+
+  /** Soft-delete (status=forgotten) or hard-delete (row wiped). */
+  forget(id, { hard = false } = {}) {
+    const m = this.state.records[id];
+    if (!m) return false;
+    if (hard) {
+      delete this.state.records[id];
+    } else {
+      m.status = 'forgotten';
+      m.updated_at = nowIso();
+    }
+    this.save();
+    return true;
+  }
+
+  promoteDraft(id) {
+    const m = this.state.records[id];
+    if (!m || m.status !== 'drafted') return null;
+    m.status = 'active';
+    m.updated_at = nowIso();
+    this.save();
+    return m;
+  }
+
+  rejectDraft(id) {
+    const m = this.state.records[id];
+    if (!m || m.status !== 'drafted') return null;
+    m.status = 'forgotten';
+    m.updated_at = nowIso();
+    this.save();
+    return m;
+  }
+
+  /** Bump last_confirmed_at (called by the retrieval pipeline when a
+   *  memory is injected). No-op for missing ids. Batched save by caller
+   *  is preferable; this saves immediately for simplicity. */
+  confirm(ids = []) {
+    let changed = false;
+    const ts = nowIso();
+    for (const id of ids) {
+      const m = this.state.records[id];
+      if (m) {
+        m.last_confirmed_at = ts;
+        changed = true;
+      }
+    }
+    if (changed) this.save();
+  }
+
+  all() {
+    return Object.values(this.state.records);
+  }
+
+  /** Non-expired, status-active memories. */
+  activeMemories(nowMs = Date.now()) {
+    return this.all().filter((m) => m.status === 'active' && !isExpired(m, nowMs));
+  }
+
+  /** Always-inject tier: active + bedrock + not expired. */
+  bedrockMemories(nowMs = Date.now()) {
+    return this.activeMemories(nowMs).filter((m) => m.bedrock === true);
+  }
+
+  /**
+   * Filtered list (mirrors the list tool). Sorted by confidence DESC then
+   * last_confirmed_at DESC.
+   */
+  list({ kinds, sensitivity_max, subject_includes, status = 'active', bedrock_only, limit } = {}) {
+    const maxRank = SENSITIVITY_RANK[sensitivity_max] ?? SENSITIVITY_RANK.restricted;
+    const subjWanted = Array.isArray(subject_includes)
+      ? subject_includes.map((s) => String(s).toLowerCase())
+      : null;
+    let rows = this.all().filter((m) => {
+      if (status && m.status !== status) return false;
+      if (Array.isArray(kinds) && kinds.length > 0 && !kinds.includes(m.kind)) return false;
+      if (SENSITIVITY_RANK[m.sensitivity] > maxRank) return false;
+      if (bedrock_only === true && m.bedrock !== true) return false;
+      if (subjWanted) {
+        const ms = (m.subject ?? []).map((s) => String(s).toLowerCase());
+        if (!subjWanted.some((w) => ms.includes(w))) return false;
+      }
+      return true;
+    });
+    rows.sort(
+      (a, b) =>
+        (b.confidence ?? 0) - (a.confidence ?? 0) ||
+        String(b.last_confirmed_at).localeCompare(String(a.last_confirmed_at)),
+    );
+    if (Number.isInteger(limit) && limit > 0) rows = rows.slice(0, limit);
+    return rows;
+  }
+}
+
+export function isExpired(m, nowMs = Date.now()) {
+  if (!m || typeof m.expires_at !== 'string') return false;
+  const t = Date.parse(m.expires_at);
+  return Number.isFinite(t) && t < nowMs;
+}
+
+/** The text we embed for a memory: claim, then summary, then subject tags —
+ *  matching the desktop's memory_embedding_text composition. */
+export function memoryEmbeddingText(m) {
+  const parts = [m.claim];
+  if (m.summary) parts.push(m.summary);
+  if (Array.isArray(m.subject) && m.subject.length > 0) parts.push(m.subject.join(', '));
+  return parts.filter(Boolean).join('\n');
+}

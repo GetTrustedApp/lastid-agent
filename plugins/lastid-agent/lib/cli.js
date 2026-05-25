@@ -465,14 +465,46 @@ async function cmdMemoryRetrieve(flags) {
     process.stderr.write('memory-retrieve: --prompt required\n');
     process.exit(2);
   }
-  const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
+  const scope = flags.scope ?? 'main';
   const { loadAgentVc } = await import('./keychain.js');
-  const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
-  const loaded = await loadAgentVc(flags.scope ?? 'main');
+  const loaded = await loadAgentVc(scope);
   if (!loaded) {
     // Not provisioned — no memories possible.
     process.exit(0);
   }
+
+  // Local-first: compose the bedrock + topical packet from the agent's own
+  // memory store + the synced operator-store, the same way policy-check
+  // resolves rules locally. The desktop /memory/retrieve is the transition
+  // fallback only (before any local memories exist).
+  try {
+    const { decodeVcClaims } = await import('./vc-claims.js');
+    const { retrievePacket } = await import('./memory-retrieve.js');
+    const { OperatorStore } = await import('./operator-store.js');
+    const { makeEmbedder } = await import('./embeddings.js').catch(() => ({}));
+    const claims = decodeVcClaims(loaded.vcCompact) ?? {};
+    const embedder = typeof makeEmbedder === 'function' ? makeEmbedder() : null;
+    const { markdown } = await retrievePacket({
+      scope,
+      agentDid: claims.sub ?? loaded.agentDid ?? null,
+      parentHumanDid: claims.parent_human_did ?? null,
+      prompt,
+      operatorStore: new OperatorStore(scope),
+      embedder,
+    });
+    if (markdown && markdown.trim().length > 0) {
+      process.stdout.write(markdown);
+      process.exit(0);
+    }
+  } catch (e) {
+    process.stderr.write(`memory-retrieve(local): ${e?.message ?? e}\n`);
+    // fall through to desktop
+  }
+
+  // Desktop fallback (transition): the old TCB still holds memories until
+  // they're migrated. Soft-fail to no output if unreachable.
+  const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
+  const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
   const { signingKey, signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
   const client = new DesktopMcpClient({
     agentDid: loaded.agentDid,
@@ -482,7 +514,6 @@ async function cmdMemoryRetrieve(flags) {
   });
   const ok = await client.connect().catch(() => false);
   if (!ok) {
-    // Desktop unavailable — soft-fail with no output.
     process.exit(0);
   }
   try {
@@ -523,13 +554,47 @@ async function cmdMemorySearch(flags) {
   }
   const excludeBedrock = flags['exclude-bedrock'] === true;
   const limit = Number.parseInt(flags.limit ?? '5', 10) || 5;
-  const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
+  const scope = flags.scope ?? 'main';
   const { loadAgentVc } = await import('./keychain.js');
-  const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
-  const loaded = await loadAgentVc(flags.scope ?? 'main');
+  const loaded = await loadAgentVc(scope);
   if (!loaded) {
     process.exit(0);
   }
+
+  // Local-first: topical hits from the agent's own memory store. Desktop is
+  // the transition fallback only.
+  try {
+    const { decodeVcClaims } = await import('./vc-claims.js');
+    const { retrieveSearchBlock } = await import('./memory-retrieve.js');
+    const { makeEmbedder } = await import('./embeddings.js').catch(() => ({}));
+    const claims = decodeVcClaims(loaded.vcCompact) ?? {};
+    const embedder = typeof makeEmbedder === 'function' ? makeEmbedder() : null;
+    const block = await retrieveSearchBlock({
+      scope,
+      agentDid: claims.sub ?? loaded.agentDid ?? null,
+      parentHumanDid: claims.parent_human_did ?? null,
+      query: prompt,
+      limit,
+      excludeBedrock,
+      embedder,
+    });
+    if (block && block.trim().length > 0) {
+      process.stdout.write(`${block}\n`);
+      process.exit(0);
+    }
+    // No local hits: if we have ANY local memories, that's a definitive
+    // "nothing relevant" — stay silent rather than asking the desktop.
+    const { MemoryStore } = await import('./memory-store.js');
+    if (new MemoryStore(scope).all().length > 0) {
+      process.exit(0);
+    }
+  } catch (e) {
+    process.stderr.write(`memory-search(local): ${e?.message ?? e}\n`);
+    // fall through to desktop
+  }
+
+  const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
+  const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
   const { signingKey, signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
   const client = new DesktopMcpClient({
     agentDid: loaded.agentDid,
@@ -576,6 +641,68 @@ async function cmdMemorySearch(flags) {
     process.stderr.write(`memory-search: ${e?.message ?? e}\n`);
     process.exit(0);
   }
+}
+
+/**
+ * `lastid-agent memory-setup` — opt-in install of the local-embeddings stack
+ * (@xenova/transformers + all-MiniLM-L6-v2). Deliberately NOT part of the
+ * fast first-run bootstrap (the ~137MB dep would stall the MCP server past
+ * the runtime's connect timeout). Until this runs, memory search degrades to
+ * keyword scoring. Installs the dep into the plugin dir, downloads + warms
+ * the model, then backfills embeddings for the agent's local memories.
+ */
+async function cmdMemorySetup(flags) {
+  const { dirname, join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const { spawnSync } = await import('node:child_process');
+  const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+  const { embeddingsInstalled } = await import('./embeddings.js');
+  if (!(await embeddingsInstalled())) {
+    process.stdout.write('Installing local embeddings (@xenova/transformers, ~137MB)…\n');
+    const r = spawnSync(
+      'npm',
+      ['install', '@xenova/transformers', '--omit=dev', '--no-audit', '--no-fund'],
+      { cwd: pluginRoot, stdio: ['ignore', process.stderr, process.stderr] },
+    );
+    if (r.status !== 0) {
+      process.stderr.write(`memory-setup: dependency install failed (exit ${r.status ?? 'n/a'})\n`);
+      process.exit(1);
+    }
+  } else {
+    process.stdout.write('Embeddings dependency already installed.\n');
+  }
+
+  // Warm the model (downloads on first use, caches under ~/.lastid-agent/models).
+  process.stdout.write('Downloading + warming the embedding model…\n');
+  const { makeEmbedder, EMBED_DIM } = await import('./embeddings.js');
+  const embedder = makeEmbedder();
+  const probe = await embedder('warm up the embedding model');
+  if (!Array.isArray(probe) || probe.length !== EMBED_DIM) {
+    process.stderr.write('memory-setup: model failed to produce an embedding. Memory search will use keyword fallback.\n');
+    process.exit(1);
+  }
+  process.stdout.write(`Model ready (${EMBED_DIM}-dim).\n`);
+
+  // Backfill embeddings for the agent's existing memories so the first real
+  // search is fast.
+  const scope = flags.scope ?? 'main';
+  const { loadAgentVc } = await import('./keychain.js');
+  const loaded = await loadAgentVc(scope);
+  if (loaded) {
+    const { decodeVcClaims } = await import('./vc-claims.js');
+    const { MemoryStore } = await import('./memory-store.js');
+    const { backfillEmbeddings } = await import('./embeddings.js');
+    const claims = decodeVcClaims(loaded.vcCompact) ?? {};
+    const store = new MemoryStore(scope, undefined, {
+      agentDid: claims.sub ?? loaded.agentDid ?? null,
+      parentHumanDid: claims.parent_human_did ?? null,
+    });
+    const n = await backfillEmbeddings(store, embedder);
+    process.stdout.write(`Backfilled embeddings for ${n} existing memor${n === 1 ? 'y' : 'ies'}.\n`);
+  }
+  process.stdout.write('Done. Semantic memory search is now active.\n');
+  process.exit(0);
 }
 
 /**
@@ -936,6 +1063,9 @@ async function main() {
       break;
     case 'memory-search':
       await cmdMemorySearch(flags);
+      break;
+    case 'memory-setup':
+      await cmdMemorySetup(flags);
       break;
     case 'policy-check':
       await cmdPolicyCheck(flags);

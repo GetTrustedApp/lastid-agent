@@ -28,6 +28,7 @@ import {
   runApprovalLoop,
 } from './use-approval-loop.js';
 import { reapStaleServers } from './reap-stale-servers.js';
+import { MEMORY_TOOLS, MEMORY_TOOL_NAMES, handleMemoryTool } from './memory-tools.js';
 
 const SERVER_INFO = {
   name: 'lastid-agent',
@@ -70,6 +71,10 @@ const PLUGIN_TOOLS = [
       additionalProperties: false,
     },
   },
+  // Memory tools — served locally against the agent's own memory store
+  // (lib/memory-store.js). These names override any same-named desktop
+  // tools in the tools/list merge below, so memory is local-first.
+  ...MEMORY_TOOLS,
 ];
 
 const PLUGIN_TOOL_NAMES = new Set(PLUGIN_TOOLS.map((t) => t.name));
@@ -118,6 +123,10 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
   // each tool's `requiredCapability` annotation — never by the model.
   const claims = loadedAgent ? (decodeVcClaims(loadedAgent.vcCompact) ?? {}) : {};
   enforceToolCapability(name, claims, loadedAgent);
+
+  if (MEMORY_TOOL_NAMES.has(name)) {
+    return handleMemoryTool({ name, args: _args ?? {}, scope, loadedAgent, claims });
+  }
 
   if (name === 'lastid_send_message') {
     const text = typeof _args?.text === 'string' ? _args.text : '';

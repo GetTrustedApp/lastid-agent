@@ -1,6 +1,6 @@
 {
   "name": "lastid-agent-runtime",
-  "version": "0.8.21",
+  "version": "0.8.22",
   "private": true,
   "description": "Runtime package for the lastid-agent plugin (deps installed on-demand by bin/lastid-agent.js on first run).",
   "type": "module",
@@ -12,5 +12,6 @@
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "ws": "^8.18.0"
-  }
+  },
+  "comment_optionalEmbeddings": "@xenova/transformers (~137MB) is intentionally NOT a dependency — installing it in the fast first-run bootstrap would stall the MCP server past the runtime's connect timeout. It is opt-in via `lastid-agent memory-setup`, which installs it on demand. Memory search degrades to keyword scoring until then."
 }
