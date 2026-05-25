@@ -355,6 +355,15 @@ export function sdkClaimCredential(credential_type_str: string, params_json: any
 export function sdkCreateIdentity(password: string, use_biometrics: boolean): Promise<any>;
 
 /**
+ * Decrypt an agent-state content envelope (base64 LIDE SymmetricOnly)
+ * for the agent at `slot_index`, returning the plaintext content bytes.
+ * Operator-side read-back: lets the console show + edit the rules it
+ * authored (the operator can derive any of its agents' slot_seeds). The
+ * slot_seed is derived in-WASM and never crosses into JS.
+ */
+export function sdkDecryptAgentContentForSlot(slot_index: number, enc_b64: string): Promise<Uint8Array>;
+
+/**
  * POST `/v1/oid4vci/agent-provision/deny` with a reason. Used by
  * the approve page's Deny button. Caller must already have
  * fetched `/pending` (which attached the row to their DID) — the

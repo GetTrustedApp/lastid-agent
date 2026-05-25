@@ -31,6 +31,7 @@ export const sdkAuthedFetch: (a: number, b: number, c: number, d: number, e: any
 export const sdkBuildWebSocketAuth: (a: number, b: number) => any;
 export const sdkClaimCredential: (a: number, b: number, c: any) => any;
 export const sdkCreateIdentity: (a: number, b: number, c: number) => any;
+export const sdkDecryptAgentContentForSlot: (a: number, b: number, c: number) => any;
 export const sdkDenyAgentProvisioning: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
 export const sdkEncryptAgentContentForSlot: (a: number, b: number, c: number) => any;
 export const sdkFetchAgentProvisioningPending: (a: number, b: number, c: number, d: number) => any;
