@@ -22,7 +22,7 @@ const SHARE = {
   title: 'OpenAI key',
   injection: { type: 'header', name: 'Authorization', format: 'Bearer {value}' },
   constraints: [],
-  on_violation: 'deny',
+  on_violation: { type: 'deny' },
   require_approval_per_use: false,
   granted_actions: ['use'],
   secret: 'sk-SECRET-zzz',
@@ -54,7 +54,7 @@ test('vault_use on an unknown / unverifiable share → share_not_found', async (
 })
 
 test('vault_use denied by policy → policy_denied (no handle)', async () => {
-  const d = deps({ resolveShare: async () => ({ ...SHARE, constraints: [{ kind: 'time_window', start_ms: 0, end_ms: 1 }] }) });
+  const d = deps({ resolveShare: async () => ({ ...SHARE, constraints: [{ type: 'time_window', not_before: '2026-01-01T00:00:00Z', not_after: '2026-01-02T00:00:00Z' }] }) });
   const r = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1', ctx: { now_ms: 999999 } }, d);
   assert.equal(r.error, 'policy_denied');
   assert.equal(d.handles.size, 0);
