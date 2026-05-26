@@ -144,7 +144,7 @@ const loadedAgent = { agentDid: 'did:lastid:agent:zT', slotSeed: Buffer.alloc(32
 const claims = { sub: 'did:lastid:agent:zT', parent_human_did: 'did:lastid:zH' };
 const okFetch = async () => ({ ok: true, status: 200 }); // live write-through succeeds w/o network
 
-test('memory tools append audit records (write/update/forget); draft does NOT', async () => {
+test('memory tools SPOOL audit records (write/update/forget); draft does NOT; listener drain chains them', async () => {
   const { scope, dir } = freshScope();
   const call = (name, args) => handleMemoryTool({ name, args, scope, loadedAgent, claims, fetchImpl: okFetch });
   const body = (r) => JSON.parse(r.content[0].text);
@@ -154,12 +154,20 @@ test('memory tools append audit records (write/update/forget); draft does NOT', 
     await call('lastid_memory_update', { id: w.memory.id, claim: 'c1 updated', reason: 'clarified' });
     await call('lastid_memory_forget', { id: w.memory.id, reason: 'obsolete' });
 
+    // The MCP tool process only ENQUEUES — the signed chain is still empty
+    // until the listener (single writer) drains the spool.
+    assert.equal(readMemoryAudit(scope).length, 0, 'memory ops must not write the chain directly');
+
+    const { deriveAgentEd25519Keypair } = await import('../lib/agent-provisioning.js');
+    const { signingKey } = deriveAgentEd25519Keypair(loadedAgent.slotSeed);
+    const { drainAuditSpool } = await import('../lib/audit-spool.js');
+    const chained = drainAuditSpool({ scope, signingKey, agentDid: loadedAgent.agentDid });
+    assert.equal(chained, 3, 'three CUD events chained (draft excluded)');
+
     const chain = readMemoryAudit(scope);
     const types = chain.map((r) => r.event_type);
     assert.deepEqual(types, ['AgentMemoryWritten', 'AgentMemoryUpdated', 'AgentMemoryForgotten'], 'draft not chained');
     // signed with the agent's derived key → verifies
-    const { deriveAgentEd25519Keypair } = await import('../lib/agent-provisioning.js');
-    const { signingKey } = deriveAgentEd25519Keypair(loadedAgent.slotSeed);
     assert.equal(verifyMemoryAudit(scope, publicKeyFor(signingKey)).intact, true);
     // metadata is non-sensitive (no claim leaked)
     assert.ok(!JSON.stringify(chain).includes('c1 updated'), 'claim text not in the audit chain');

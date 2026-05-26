@@ -36,6 +36,8 @@ import { writeLastProject } from '../lib/project-sticky.js';
 import { recordRuleHit } from '../lib/rule-metrics.js';
 import { hostMemoryWriteWarning } from '../lib/memory-guidance.js';
 import { resolveScope } from '../lib/scope.js';
+import { enqueueAuditEvent } from '../lib/audit-spool.js';
+import { redactSecrets } from '../lib/bug-report.js';
 
 // This session's agent scope (LASTID_AGENT_SCOPE → 'main'). The policy-check /
 // memory-search CLI children inherit the env and resolve it themselves; this
@@ -55,6 +57,41 @@ try {
 
 const toolName = event?.tool_name ?? event?.toolName ?? '';
 const toolInput = event?.tool_input ?? event?.toolInput ?? {};
+
+// ─── 0. Audit: record the tool CALL ────────────────────────────────
+//
+// Every tool invocation drops a `tool_call` event into the audit spool; the
+// listener (the single chain writer) signs + hash-links + ships it. Lock-free,
+// best-effort, off the latency path (one small atomic file write — no chain
+// read-modify-write here, which is what lets parallel tool calls be safe). The
+// recorded input is secret-redacted and capped so a huge Write payload can't
+// bloat the chain or leak a key. `tool_use_id` correlates this to its
+// PostToolUse `tool_result`.
+if (toolName) {
+  try {
+    let raw;
+    try {
+      raw = JSON.stringify(toolInput ?? {});
+    } catch {
+      raw = String(toolInput ?? '');
+    }
+    const { text, count } = redactSecrets(raw);
+    const CAP = 4000;
+    enqueueAuditEvent({
+      scope: activeScope,
+      eventType: 'tool_call',
+      metadata: {
+        tool: toolName,
+        input: text.length > CAP ? text.slice(0, CAP) : text,
+        input_redactions: count,
+        input_truncated: text.length > CAP,
+      },
+      toolUseId: event?.tool_use_id ?? event?.toolUseId ?? null,
+    });
+  } catch {
+    /* audit is best-effort — never block a tool call */
+  }
+}
 
 // Accumulator for `additionalContext` blocks. We may surface a
 // policy warn, an ambient-memory recall, and a sub-agent briefing —

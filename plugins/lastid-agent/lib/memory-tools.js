@@ -16,8 +16,7 @@
  */
 import { MemoryStore } from './memory-store.js';
 import { makeEmbedder, cosine, embedMemory, EMBED_DIM, SEMANTIC_FLOOR } from './embeddings.js';
-import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
-import { appendMemoryAudit } from './memory-audit.js';
+import { enqueueAuditEvent } from './audit-spool.js';
 import { publishAgentMemory } from './agent-memory-publish.js';
 import { readLastProject } from './project-sticky.js';
 
@@ -265,19 +264,14 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
     agentDid,
     parentHumanDid: claims?.parent_human_did ?? null,
   });
-  // Agent-side audit chain: sign every memory CUD with the agent's key.
-  let signingKey = null;
-  try {
-    ({ signingKey } = deriveAgentEd25519Keypair(loadedAgent.slotSeed));
-  } catch {
-    /* unsigned audit if key derivation fails — still hash-linked */
-  }
+  // Agent-side audit chain: ENQUEUE every memory CUD to the spool. We must NOT
+  // append the signed chain here — this MCP tool server is one of several
+  // processes that emit audit events (the PreToolUse/PostToolUse hooks too), and
+  // Claude runs tools in parallel, so concurrent appends would fork the hash
+  // chain. The listener is the single chain writer: it drains the spool in
+  // order, signs + hash-links each event, and ships. (See audit-spool.js.)
   const audit = (eventType, memoryId, metadata) => {
-    try {
-      appendMemoryAudit({ scope, signingKey, agentDid, eventType, memoryId, metadata });
-    } catch (e) {
-      process.stderr.write(`[lastid-agent] memory-audit append failed: ${e?.message ?? e}\n`);
-    }
+    enqueueAuditEvent({ scope, eventType, memoryId, metadata });
   };
   // LIVE write-through (saas-migration §slot_seed): the IdP server store is
   // authoritative. The tool encrypts under the agent's slot_seed and POSTs as

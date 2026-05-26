@@ -1052,24 +1052,40 @@ async function cmdListen(flags) {
 
   const { signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed);
 
-  // Flush the local memory-audit chain to the IdP (operator-visible
-  // cross-device). The listener is the single shipper (the MCP tool process
-  // only appends locally); offline-safe via the ship cursor.
-  const shipAuditBestEffort = () =>
-    import('./memory-audit-ship.js')
-      .then((m) =>
-        m.shipMemoryAudit({
-          idpUrl,
-          scope,
-          agentDid: loaded.agentDid,
-          vcCompact: loaded.vcCompact,
-          signingKey,
-        }),
-      )
-      .then((n) => {
-        if (n > 0) process.stderr.write(`[lastid-agent] shipped ${n} memory-audit record(s) to IdP\n`);
-      })
-      .catch(() => {});
+  // Drain the audit spool into the signed chain, then ship it to the IdP
+  // (operator-visible cross-device). The listener is the SINGLE chain writer:
+  // every other process (the MCP tool server's memory CUD, the
+  // PreToolUse/PostToolUse hooks' tool events) only ENQUEUES to the spool, so
+  // the hash chain can't fork under parallel tool calls. We drain in order
+  // here, sign + hash-link each event, then ship. Offline-safe via the ship
+  // cursor; the `auditFlushing` guard keeps two ticks from draining at once.
+  let auditFlushing = false;
+  const shipAuditBestEffort = async () => {
+    if (auditFlushing) return;
+    auditFlushing = true;
+    try {
+      try {
+        const { drainAuditSpool } = await import('./audit-spool.js');
+        const chained = drainAuditSpool({ scope, signingKey, agentDid: loaded.agentDid });
+        if (chained > 0) process.stderr.write(`[lastid-agent] chained ${chained} spooled audit event(s)\n`);
+      } catch (e) {
+        process.stderr.write(`[lastid-agent] audit spool drain failed: ${e?.message ?? e}\n`);
+      }
+      const { shipMemoryAudit } = await import('./memory-audit-ship.js');
+      const n = await shipMemoryAudit({
+        idpUrl,
+        scope,
+        agentDid: loaded.agentDid,
+        vcCompact: loaded.vcCompact,
+        signingKey,
+      });
+      if (n > 0) process.stderr.write(`[lastid-agent] shipped ${n} audit record(s) to IdP\n`);
+    } catch {
+      /* best-effort */
+    } finally {
+      auditFlushing = false;
+    }
+  };
 
   // Ship locally-recorded rule-hit metrics (the PreToolUse hook appends them).
   // Best-effort + off the latency path; the ship cursor only advances on a 2xx.
@@ -1274,8 +1290,9 @@ async function cmdListen(flags) {
       .finally(() => {
         draining = false;
       });
-    // Piggyback: flush any memory-audit records + rule-hit metrics appended by
-    // the MCP tool / PreToolUse hook since the last connect. Cheap when empty.
+    // Piggyback: drain+chain+ship any audit events spooled by the MCP tool or
+    // the Pre/PostToolUse hooks, plus rule-hit metrics, since the last tick.
+    // Cheap when the spool/queue is empty.
     void shipAuditBestEffort();
     void shipRuleHitsBestEffort();
   }, OUTBOX_POLL_MS);
