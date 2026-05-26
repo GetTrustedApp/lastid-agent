@@ -108,6 +108,30 @@ function pickPayloadString(payload, aliases) {
 }
 
 /**
+ * Best-effort message from any thrown value. The MLS wasm rejects with a
+ * JsValue / string (NOT a JS Error), so `err.message` is `undefined` — which
+ * is exactly why `processWelcome failed: undefined` / `processInbound failed:
+ * undefined` told us nothing. Pull the most informative text we can: a real
+ * Error's message+stack, a thrown string, else a JSON/String fallback. Never
+ * throws (a circular value falls back to String()).
+ */
+export function errText(err) {
+  if (err == null) return String(err);
+  if (typeof err === 'string') return err;
+  if (err instanceof Error) {
+    return err.stack ? `${err.message}\n${err.stack}` : err.message || String(err);
+  }
+  if (typeof err.message === 'string' && err.message.length > 0) return err.message;
+  try {
+    const json = JSON.stringify(err);
+    if (json && json !== '{}') return json;
+  } catch {
+    /* circular / non-serializable — fall through */
+  }
+  return String(err);
+}
+
+/**
  * @typedef {Object} DispatcherOptions
  * @property {import('./mls-client.js').MlsClient} mls
  * @property {string} [scope]   Defaults to 'main'.
@@ -298,7 +322,7 @@ export class MlsDispatcher {
               ? event.payload.inviter_did
               : null,
         }).catch((err) =>
-          this.#log(`[lastid-agent] recordGroup (welcome) failed: ${err.message}`),
+          this.#log(`[lastid-agent] recordGroup (welcome) failed: ${errText(err)}`),
         );
       }
 
@@ -316,7 +340,7 @@ export class MlsDispatcher {
         });
       }
     } catch (err) {
-      this.#log(`[lastid-agent] processWelcome failed: ${err.message}`);
+      this.#log(`[lastid-agent] processWelcome failed: ${errText(err)}`);
     }
   }
 
@@ -348,14 +372,14 @@ export class MlsDispatcher {
     try {
       inbound = this.#mls.processInbound(mlsMessageB64);
     } catch (err) {
-      this.#log(`[lastid-agent] processInbound failed: ${err.message}`);
+      this.#log(`[lastid-agent] processInbound failed: ${errText(err)}`);
       return;
     }
 
     try {
       await this.#mls.persist();
     } catch (err) {
-      this.#log(`[lastid-agent] mls persist after inbound failed: ${err.message}`);
+      this.#log(`[lastid-agent] mls persist after inbound failed: ${errText(err)}`);
     }
 
     // Non-application inbound (commit, proposal, external) only
@@ -373,7 +397,7 @@ export class MlsDispatcher {
     try {
       envelope = JSON.parse(Buffer.from(plaintextB64, 'base64').toString('utf-8'));
     } catch (err) {
-      this.#log(`[lastid-agent] application payload not JSON: ${err.message}`);
+      this.#log(`[lastid-agent] application payload not JSON: ${errText(err)}`);
       return;
     }
 
@@ -422,7 +446,7 @@ export class MlsDispatcher {
       this.#mls.processInbound(mlsProposalB64);
       await this.#mls.persist();
     } catch (err) {
-      this.#log(`[lastid-agent] proposal processing failed: ${err.message}`);
+      this.#log(`[lastid-agent] proposal processing failed: ${errText(err)}`);
     }
   }
 
@@ -497,7 +521,7 @@ export class MlsDispatcher {
         );
       }
     } catch (err) {
-      this.#log(`[lastid-agent] proposal_reassigned handler failed: ${err.message}`);
+      this.#log(`[lastid-agent] proposal_reassigned handler failed: ${errText(err)}`);
     }
   }
 
@@ -525,7 +549,7 @@ export class MlsDispatcher {
       await this.#mls.persist();
       this.#log(`[lastid-agent] forgot dissolved group ${groupIdB64}`);
     } catch (err) {
-      this.#log(`[lastid-agent] forgetGroup failed: ${err.message}`);
+      this.#log(`[lastid-agent] forgetGroup failed: ${errText(err)}`);
     }
   }
 
@@ -582,7 +606,7 @@ export class MlsDispatcher {
       await this.#rotateIfNeeded(path);
       await appendFile(path, `${JSON.stringify(record)}\n`, 'utf-8');
     } catch (err) {
-      this.#log(`[lastid-agent] inbox append failed: ${err.message}`);
+      this.#log(`[lastid-agent] inbox append failed: ${errText(err)}`);
     }
   }
 
@@ -593,7 +617,7 @@ export class MlsDispatcher {
       await rename(path, `${path}.1`);
     } catch (err) {
       if (err.code !== 'ENOENT') {
-        this.#log(`[lastid-agent] inbox rotate failed: ${err.message}`);
+        this.#log(`[lastid-agent] inbox rotate failed: ${errText(err)}`);
       }
     }
   }
