@@ -19,6 +19,7 @@ import { makeEmbedder, cosine, embedMemory, EMBED_DIM, SEMANTIC_FLOOR } from './
 import { enqueueAuditEvent } from './audit-spool.js';
 import { publishAgentMemory } from './agent-memory-publish.js';
 import { readLastProject } from './project-sticky.js';
+import { projectKeyForPath } from './project-key.js';
 
 const DEFAULT_IDP_URL = 'https://human.lastid.co';
 
@@ -39,12 +40,7 @@ const writeInputSchema = {
       type: 'string',
       enum: ['agent', 'global', 'project'],
       description:
-        "Storage tier. Default agent. 'project' = shared with all your operator's agents and injected only when working in that repo (use for repo-specific ground truth/decisions).",
-    },
-    project_key: {
-      type: 'string',
-      description:
-        "For tier='project': the repo (normalized git remote, e.g. github.com/org/repo). Omit to use the repo you're currently working in.",
+        "Storage tier. 'project' (the default when you're working in a repo) = shared with your operator's agents on that repo. 'agent' = private to you. 'global' = all your operator's agents everywhere (a proposal the operator reviews). The repo for project-tier is detected AUTOMATICALLY from where you're working — you do NOT name it.",
     },
     subject: {
       type: 'array',
@@ -76,7 +72,7 @@ export const MEMORY_TOOLS = [
   {
     name: 'lastid_memory_draft',
     description:
-      'Propose a memory for operator review. Use when YOU inferred something durable (preference, decision, named entity, workflow rule) but the operator did NOT explicitly ask you to save it. Queues for review; does NOT influence future turns until the operator promotes it. Always include source_quote.',
+      "Save a durable memory you INFERRED (the operator didn't explicitly say \"remember\"). It's USED IMMEDIATELY as a draft — marked unverified, lower-trust than a confirmed memory, never ground truth — and, when you're working in a repo, shared with your operator's agents on that repo (project tier) so the whole fleet benefits. Your operator can demote it. Prefer lastid_memory_write when the operator explicitly asked. Always include source_quote.",
     requiredCapability: CAP_DRAFT,
     inputSchema: writeInputSchema,
   },
@@ -201,9 +197,13 @@ export function keywordScore(query, m) {
  * falls back to keyword/subject scoring. Returns
  * [{ memory_id, claim, summary, subject, score }] sorted desc, top `limit`.
  */
-export async function searchMemories(store, query, { limit = 8, excludeBedrock = false, embedder = null, projectKey = null } = {}) {
+export async function searchMemories(store, query, { limit = 8, excludeBedrock = false, embedder = null, projectKey = null, includeDrafts = false } = {}) {
   const select = () => {
     let c = store.activeMemories();
+    // Drafts (unverified) are eligible too when asked: the agent's own + this
+    // repo's project drafts (usableDrafts scopes them). The hit carries
+    // `draft: true` so the renderer marks it — usable, but lower-trust.
+    if (includeDrafts) c = c.concat(store.usableDrafts(projectKey));
     if (excludeBedrock) c = c.filter((m) => m.bedrock !== true);
     // Project-tier memories are eligible for topical ranking ONLY when the
     // agent is working in their repo (project_key === the active projectKey);
@@ -243,6 +243,9 @@ export async function searchMemories(store, query, { limit = 8, excludeBedrock =
     ...(m.summary ? { summary: m.summary } : {}),
     subject: m.subject,
     score: Number(score.toFixed(4)),
+    // Unverified draft — the renderer marks it so it's weighted as a tentative
+    // proposal, not ground truth.
+    ...(m.status === 'drafted' ? { draft: true } : {}),
   }));
 }
 
@@ -257,7 +260,7 @@ function err(message) {
  * Dispatch a memory tool. Assumes the central capability gate already ran.
  * Builds the store from the agent's identity (agent_did + parent_human_did).
  */
-export async function handleMemoryTool({ name, args = {}, scope = 'main', loadedAgent, claims, fetchImpl }) {
+export async function handleMemoryTool({ name, args = {}, scope = 'main', loadedAgent, claims, fetchImpl, resolveRepo }) {
   if (!loadedAgent) return err('not provisioned — run `lastid-agent provision` first');
   const agentDid = claims?.sub ?? loadedAgent.agentDid ?? null;
   const store = new MemoryStore(scope, undefined, {
@@ -283,17 +286,36 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
     publishAgentMemory({ idpUrl, loaded: loadedAgent, memory, status, version: memory.version, fetchImpl }).catch(() => false);
   const notSaved = (detail) =>
     err(`memory NOT saved — the server write failed${detail ? `: ${detail}` : ''}. Tell your operator; nothing was stored.`);
-  // Project-tier authoring: default project_key to the repo the agent is
-  // currently working in (the sticky last-project the PreToolUse hook records)
-  // when the model didn't name one. Without any repo context we can't scope it.
-  if ((name === 'lastid_memory_write' || name === 'lastid_memory_draft') && args.tier === 'project' && !args.project_key) {
-    const sticky = readLastProject(scope);
-    if (!sticky) {
-      return err(
-        "tier='project' needs a repo and none is in context yet — pass project_key (the repo's normalized git remote, e.g. github.com/org/repo), or act in the repo first.",
-      );
+  // ── THE REPO IS TOOL-DERIVED FROM THE FILESYSTEM, never from the agent ──
+  // The agent does NOT supply the repo: it hallucinated keys (e.g.
+  // github.com/LastID/lastid.co) when the real git remote is
+  // github.com/GetTrustedApp/lastid.co, and the old "pass project_key" error
+  // invited it to invent one on retry. We resolve the repo from where the work
+  // is happening — the sticky last-project (PreToolUse records it from the
+  // operative path's git remote), falling back to this process's cwd — and run
+  // it through normalizeRemoteUrl, so the key is always the REAL, lowercased
+  // host/owner/repo. Any agent-supplied project_key is dropped.
+  if (name === 'lastid_memory_write' || name === 'lastid_memory_draft') {
+    if ('project_key' in args) delete args.project_key;
+    // Filesystem-derived (injectable for tests). Sticky = the operative path's
+    // git remote PreToolUse recorded; cwd is the fallback. Never the agent.
+    const repo =
+      (typeof resolveRepo === 'function' ? resolveRepo() : readLastProject(scope) || projectKeyForPath(process.cwd())) || null;
+    const canProject = Buffer.isBuffer(loadedAgent.projectRootSeed);
+    // Repo work defaults to the PROJECT tier (shared, opt-out) when we can both
+    // detect a real repo AND publish it. A genuinely personal note can still
+    // pass tier:'agent' explicitly.
+    if (!args.tier && repo && canProject) {
+      args = { ...args, tier: 'project' };
     }
-    args = { ...args, project_key: sticky };
+    if (args.tier === 'project') {
+      if (!repo) {
+        return err(
+          "can't scope a project memory — no repo is in context. Read or edit a file in the repo first (the repo is detected automatically from its git remote; you never supply it), then save. Or use tier:'agent' for a private note.",
+        );
+      }
+      args = { ...args, project_key: repo };
+    }
   }
   // A project-tier write needs the operator's project_root_seed (sealed at
   // provisioning). If this session's bundle lacks it — the agent predates
@@ -329,18 +351,21 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
         return ok({ ok: true, memory: publicView(store.get(m.id) ?? m) });
       }
       case 'lastid_memory_draft': {
-        // Drafts ride to the IdP too (content.status='drafted') so the operator
-        // sees them for review; not audit-chained until promoted (the chain
-        // logs decisions, not proposals).
+        // Drafts ride to the IdP (content.status='drafted', record status
+        // 'active' so peers sync it) — used immediately as a marked draft, not
+        // audit-chained until confirmed (the chain logs decisions, not proposals).
         const m = store.draft(args);
         if (!(await live(m, 'active'))) {
           store.forget(m.id, { hard: true });
           return notSaved();
         }
+        const shared = m.tier === 'project' && m.project_key;
         return ok({
           ok: true,
           status: 'drafted',
-          note: 'Saved to your operator for review. Will not influence future turns until promoted.',
+          note: shared
+            ? `Saved as a draft (marked unverified) and shared with your operator's agents on ${m.project_key} — usable now; your operator can demote it.`
+            : 'Saved as a draft (marked unverified) — usable by you now; your operator can demote or confirm it.',
           memory: publicView(store.get(m.id) ?? m),
         });
       }

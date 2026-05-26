@@ -43,6 +43,29 @@ test('retrievePacket: empty store → empty markdown', async () => {
   assert.equal(injectedIds.length, 0);
 });
 
+test('retrievePacket: surfaces THIS repo\'s project draft, marked "(draft)", with fetch-full guidance', async () => {
+  const s = freshStore();
+  const REPO = 'github.com/lastid/lastid.co';
+  s.draft({
+    kind: 'decision', subject: ['vault'], claim: 'handle envelope is HPKE base mode',
+    source_kind: 'inferred', tier: 'project', project_key: REPO,
+  });
+  const { markdown } = await retrievePacket({ prompt: 'how does the handle envelope work', store: s, projectKey: REPO });
+  assert.match(markdown, /handle envelope is HPKE base mode/);
+  assert.match(markdown, /\(draft\)/); // marked unverified, not ground truth
+  assert.match(markdown, /lastid_memory_get/); // told it can fetch the full memory by id
+});
+
+test('retrievePacket: a project draft for a DIFFERENT repo is not surfaced', async () => {
+  const s = freshStore();
+  s.draft({
+    kind: 'decision', subject: ['vault'], claim: 'a different repos draft secret',
+    source_kind: 'inferred', tier: 'project', project_key: 'github.com/lastid/other-repo',
+  });
+  const { markdown } = await retrievePacket({ prompt: 'draft secret', store: s, projectKey: 'github.com/lastid/lastid.co' });
+  assert.equal(markdown.includes('a different repos draft secret'), false);
+});
+
 test('retrievePacket: bumps last_confirmed_at on injected bedrock', async () => {
   const s = freshStore();
   const m = s.write({ kind: 'fact', subject: ['x'], claim: 'ground truth', source_kind: 'user_explicit', bedrock: true });

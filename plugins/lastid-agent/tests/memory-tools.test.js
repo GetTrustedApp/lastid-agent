@@ -83,6 +83,72 @@ test('a project-tier write WITH a project_root_seed passes the seed guard and pr
   }
 });
 
+// REGRESSION (made-up repos / bifurcation): the agent used to supply project_key
+// and HALLUCINATED it (github.com/LastID/lastid.co vs the real
+// github.com/GetTrustedApp/lastid.co); the old "pass project_key" error invited
+// it to invent one on retry. The repo MUST be tool-derived from the filesystem
+// (the git remote), never the agent. These lock that.
+test('REGRESSION: an agent-supplied project_key is IGNORED — the repo is derived, never the agent', async () => {
+  const { scope, cleanup } = withScope();
+  const seeded = { ...loadedAgent, projectRootSeed: Buffer.alloc(32, 9) };
+  try {
+    const res = await handleMemoryTool({
+      name: 'lastid_memory_draft',
+      args: {
+        kind: 'decision', subject: ['vault'], claim: 'handle envelope is HPKE base mode',
+        source_kind: 'inferred', tier: 'project',
+        project_key: 'github.com/LastID/lastid.co', // ← the agent's HALLUCINATED repo
+      },
+      scope, loadedAgent: seeded, claims, fetchImpl: okFetch,
+      resolveRepo: () => 'github.com/gettrustedapp/lastid.co', // the REAL git remote
+    });
+    assert.equal(res.isError ?? false, false);
+    const b = body(res);
+    assert.equal(b.memory.tier, 'project');
+    assert.equal(b.memory.project_key, 'github.com/gettrustedapp/lastid.co', 'derived repo wins');
+    assert.notEqual(b.memory.project_key, 'github.com/LastID/lastid.co', 'made-up repo never stored');
+  } finally {
+    cleanup();
+  }
+});
+
+test('repo work with NO explicit tier defaults to project, scoped to the DERIVED repo', async () => {
+  const { scope, cleanup } = withScope();
+  const seeded = { ...loadedAgent, projectRootSeed: Buffer.alloc(32, 9) };
+  try {
+    const res = await handleMemoryTool({
+      name: 'lastid_memory_draft',
+      args: { kind: 'fact', subject: ['x'], claim: 'a repo fact', source_kind: 'inferred' }, // no tier, no project_key
+      scope, loadedAgent: seeded, claims, fetchImpl: okFetch,
+      resolveRepo: () => 'github.com/gettrustedapp/lastid.co',
+    });
+    const b = body(res);
+    assert.equal(b.memory.tier, 'project');
+    assert.equal(b.memory.project_key, 'github.com/gettrustedapp/lastid.co');
+  } finally {
+    cleanup();
+  }
+});
+
+test('tier=project with NO repo in context refuses WITHOUT inviting a made-up key', async () => {
+  const { scope, cleanup } = withScope();
+  const seeded = { ...loadedAgent, projectRootSeed: Buffer.alloc(32, 9) };
+  try {
+    const res = await handleMemoryTool({
+      name: 'lastid_memory_draft',
+      args: { kind: 'fact', subject: ['x'], claim: 'c', source_kind: 'inferred', tier: 'project' },
+      scope, loadedAgent: seeded, claims, fetchImpl: okFetch,
+      resolveRepo: () => null, // no repo derivable from the filesystem
+    });
+    assert.equal(res.isError, true);
+    const b = body(res);
+    assert.match(b.error, /no repo is in context/);
+    assert.doesNotMatch(b.error, /pass project_key/); // must NOT tell the agent to supply one
+  } finally {
+    cleanup();
+  }
+});
+
 test('MEMORY_TOOL_NAMES covers the 7 tools', () => {
   for (const n of [
     'lastid_memory_write',
@@ -274,6 +340,24 @@ test('searchMemories: ranks higher-overlap first', async () => {
     store.write({ kind: 'fact', subject: ['x'], claim: 'alpha only', source_kind: 'inferred' });
     const hits = await searchMemories(store, 'alpha beta', { limit: 5 });
     assert.equal(hits[0].claim, 'alpha beta gamma', 'more overlap ranks first');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('searchMemories: includeDrafts surfaces a draft (tagged), excluded by default', async () => {
+  const scope = `test-${randomUUID()}`;
+  const dir = join(homedir(), '.lastid-agent', scope);
+  try {
+    const store = new MemoryStore(scope, undefined, { agentDid: 'did:a', parentHumanDid: 'did:h' });
+    store.draft({ kind: 'fact', subject: ['x'], claim: 'kafka topic naming convention', source_kind: 'inferred' });
+    // Default: drafts are NOT in topical search.
+    assert.equal((await searchMemories(store, 'kafka topic', { limit: 5 })).length, 0);
+    // Opt-in: the draft surfaces, tagged so the renderer marks it.
+    const hits = await searchMemories(store, 'kafka topic', { limit: 5, includeDrafts: true });
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].claim, 'kafka topic naming convention');
+    assert.equal(hits[0].draft, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

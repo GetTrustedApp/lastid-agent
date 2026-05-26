@@ -488,6 +488,29 @@ export class MemoryStore {
   }
 
   /**
+   * Drafted (unverified) memories that are USABLE as drafts — surfaced in
+   * retrieval (the renderer marks them "(draft)" so they're weighted as
+   * tentative proposals, never ground truth):
+   *   - the agent's own agent-tier drafts (its private working notes), and
+   *   - project-tier drafts for the repo it's working in (its own + peers'
+   *     synced drafts — shared-by-default, the operator demotes the bad ones).
+   * Global-tier drafts stay review-gated (the high bar — they reach every
+   * context, so a human promotes before they inject). Excludes expired.
+   *
+   * This is the opt-OUT draft model: a draft is used immediately (marked),
+   * the human demotes it — vs the old opt-in where a draft was invisible until
+   * promoted, so an agent couldn't even see its own learning.
+   */
+  usableDrafts(projectKey, nowMs = Date.now()) {
+    return this.all().filter(
+      (m) =>
+        m.status === 'drafted' &&
+        !isExpired(m, nowMs) &&
+        (m.tier === 'agent' || (m.tier === 'project' && m.project_key === projectKey)),
+    );
+  }
+
+  /**
    * Filtered list (mirrors the list tool). Sorted by confidence DESC then
    * last_confirmed_at DESC.
    */

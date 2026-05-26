@@ -24,7 +24,11 @@ import { cosine, SEMANTIC_FLOOR } from './embeddings.js';
 const PACKET_PREAMBLE =
   'The following memories are ground truth about the operator and project. ' +
   'When they conflict with your training data or general assumptions, the ' +
-  'memories WIN. Cite the memory id (e.g. [mem_abc]) when you use one.';
+  'memories WIN. Cite the memory id (e.g. [mem_abc]) when you use one. ' +
+  'Entries marked "(draft)" are unverified proposals (yours or a peer agent\'s ' +
+  'on this repo) — usable, but lower-trust than confirmed memories and never ' +
+  'treated as ground truth; your operator can demote them. If you need a ' +
+  "memory's full content, fetch it by id with lastid_memory_get.";
 
 /**
  * Operator-authored bedrock memories from the synced operator-store, if any.
@@ -51,7 +55,8 @@ function operatorBedrock(operatorStore) {
 
 function renderItem(m) {
   const summary = m.summary && m.summary.trim().length > 0 ? ` ${m.summary.trim()}` : '';
-  return `- [${m.id ?? m.memory_id}] ${m.claim}${summary}`;
+  const draft = m.draft ? ' (draft)' : '';
+  return `- [${m.id ?? m.memory_id}]${draft} ${m.claim}${summary}`;
 }
 
 /**
@@ -139,7 +144,7 @@ export async function retrievePacket({
   // by score is apples-to-apples. `projectKey` lets this repo's project
   // memories into the topical pool (and keeps other repos' out).
   const [agentTopical, opTopical] = await Promise.all([
-    searchMemories(mem, prompt ?? '', { limit: topicalLimit, excludeBedrock: true, embedder, projectKey }),
+    searchMemories(mem, prompt ?? '', { limit: topicalLimit, excludeBedrock: true, embedder, projectKey, includeDrafts: true }),
     topicalOperatorMemories(operatorStore, prompt ?? '', embedder, topicalLimit),
   ]);
   const topical = [...agentTopical, ...opTopical]
@@ -190,7 +195,7 @@ export async function retrieveSearchBlock({
   projectKey = null,
 } = {}) {
   const mem = store ?? new MemoryStore(scope, undefined, { agentDid, parentHumanDid });
-  const hits = await searchMemories(mem, query ?? '', { limit, excludeBedrock, embedder, projectKey });
+  const hits = await searchMemories(mem, query ?? '', { limit, excludeBedrock, embedder, projectKey, includeDrafts: true });
   // When the agent is working in a repo, always surface that repo's project
   // bedrock (ground truth) here too — so moving to a new repo mid-turn brings
   // its always-inject memories immediately, not just on the next turn. These
@@ -208,7 +213,8 @@ export async function retrieveSearchBlock({
   for (const h of hits) {
     const score = typeof h.score === 'number' ? ` [match ${h.score.toFixed(2)}]` : '';
     const subject = Array.isArray(h.subject) && h.subject.length > 0 ? ` (subject: ${h.subject.join(', ')})` : '';
-    lines.push(`- [${h.memory_id}] ${h.claim}${score}${subject}`);
+    const draft = h.draft ? ' (draft)' : '';
+    lines.push(`- [${h.memory_id}]${draft} ${h.claim}${score}${subject}`);
     if (h.summary && h.summary.trim().length > 0) lines.push(`  ${h.summary.trim()}`);
   }
   lines.push('</lastid-memory>');

@@ -215,3 +215,31 @@ test('memoryEmbeddingText: claim + summary + subject tags', () => {
   assert.equal(t, 'C\nS\na, b');
   assert.equal(memoryEmbeddingText({ claim: 'C', subject: [] }), 'C');
 });
+
+// ── usableDrafts: the opt-out draft model (used immediately, marked) ─────
+
+const REPO = 'github.com/lastid/lastid.co';
+
+test('usableDrafts: own agent draft + this-repo project draft surface; other-repo + global drafts do not', () => {
+  const s = freshStore();
+  const a = s.draft({ ...baseWrite, claim: 'my agent note' }); // agent tier (default)
+  const p = s.draft({ ...baseWrite, claim: 'repo note', tier: 'project', project_key: REPO });
+  const other = s.draft({ ...baseWrite, claim: 'other repo', tier: 'project', project_key: 'github.com/lastid/other' });
+  const g = s.draft({ ...baseWrite, claim: 'global note', tier: 'global' }); // high bar — stays gated
+
+  const ids = s.usableDrafts(REPO).map((m) => m.id).sort();
+  assert.deepEqual(ids, [a.id, p.id].sort());
+  assert.equal(s.usableDrafts(REPO).some((m) => m.id === other.id), false, 'other repo excluded');
+  assert.equal(s.usableDrafts(REPO).some((m) => m.id === g.id), false, 'global draft stays review-gated');
+});
+
+test('usableDrafts: active, forgotten, and expired drafts are all excluded', () => {
+  const s = freshStore();
+  const live = s.draft({ ...baseWrite, claim: 'live draft' });
+  const exp = s.draft({ ...baseWrite, claim: 'expired', expires_at: '2000-01-01T00:00:00Z' });
+  const rej = s.draft({ ...baseWrite, claim: 'rejected' });
+  s.rejectDraft(rej.id); // → forgotten
+  s.write({ ...baseWrite, claim: 'active, not a draft' });
+  assert.deepEqual(s.usableDrafts(null).map((m) => m.id), [live.id]);
+  assert.equal(exp.status, 'drafted'); // still drafted, just expired → excluded by isExpired
+});
