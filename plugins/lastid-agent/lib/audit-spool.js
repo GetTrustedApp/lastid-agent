@@ -26,6 +26,7 @@ import {
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { appendMemoryAudit } from './memory-audit.js';
+import { isAuditEnabled, loadAuditPolicy } from './audit-policy.js';
 
 export function auditSpoolDir(scope = 'main') {
   return join(homedir(), '.lastid-agent', scope ?? 'main', 'audit-spool');
@@ -48,6 +49,14 @@ let counter = 0;
  */
 export function enqueueAuditEvent({ scope = 'main', eventType, memoryId = null, metadata = {}, toolUseId = null } = {}) {
   if (!eventType) return null;
+  // HONOR the operator's signed audit policy AT THE SOURCE: a class the operator
+  // disabled is never spooled, so it never chains or ships. Fail-open — only an
+  // explicitly-disabled class is dropped (loadAuditPolicy + isAuditEnabled).
+  try {
+    if (!isAuditEnabled(loadAuditPolicy(scope), eventType)) return null;
+  } catch {
+    /* policy read failed → fail open (audit) */
+  }
   try {
     const dir = auditSpoolDir(scope);
     mkdirSync(dir, { recursive: true, mode: 0o700 });

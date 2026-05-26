@@ -37,6 +37,7 @@ import { recordRuleHit } from '../lib/rule-metrics.js';
 import { hostMemoryWriteWarning } from '../lib/memory-guidance.js';
 import { resolveScope } from '../lib/scope.js';
 import { enqueueAuditEvent } from '../lib/audit-spool.js';
+import { isAuditEnabled, loadAuditPolicy } from '../lib/audit-policy.js';
 import { redactSecrets } from '../lib/bug-report.js';
 
 // This session's agent scope (LASTID_AGENT_SCOPE → 'main'). The policy-check /
@@ -106,19 +107,22 @@ if (toolName) {
   const decision = runPolicyCheck(toolName, toolInput);
   if (decision?.allow === false && decision?.matched) {
     const m = decision.matched;
-    // Record the fire for metrics (local append, shipped by the listener).
-    // Best-effort + off the latency path; no command/pattern text — only the
-    // rule id, severity, tool category, and curated provenance.
+    // Record the fire for metrics (local append, shipped by the listener),
+    // unless the operator disabled the 'rule_fires' audit class. Best-effort +
+    // off the latency path; no command/pattern text — only the rule id,
+    // severity, tool category, and curated provenance.
     try {
-      recordRuleHit({
-        scope: activeScope,
-        ruleId: m.memory_id,
-        severity: m.severity,
-        tool: m.tool,
-        curated: m.curated === true,
-        pack: m.pack ?? null,
-        rule: m.rule ?? null,
-      });
+      if (isAuditEnabled(loadAuditPolicy(activeScope), 'AgentRuleFired')) {
+        recordRuleHit({
+          scope: activeScope,
+          ruleId: m.memory_id,
+          severity: m.severity,
+          tool: m.tool,
+          curated: m.curated === true,
+          pack: m.pack ?? null,
+          rule: m.rule ?? null,
+        });
+      }
     } catch {
       /* metrics are best-effort — never block a tool call */
     }
