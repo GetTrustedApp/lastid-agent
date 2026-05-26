@@ -46,6 +46,7 @@ function operatorBedrock(operatorStore) {
         id: r.id,
         claim: typeof r.content.claim === 'string' ? r.content.claim : '',
         summary: typeof r.content.summary === 'string' ? r.content.summary : undefined,
+        tier: 'operator',
       }))
       .filter((m) => m.claim.length > 0);
   } catch {
@@ -53,10 +54,24 @@ function operatorBedrock(operatorStore) {
   }
 }
 
+/**
+ * Tier/trust tag for an injected line: `(project)`, `(global)`, `(agent)`,
+ * `(operator)`, combined with draft → `(project, draft)`. Lets the agent (and
+ * the operator reading the packet) tell COLLECTIVE ground truth — global +
+ * project, shared across all the operator's agents (agent_did is null, so a
+ * peer agent may have authored it) — from PRIVATE agent-tier (just this agent),
+ * and tentative drafts from confirmed memories. No tag when tier is unknown.
+ */
+function tierLabel(m) {
+  const parts = [];
+  if (m.tier) parts.push(m.tier);
+  if (m.draft) parts.push('draft');
+  return parts.length > 0 ? ` (${parts.join(', ')})` : '';
+}
+
 function renderItem(m) {
   const summary = m.summary && m.summary.trim().length > 0 ? ` ${m.summary.trim()}` : '';
-  const draft = m.draft ? ' (draft)' : '';
-  return `- [${m.id ?? m.memory_id}]${draft} ${m.claim}${summary}`;
+  return `- [${m.id ?? m.memory_id}]${tierLabel(m)} ${m.claim}${summary}`;
 }
 
 /**
@@ -109,6 +124,7 @@ async function topicalOperatorMemories(operatorStore, query, embedder, limit) {
     ...(c.summary ? { summary: c.summary } : {}),
     subject: c.subject,
     score: Number(score.toFixed(4)),
+    tier: 'operator',
   }));
 }
 
@@ -134,9 +150,9 @@ export async function retrievePacket({
   // which repo we're in (projectKey). Project bedrock injects every turn the
   // agent works in that repo; it never appears for unrelated work.
   const bedrock = [
-    ...mem.bedrockMemories().map((m) => ({ id: m.id, claim: m.claim, summary: m.summary })),
+    ...mem.bedrockMemories().map((m) => ({ id: m.id, claim: m.claim, summary: m.summary, tier: m.tier })),
     ...operatorBedrock(operatorStore),
-    ...mem.projectBedrockMemories(projectKey).map((m) => ({ id: m.id, claim: m.claim, summary: m.summary })),
+    ...mem.projectBedrockMemories(projectKey).map((m) => ({ id: m.id, claim: m.claim, summary: m.summary, tier: 'project' })),
   ];
 
   // Topical = agent-authored + operator-authored (non-bedrock), ranked
@@ -206,15 +222,14 @@ export async function retrieveSearchBlock({
   if (projBedrock.length > 0) {
     lines.push(`Ground truth for this project (${projectKey}):`);
     for (const m of projBedrock) {
-      lines.push(`- [${m.id}] ${m.claim}`);
+      lines.push(`- [${m.id}] (project) ${m.claim}`);
       if (m.summary && m.summary.trim().length > 0) lines.push(`  ${m.summary.trim()}`);
     }
   }
   for (const h of hits) {
     const score = typeof h.score === 'number' ? ` [match ${h.score.toFixed(2)}]` : '';
     const subject = Array.isArray(h.subject) && h.subject.length > 0 ? ` (subject: ${h.subject.join(', ')})` : '';
-    const draft = h.draft ? ' (draft)' : '';
-    lines.push(`- [${h.memory_id}]${draft} ${h.claim}${score}${subject}`);
+    lines.push(`- [${h.memory_id}]${tierLabel(h)} ${h.claim}${score}${subject}`);
     if (h.summary && h.summary.trim().length > 0) lines.push(`  ${h.summary.trim()}`);
   }
   lines.push('</lastid-memory>');

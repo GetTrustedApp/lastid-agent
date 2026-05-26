@@ -31,9 +31,19 @@ test('retrievePacket: composes bedrock + topical, cites ids', async () => {
   assert.match(markdown, /<lastid-memory>/);
   assert.match(markdown, /## Bedrock/);
   assert.match(markdown, /## Relevant to this turn/);
-  assert.match(markdown, new RegExp(`\\[${bed.id}\\] matt writes terse`));
+  assert.match(markdown, new RegExp(`\\[${bed.id}\\] \\(agent\\) matt writes terse`));
   assert.match(markdown, /socketfirewall/);
   assert.ok(injectedIds.includes(bed.id));
+});
+
+test('retrievePacket: labels each line with its tier so collective (global/project) vs private (agent) is legible', async () => {
+  const s = freshStore();
+  const REPO = 'github.com/acme/widgets';
+  s.write({ kind: 'fact', subject: ['install'], claim: 'use pnpm for installs', source_kind: 'user_explicit', tier: 'global', bedrock: true });
+  s.write({ kind: 'fact', subject: ['build'], claim: 'this repo builds with turbo', source_kind: 'user_explicit', tier: 'project', project_key: REPO, bedrock: true });
+  const { markdown } = await retrievePacket({ prompt: 'how do installs work', store: s, projectKey: REPO });
+  assert.match(markdown, /\(global\)/, 'global ground truth tagged');
+  assert.match(markdown, /\(project\)/, 'this repo\'s ground truth tagged');
 });
 
 test('retrievePacket: empty store → empty markdown', async () => {
@@ -52,7 +62,7 @@ test('retrievePacket: surfaces THIS repo\'s project draft, marked "(draft)", wit
   });
   const { markdown } = await retrievePacket({ prompt: 'how does the handle envelope work', store: s, projectKey: REPO });
   assert.match(markdown, /handle envelope is HPKE base mode/);
-  assert.match(markdown, /\(draft\)/); // marked unverified, not ground truth
+  assert.match(markdown, /\(project, draft\)/); // tier + unverified marker
   assert.match(markdown, /lastid_memory_get/); // told it can fetch the full memory by id
 });
 
@@ -84,7 +94,7 @@ test('retrievePacket: includes operator-store bedrock memories', async () => {
     ],
   };
   const { markdown } = await retrievePacket({ prompt: 'x', store: s, operatorStore });
-  assert.match(markdown, /\[mem_op1\] operator says never force push/);
+  assert.match(markdown, /\[mem_op1\] \(operator\) operator says never force push/);
   assert.doesNotMatch(markdown, /should be skipped/);
 });
 
@@ -98,9 +108,9 @@ test('retrievePacket: operator non-bedrock memories surface topically (keyword)'
   }
   const { markdown } = await retrievePacket({ prompt: "kubernetes helm", store: s, operatorStore })
   assert.match(markdown, /## Relevant to this turn/)
-  assert.match(markdown, /\[mem_opA\] deploy with kubernetes helm/)
+  assert.match(markdown, /\[mem_opA\] \(operator\) deploy with kubernetes helm/)
   // the bedrock operator memory goes in the Bedrock section, not topical
-  assert.match(markdown, /\[mem_opB\] always inject this/)
+  assert.match(markdown, /\[mem_opB\] \(operator\) always inject this/)
 })
 
 test('retrieveSearchBlock: ambient hits, excludes bedrock', async () => {

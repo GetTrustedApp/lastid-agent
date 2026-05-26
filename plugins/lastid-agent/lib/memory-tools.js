@@ -197,6 +197,13 @@ export function keywordScore(query, m) {
  * falls back to keyword/subject scoring. Returns
  * [{ memory_id, claim, summary, subject, score }] sorted desc, top `limit`.
  */
+// Relevance lift for a memory that belongs to the repo the agent is working in
+// right now (tier=project AND project_key === the active projectKey). Applied to
+// the SORT rank only — keeps cross-repo (global/agent) memories eligible and
+// ranked on raw relevance, but lets this boundary's ground truth lead instead
+// of a global memory that merely mentions another repo.
+const PROJECT_RANK_BOOST = 0.25;
+
 export async function searchMemories(store, query, { limit = 8, excludeBedrock = false, embedder = null, projectKey = null, includeDrafts = false } = {}) {
   const select = () => {
     let c = store.activeMemories();
@@ -236,13 +243,24 @@ export async function searchMemories(store, query, { limit = 8, excludeBedrock =
   if (!scored) {
     scored = candidates.map((m) => ({ m, score: keywordScore(query, m) })).filter((x) => x.score > 0);
   }
-  scored.sort((a, b) => b.score - a.score);
+  // Sort by a boundary-weighted `rank` (this repo's project memories lifted),
+  // but keep the raw `score` for display so the shown [match] stays honest.
+  for (const s of scored) {
+    const onBoundary = s.m.tier === 'project' && !!projectKey && s.m.project_key === projectKey;
+    s.rank = onBoundary ? s.score * (1 + PROJECT_RANK_BOOST) : s.score;
+  }
+  scored.sort((a, b) => b.rank - a.rank);
   return scored.slice(0, limit).map(({ m, score }) => ({
     memory_id: m.id,
     claim: m.claim,
     ...(m.summary ? { summary: m.summary } : {}),
     subject: m.subject,
     score: Number(score.toFixed(4)),
+    // Tier lets the renderer label collective ground truth (global/project,
+    // shared across the operator's agents) vs private (agent, just me);
+    // project_key pins which repo a project hit belongs to.
+    tier: m.tier,
+    ...(m.tier === 'project' && m.project_key ? { project_key: m.project_key } : {}),
     // Unverified draft — the renderer marks it so it's weighted as a tentative
     // proposal, not ground truth.
     ...(m.status === 'drafted' ? { draft: true } : {}),

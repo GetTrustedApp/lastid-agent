@@ -362,3 +362,29 @@ test('searchMemories: includeDrafts surfaces a draft (tagged), excluded by defau
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('searchMemories: boundary-weights THIS repo\'s project memory above an equally-relevant global one, tags tier', async () => {
+  const scope = `test-${randomUUID()}`;
+  const dir = join(homedir(), '.lastid-agent', scope);
+  const REPO = 'github.com/acme/widgets';
+  try {
+    const store = new MemoryStore(scope, undefined, { agentDid: 'did:a', parentHumanDid: 'did:h' });
+    // Identical claims → identical raw keyword score; only tier/boundary differs.
+    store.write({ kind: 'fact', subject: ['deploy'], claim: 'deploy the widget pipeline carefully', source_kind: 'inferred', tier: 'global' });
+    store.write({ kind: 'fact', subject: ['deploy'], claim: 'deploy the widget pipeline carefully', source_kind: 'inferred', tier: 'project', project_key: REPO });
+
+    // Working IN the repo: the project memory leads (boosted) and carries its tier/key;
+    // the global one is still present (cross-repo recall preserved).
+    const inRepo = await searchMemories(store, 'deploy the widget pipeline', { limit: 5, projectKey: REPO });
+    assert.equal(inRepo[0].tier, 'project', 'on-boundary project memory ranks first');
+    assert.equal(inRepo[0].project_key, REPO);
+    assert.ok(inRepo.some((h) => h.tier === 'global'), 'global stays eligible');
+
+    // Working in a DIFFERENT repo: the project memory is filtered out entirely; global leads.
+    const elsewhere = await searchMemories(store, 'deploy the widget pipeline', { limit: 5, projectKey: 'github.com/acme/other' });
+    assert.ok(elsewhere.every((h) => h.tier !== 'project'), 'another repo\'s project memory never leaks');
+    assert.equal(elsewhere[0].tier, 'global');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
