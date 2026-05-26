@@ -174,6 +174,36 @@ export class MlsClient {
   }
 
   /**
+   * Author a fresh MLS group with this agent as sole creator. Pass a
+   * caller-reserved `group_id_b64`. Returns parsed JoinedGroupInfo
+   * { group_id_b64, member_count: 1, epoch: 0 }. Follow with
+   * `exportGroupInfo` (→ POST /v1/groups) then `addMember` per peer;
+   * persist after (this mints a signing key the state file must capture).
+   */
+  createGroup(groupIdB64) {
+    return JSON.parse(this.#handle.createGroup(groupIdB64));
+  }
+
+  /**
+   * Export the group's GroupInfo as base64 TLS — the `mls_group_init`
+   * POST /v1/groups requires (the IdP hashes it into the canonical
+   * mls_group_id). Read-only; no state mutation.
+   */
+  exportGroupInfo(groupIdB64) {
+    return this.#handle.exportGroupInfo(groupIdB64);
+  }
+
+  /**
+   * Add a peer (base64-TLS KeyPackage) to a group this agent owns.
+   * Returns parsed { commit_b64, welcome_b64, new_epoch }: deliver
+   * `welcome_b64` to the invitee and let the IdP broadcast `commit_b64`
+   * to existing members. Persist after — the ratchet advanced.
+   */
+  addMember(groupIdB64, keyPackageB64) {
+    return JSON.parse(this.#handle.addMember(groupIdB64, keyPackageB64));
+  }
+
+  /**
    * Process an inbound message — application, commit, or proposal.
    * Returns the parsed `InboundResult` JSON. Application messages
    * include `application_b64` (the encrypted plaintext, base64);
