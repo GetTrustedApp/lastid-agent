@@ -665,6 +665,36 @@ async function cmdMemoryRetrieve(flags) {
 }
 
 /**
+ * `lastid-agent vault-list --json` — called by the SessionStart and
+ * UserPromptSubmit hooks to surface the credentials the operator has shared with
+ * this agent (so it knows its vault access up front, not only via a mid-task
+ * tool call). Decodes the LOCAL synced vault cache with the agent's slot_seed,
+ * strips the secret (vaultListView → compactCredential), and prints
+ * `{ "items": [...] }` on stdout. NEVER prints a secret. Soft-fail: any error /
+ * not provisioned → `{ "items": [] }` and exit 0 so the hook injects nothing.
+ */
+async function cmdVaultList(flags) {
+  const scope = resolveScope(flags);
+  const emitEmpty = () => {
+    process.stdout.write(JSON.stringify({ items: [] }));
+    process.exit(0);
+  };
+  const { loadAgentVc } = await import('./keychain.js');
+  const loaded = await loadAgentVc(scope);
+  if (!loaded) emitEmpty();
+  try {
+    const { decryptedVaultViews } = await import('./vault-cache.js');
+    const { compactCredential } = await import('./credential-awareness.js');
+    const items = decryptedVaultViews(scope, loaded.slotSeed).map(compactCredential);
+    process.stdout.write(JSON.stringify({ items }));
+    process.exit(0);
+  } catch (e) {
+    process.stderr.write(`vault-list: ${e?.message ?? e}\n`);
+    emitEmpty();
+  }
+}
+
+/**
  * `lastid-agent memory-search --prompt "..." [--exclude-bedrock]`
  *
  * Pure topical semantic search — different from `memory-retrieve`
@@ -1520,6 +1550,9 @@ async function main() {
       break;
     case 'memory-retrieve':
       await cmdMemoryRetrieve(flags);
+      break;
+    case 'vault-list':
+      await cmdVaultList(flags);
       break;
     case 'memory-search':
       await cmdMemorySearch(flags);

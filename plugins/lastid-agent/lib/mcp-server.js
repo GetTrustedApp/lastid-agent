@@ -275,18 +275,8 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
     // metadata view (secret stripped by vaultListView). Plaintext exists only
     // transiently here; it is NEVER returned to the model. The credential's
     // actual use (unfurl + inject) happens in the listener at http_fetch time.
-    const { listVaultCache, vaultListView } = await import('./vault-cache.js');
-    const { decryptContent } = await import('./agent-content-crypto.js');
-    const items = [];
-    for (const sealed of listVaultCache(scope)) {
-      try {
-        const bytes = decryptContent(loadedAgent.slotSeed, sealed.enc_b64);
-        const decoded = JSON.parse(Buffer.from(bytes).toString('utf8'));
-        items.push(vaultListView(decoded, sealed.id));
-      } catch {
-        // Undecryptable (wrong slot / corrupt) — skip, don't surface a partial.
-      }
-    }
+    const { decryptedVaultViews } = await import('./vault-cache.js');
+    const items = decryptedVaultViews(scope, loadedAgent.slotSeed);
     return { content: [{ type: 'text', text: JSON.stringify({ items }, null, 2) }] };
   }
 

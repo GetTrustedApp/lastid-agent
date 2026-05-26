@@ -264,6 +264,33 @@ export function vaultListView(decoded, id = null) {
   };
 }
 
+/**
+ * Decode EVERY cached sealed share to its metadata-only view (secret dropped by
+ * vaultListView). Undecryptable entries (wrong slot / corrupt) and revoked ones
+ * are skipped — never surface a partial. This is the single decode-all choke
+ * point shared by the `vault_list` MCP tool and the `vault-list` CLI subcommand
+ * (which feeds the session-start credential awareness block). Deps are
+ * injectable so the decode loop is unit-testable without real crypto.
+ */
+export function decryptedVaultViews(
+  scope = 'main',
+  slotSeed,
+  { listCache = listVaultCache, decrypt = decryptContent } = {},
+) {
+  const out = [];
+  for (const sealed of listCache(scope)) {
+    if (!sealed || typeof sealed.enc_b64 !== 'string' || sealed.status === 'revoked') continue;
+    try {
+      const bytes = decrypt(slotSeed, sealed.enc_b64);
+      const decoded = JSON.parse(Buffer.from(bytes).toString('utf8'));
+      out.push(vaultListView(decoded, sealed.id));
+    } catch {
+      // Undecryptable — skip.
+    }
+  }
+  return out;
+}
+
 /** A short "how to use this" line for the agent, from the share metadata. */
 export function usageContext(meta) {
   const parts = [];

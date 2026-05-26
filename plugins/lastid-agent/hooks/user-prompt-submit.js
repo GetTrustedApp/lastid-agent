@@ -27,6 +27,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readLastProject } from '../lib/project-sticky.js';
 import { projectKeyForPath } from '../lib/project-key.js';
+import { resolveScope } from '../lib/scope.js';
+import {
+  diffNewCredentials,
+  formatCredentialDelta,
+  readSeenCreds,
+  writeSeenCreds,
+} from '../lib/credential-awareness.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
@@ -94,7 +101,17 @@ if (result.error || result.status !== 0) {
 // (see lib/mcp-server.js + lib/agent-inbox.js), the same mechanism
 // the iMessage plugin uses. This hook stays memory-only.
 const packetMarkdown = (result.stdout ?? '').trim();
-if (packetMarkdown.length === 0) {
+
+// Credential-awareness delta: if a vault share has landed since the last turn,
+// inject a compact "new credential available" note so the agent knows it now
+// has access (instead of discovering it only via a vault_list call). Best-
+// effort + local-only (no secret); empty on any failure.
+const credentialDelta = computeCredentialDelta();
+
+const additionalContext = [credentialDelta, packetMarkdown]
+  .filter((s) => s && s.trim().length > 0)
+  .join('\n\n');
+if (additionalContext.length === 0) {
   // Nothing to inject this turn.
   process.exit(0);
 }
@@ -103,13 +120,38 @@ console.log(
   JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'UserPromptSubmit',
-      additionalContext: packetMarkdown,
+      additionalContext,
     },
   }),
 );
 process.exit(0);
 
 // ---
+
+/**
+ * Diff the agent's current vault shares against the seen-id marker; return a
+ * compact delta block for newly-available credentials (and advance the marker),
+ * or '' when nothing is new. Reads the LOCAL synced cache via the same
+ * `vault-list` CLI the session-start hook uses (secret stripped). Soft-fail.
+ */
+function computeCredentialDelta() {
+  try {
+    const scope = resolveScope();
+    const vl = spawnSync('node', [cliPath, 'vault-list', '--json', '--scope', scope], {
+      encoding: 'utf-8',
+      timeout: 4_000,
+      input: '',
+    });
+    if (vl.status !== 0 || !vl.stdout) return '';
+    const items = JSON.parse(vl.stdout)?.items ?? [];
+    const fresh = diffNewCredentials(readSeenCreds(scope), items);
+    if (fresh.length === 0) return '';
+    writeSeenCreds(scope, items.map((c) => c?.id).filter(Boolean));
+    return formatCredentialDelta(fresh);
+  } catch {
+    return '';
+  }
+}
 
 function readStdin() {
   return new Promise((resolve) => {

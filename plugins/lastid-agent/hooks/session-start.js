@@ -25,6 +25,7 @@ import { fileURLToPath } from 'node:url';
 import { ensureListenerRunning } from '../lib/listener-daemon.js';
 import { memoryGuidanceLines } from '../lib/memory-guidance.js';
 import { resolveScope } from '../lib/scope.js';
+import { formatCredentialBlock, writeSeenCreds } from '../lib/credential-awareness.js';
 
 // This session's agent scope (LASTID_AGENT_SCOPE → 'main') — pins the listener,
 // sync, and memory-setup below to the right identity so one host can run
@@ -97,8 +98,28 @@ if (!status.provisioned) {
   process.exit(0);
 }
 
+// List the credentials already shared with this agent so the model knows its
+// vault access up front (instead of discovering it only via a mid-task
+// vault_list call). Best-effort: reads the LOCAL synced cache via the CLI, which
+// strips the secret; empty/missing → no block. Seed the per-turn "new
+// credential" marker so UserPromptSubmit doesn't re-announce these at first.
+let credentialsBlock = '';
+try {
+  const vl = spawnSync('node', [cliPath, 'vault-list', '--json', '--scope', sessionScope], {
+    encoding: 'utf-8',
+    timeout: 5_000,
+  });
+  if (vl.status === 0 && vl.stdout) {
+    const items = JSON.parse(vl.stdout)?.items ?? [];
+    credentialsBlock = formatCredentialBlock(items);
+    writeSeenCreds(sessionScope, items.map((c) => c?.id).filter(Boolean));
+  }
+} catch (err) {
+  process.stderr.write(`[lastid-agent] vault-list (session-start): ${err.message}\n`);
+}
+
 // Provisioned — emit the operating context.
-const context = buildOperatingContext(status);
+const context = buildOperatingContext(status, credentialsBlock);
 process.stderr.write(
   `[lastid-agent] provisioned: ${status.agent_did}\n`,
 );
@@ -210,7 +231,7 @@ function emit(additionalContext) {
   );
 }
 
-function buildOperatingContext(s) {
+function buildOperatingContext(s, credentialsBlock = '') {
   const caps = (s.capabilities ?? [])
     .map((c) => `- ${c.resource}: ${(c.actions ?? []).join(', ')}`)
     .join('\n');
@@ -279,6 +300,7 @@ function buildOperatingContext(s) {
     '- If `http_fetch` returns a credential-related error (401, 403),',
     '  report it. Do not silently retry with a different credential.',
     '',
+    ...(credentialsBlock ? [credentialsBlock, ''] : []),
     '## What lands in the audit chain',
     '',
     'Every tool call you make appends a record to a blake3-linked,',
