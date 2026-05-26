@@ -17,6 +17,8 @@ import {
   getVaultShare,
   resolveVaultShare,
   vaultListView,
+  usageContext,
+  summarizeConstraints,
   vaultCachePath,
 } from '../lib/vault-cache.js';
 import { encryptContent } from '../lib/agent-content-crypto.js';
@@ -101,6 +103,56 @@ test('vaultListView: a bundle with no secret reports has_secret=false (no crash)
   const view = vaultListView({ item_id: 'x', title: 'T' });
   assert.equal(view.has_secret, false);
   assert.equal('secret' in view, false);
+});
+
+test('vaultListView DROPS the companion secret + acl (AWS/OAuth), reports has_secondary_secret', () => {
+  const decoded = {
+    item_id: 'vault_aws',
+    title: 'AWS prod',
+    kind: 'api_key',
+    service: 'aws',
+    key_label: 'Access key ID',
+    secondary_key_label: 'Secret access key',
+    injection: { type: 'header', name: 'Authorization' },
+    secret: 'AKIA-PRIMARY',
+    secret_secondary: 'SECRET-ACCESS-zzz',
+    acl: { share_signature: 'sig', kid: 'device-key' },
+  };
+  const view = vaultListView(decoded);
+  assert.equal(view.has_secret, true);
+  assert.equal(view.has_secondary_secret, true);
+  // Neither secret nor the signing blob rides along.
+  assert.equal('secret' in view, false);
+  assert.equal('secret_secondary' in view, false);
+  assert.equal('acl' in view, false);
+  const json = JSON.stringify(view);
+  assert.equal(json.includes('SECRET-ACCESS-zzz'), false);
+  assert.equal(json.includes('AKIA-PRIMARY'), false);
+});
+
+test('usageContext: builds a how-to-use line from share metadata (no secret)', () => {
+  const u = usageContext({
+    service: 'openai',
+    account: 'acme-prod',
+    key_label: 'API key',
+    injection: { type: 'oauth_bearer' },
+    docs_url: 'https://docs.openai.com',
+  });
+  assert.match(u, /service: openai/);
+  assert.match(u, /account: acme-prod/);
+  assert.match(u, /OAuth bearer/);
+  assert.match(u, /docs: https:\/\/docs\.openai\.com/);
+});
+
+test('summarizeConstraints: renders recurring schedule + rate in plain language', () => {
+  const s = summarizeConstraints([
+    { type: 'recurring_schedule', days: [0, 1, 2, 3, 4], start_minute: 540, end_minute: 1020, utc_offset_minutes: 0 },
+    { type: 'rate_per_minute', max: 10 },
+  ]);
+  assert.match(s, /Mon\/Tue\/Wed\/Thu\/Fri 09:00–17:00 UTC/);
+  assert.match(s, /max 10\/min/);
+  assert.equal(summarizeConstraints([]), undefined);
+  assert.equal(summarizeConstraints(undefined), undefined);
 });
 
 // resolveVaultShare — the decrypt + operator-signature gate. The negative

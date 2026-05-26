@@ -139,12 +139,62 @@ export function resolveVaultShare(scope, id, { slotSeed, operatorJwk, onReject }
  */
 export function vaultListView(decoded, id = null) {
   const bundle = decoded && typeof decoded === 'object' ? decoded : {};
-  // Explicitly pull the secret OUT so it can't ride along, whatever else the
-  // bundle carries.
-  const { secret, ...meta } = bundle;
+  // Explicitly pull BOTH secrets OUT so neither can ride along, whatever else
+  // the bundle carries (AWS/OAuth credentials carry a companion secret). The
+  // `acl` blob is operator-signing detail the agent doesn't need — drop it too.
+  const { secret, secret_secondary, acl, ...meta } = bundle;
   return {
     id: id ?? meta.item_id ?? null,
     ...meta,
     has_secret: typeof secret === 'string' && secret.length > 0,
+    has_secondary_secret: typeof secret_secondary === 'string' && secret_secondary.length > 0,
+    // Human-readable usage context for the agent: how to use it + the limits
+    // it should expect. Never the secret.
+    usage: usageContext(meta),
+    constraints_summary: summarizeConstraints(meta.constraints),
   };
+}
+
+/** A short "how to use this" line for the agent, from the share metadata. */
+export function usageContext(meta) {
+  const parts = [];
+  if (meta.service) parts.push(`service: ${meta.service}`);
+  if (meta.account) parts.push(`account: ${meta.account}`);
+  if (meta.key_label) parts.push(`credential: ${meta.key_label}`);
+  const inj = meta.injection?.type;
+  if (inj === 'oauth_bearer') parts.push('attached as an OAuth bearer token (auto-refreshed)');
+  else if (inj === 'header') parts.push(`attached as the ${meta.injection?.name ?? 'Authorization'} header`);
+  else if (inj === 'query_param') parts.push(`attached as the ${meta.injection?.name ?? 'api_key'} query param`);
+  else if (inj === 'basic_auth') parts.push('attached as HTTP basic auth');
+  if (meta.docs_url) parts.push(`docs: ${meta.docs_url}`);
+  return parts.join(' · ') || undefined;
+}
+
+/** Plain-language summary of the canonical {type}-tagged constraints so the
+ *  agent knows the limits before it tries to use the credential. */
+export function summarizeConstraints(constraints) {
+  if (!Array.isArray(constraints) || constraints.length === 0) return undefined;
+  const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const hhmm = (m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+  const offset = (o) => (o === 0 ? 'UTC' : `UTC${o >= 0 ? '+' : ''}${o / 60}`);
+  return constraints
+    .map((c) => {
+      switch (c?.type) {
+        case 'recurring_schedule': {
+          const days = (Array.isArray(c.days) ? c.days : []).map((d) => dayNames[d] ?? d).join('/');
+          return `usable ${days} ${hhmm(c.start_minute)}–${hhmm(c.end_minute)} ${offset(c.utc_offset_minutes)}`;
+        }
+        case 'time_window':
+          return `usable ${c.not_before} → ${c.not_after}`;
+        case 'rate_per_minute':
+          return `max ${c.max}/min`;
+        case 'amount_cap':
+          return `amount cap ${c.max} ${c.unit}`;
+        case 'scope_required':
+          return `scoped to ${c.name}=${c.value}`;
+        default:
+          return c?.type ?? 'constraint';
+      }
+    })
+    .join('; ');
 }

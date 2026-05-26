@@ -25,6 +25,7 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { evalShareForUse, OUTCOME } from './vault-policy.js';
 import { applyInjection, injectionSummary } from './vault-inject.js';
+import { usageContext, summarizeConstraints } from './vault-cache.js';
 
 const BODY_CAP = 256 * 1024; // 256 KiB, matches the desktop http_fetch cap
 
@@ -84,6 +85,11 @@ export async function handleVaultRequest(req, deps) {
       expires_at_ms: h.expiresAtMs,
       item_id: itemId,
       injection: injectionSummary(content.injection),
+      // Usage context so the agent knows HOW to use this credential + the
+      // limits it's operating under — never the secret value.
+      usage: usageContext(content),
+      docs_url: content.docs_url,
+      constraints_summary: summarizeConstraints(content.constraints),
     };
   }
 
