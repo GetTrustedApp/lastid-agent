@@ -17,6 +17,7 @@
  */
 import { mintDpopJwt } from './dpop.js';
 import { decryptContent } from './agent-content-crypto.js';
+import { applyVaultRecords } from './vault-cache.js';
 import {
   decryptProjectContent,
   deriveProjectRoutingId,
@@ -26,6 +27,7 @@ import { verifyRecordSignature } from './agent-sig-verify.js';
 
 export const RULES_PATH = '/v1/agent-state/rules';
 export const MEMORIES_PATH = '/v1/agent-state/memories';
+export const VAULT_PATH = '/v1/agent-state/vault';
 
 /**
  * Decode one wire record into the OperatorStore shape. Revoked /
@@ -130,6 +132,7 @@ export async function syncAgentState({
   projectRootSeed = null,
   store,
   memoryStore = null,
+  scope = 'main',
   fetchImpl = globalThis.fetch,
   operatorJwk = null,
   verifyRecord = null,
@@ -139,10 +142,25 @@ export async function syncAgentState({
     throw new Error('syncAgentState: no fetch implementation available');
   }
   const since = store.cursor;
-  const [rules, memories] = await Promise.all([
+  const [rules, memories, vault] = await Promise.all([
     fetchKind({ idpUrl, path: RULES_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }),
     fetchKind({ idpUrl, path: MEMORIES_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }),
+    // Vault shares ride the same per-operator cursor. We store them SEALED
+    // (no decrypt here) — the listener verifies + unfurls only at inject time.
+    // A failed vault fetch must not break rules/memories, so fail soft to empty.
+    fetchKind({ idpUrl, path: VAULT_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }).catch(
+      () => ({ records: [], cursor: since, operatorJwk: null }),
+    ),
   ]);
+
+  // Vault: persist the sealed blobs to the local vault cache (never decrypted
+  // at rest). vault_list decodes on demand + strips the secret; the inject path
+  // (listener) verifies the operator signature before use. Best-effort.
+  try {
+    applyVaultRecords(scope, vault.records);
+  } catch (err) {
+    safely(onReject, { id: 'vault-cache', kind: 'vault' }, `vault cache: ${err?.message ?? err}`);
+  }
 
   // Operator delegation key for signature verification. TRUST-ON-FIRST-USE: the
   // IdP supplies it embedded in the sync response, but we PIN it on the first
@@ -166,7 +184,7 @@ export async function syncAgentState({
     ((rec, contentBytes) => verifyRecordSignature(rec, contentBytes, opJwk, { agentDid }));
 
   const all = [...rules.records, ...memories.records];
-  let maxCursor = Math.max(since, rules.cursor, memories.cursor);
+  let maxCursor = Math.max(since, rules.cursor, memories.cursor, vault.cursor ?? since);
   const decoded = [];
   let reconciled = 0;
   for (const rec of all) {
@@ -244,7 +262,7 @@ function safely(fn, ...args) {
  * GET used for catch-up. Returns true if it handled the event.
  */
 export function makeDoorbellHandler(triggerSync, { debounceMs = 250 } = {}) {
-  const CHANGED = new Set(['rules.changed', 'memory.changed', 'agent_state.changed']);
+  const CHANGED = new Set(['rules.changed', 'memory.changed', 'vault.changed', 'agent_state.changed']);
   let timer = null;
   return function onEvent(event) {
     const type = typeof event === 'string' ? event : event?.type ?? '';

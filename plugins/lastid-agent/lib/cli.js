@@ -956,6 +956,7 @@ async function runAgentStateSync(loaded, scope) {
     projectRootSeed: loaded.projectRootSeed ?? null,
     store,
     memoryStore,
+    scope, // vault shares cache per scope
     fetchImpl: globalThis.fetch,
   });
 }

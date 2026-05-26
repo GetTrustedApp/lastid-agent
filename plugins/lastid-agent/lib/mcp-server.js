@@ -98,6 +98,17 @@ const PLUGIN_TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'vault_list',
+    description:
+      "List the vault credentials your operator has shared with you. Returns metadata ONLY — title, service, host, the injection method, constraints, and whether each requires per-use approval. You NEVER see the secret value: you can USE a shared credential (via the injection path) but never read it. Use this to discover what you can call on the operator's behalf.",
+    requiredCapability: { resource: 'vault:use', action: 'Use' },
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
   // Memory tools — served locally against the agent's own memory store
   // (lib/memory-store.js). These names override any same-named desktop
   // tools in the tools/list merge below, so memory is local-first.
@@ -153,6 +164,26 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
 
   if (MEMORY_TOOL_NAMES.has(name)) {
     return handleMemoryTool({ name, args: _args ?? {}, scope, loadedAgent, claims });
+  }
+
+  if (name === 'vault_list') {
+    // Decode each SEALED cached share with the agent's slot_seed and return the
+    // metadata view (secret stripped by vaultListView). Plaintext exists only
+    // transiently here; it is NEVER returned to the model. The credential's
+    // actual use (unfurl + inject) happens in the listener at http_fetch time.
+    const { listVaultCache, vaultListView } = await import('./vault-cache.js');
+    const { decryptContent } = await import('./agent-content-crypto.js');
+    const items = [];
+    for (const sealed of listVaultCache(scope)) {
+      try {
+        const bytes = decryptContent(loadedAgent.slotSeed, sealed.enc_b64);
+        const decoded = JSON.parse(Buffer.from(bytes).toString('utf8'));
+        items.push(vaultListView(decoded, sealed.id));
+      } catch {
+        // Undecryptable (wrong slot / corrupt) — skip, don't surface a partial.
+      }
+    }
+    return { content: [{ type: 'text', text: JSON.stringify({ items }, null, 2) }] };
   }
 
   if (name === 'lastid_send_message') {
