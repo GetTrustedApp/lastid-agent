@@ -12,6 +12,7 @@ export const botmlsclient_createGroup: (a: number, b: number, c: number) => [num
 export const botmlsclient_destroyGroup: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const botmlsclient_dumpState: (a: number) => [number, number, number, number];
 export const botmlsclient_encryptApplicationMessage: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+export const botmlsclient_exportGroupInfo: (a: number, b: number, c: number) => [number, number, number, number];
 export const botmlsclient_forgetGroup: (a: number, b: number, c: number) => [number, number];
 export const botmlsclient_generateKeyPackage: (a: number) => [number, number, number, number];
 export const botmlsclient_groupEpoch: (a: number, b: number, c: number) => [bigint, number, number];

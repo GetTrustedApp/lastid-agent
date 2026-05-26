@@ -67,6 +67,14 @@ export class BotMlsClient {
      */
     encryptApplicationMessage(group_id_b64: string, plaintext_b64: string): string;
     /**
+     * Export the GroupInfo for a freshly-created group as
+     * TLS-serialized base64 — the `mls_group_init` the IdP wants in
+     * `POST /v1/groups`, which it hashes into the canonical
+     * mls_group_id every peer agrees on. Call right after
+     * `createGroup`, before `addMember`. Read-only.
+     */
+    exportGroupInfo(group_id_b64: string): string;
+    /**
      * Wipe local MlsGroup state for a dissolved group. Idempotent:
      * calling on an absent group is a no-op. Subsequent
      * `processInbound` for the same group_id surfaces
