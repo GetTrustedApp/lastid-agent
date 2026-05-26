@@ -578,6 +578,23 @@ class PersistentBotMlsClient {
         return ret;
     }
     /**
+     * Add several peers in ONE commit. `key_packages_b64_json` is a JSON
+     * array of base64 KeyPackages. Returns JSON `AddMemberResult` (one
+     * commit, one welcome). Matches the sync client's `addMembers` so
+     * browser device-consistency reconcile uses the same primitive.
+     * @param {string} group_id_b64
+     * @param {string} key_packages_b64_json
+     * @returns {Promise<string>}
+     */
+    addMembers(group_id_b64, key_packages_b64_json) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(key_packages_b64_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.persistentbotmlsclient_addMembers(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
      * Bot DID this handle is bound to.
      * @returns {string}
      */
@@ -1262,18 +1279,18 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 739, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 760, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 560, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 581, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 546, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h06cd8775ba25515b);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 567, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb211d42f6d42ba37);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
@@ -1306,8 +1323,8 @@ function wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe(arg0, arg
     wasm.wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h06cd8775ba25515b(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h06cd8775ba25515b(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__hb211d42f6d42ba37(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__hb211d42f6d42ba37(arg0, arg1, arg2);
 }
 
 function wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152(arg0, arg1, arg2) {

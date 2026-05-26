@@ -167,6 +167,13 @@ export class PersistentBotMlsClient {
      */
     addMember(group_id_b64: string, key_package_b64: string): Promise<string>;
     /**
+     * Add several peers in ONE commit. `key_packages_b64_json` is a JSON
+     * array of base64 KeyPackages. Returns JSON `AddMemberResult` (one
+     * commit, one welcome). Matches the sync client's `addMembers` so
+     * browser device-consistency reconcile uses the same primitive.
+     */
+    addMembers(group_id_b64: string, key_packages_b64_json: string): Promise<string>;
+    /**
      * Commit every pending queued proposal.
      */
     commitPendingProposals(group_id_b64: string): Promise<string>;
