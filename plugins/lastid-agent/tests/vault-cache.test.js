@@ -16,6 +16,7 @@ import {
   listVaultCache,
   getVaultShare,
   resolveVaultShare,
+  resolveVaultSecret,
   vaultListView,
   usageContext,
   summarizeConstraints,
@@ -197,4 +198,55 @@ test('resolveVaultShare: decrypts but UNSIGNED → null (fails the operator-sig 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// resolveVaultSecret — the JIT credential release: fetch the sealed secret,
+// decrypt with the slot_seed, bind it to the share id, expose a zeroize().
+// The negative paths (no release, undecryptable, wrong share) must fail closed.
+test('resolveVaultSecret: decrypts the JIT-released secret + companion, bound to the id', async () => {
+  const sealed = encryptContent(
+    SLOT,
+    Buffer.from(JSON.stringify({ item_id: 'v', secret: 'sk-zzz', secret_secondary: 'refresh-q' }), 'utf8'),
+  ).toString('base64');
+  const out = await resolveVaultSecret('v', { slotSeed: SLOT, fetchSecretEnc: async () => sealed });
+  assert.equal(out.secret, 'sk-zzz');
+  assert.equal(out.secret_secondary, 'refresh-q');
+  assert.equal(typeof out.zeroize, 'function');
+  out.zeroize(); // wipes the decrypted buffer; must not throw
+});
+
+test('resolveVaultSecret: no secret released (404 → null) → null + onReject', async () => {
+  let why = null;
+  const out = await resolveVaultSecret('v', { slotSeed: SLOT, fetchSecretEnc: async () => null, onReject: (_id, w) => (why = w) });
+  assert.equal(out, null);
+  assert.match(why, /no secret released/);
+});
+
+test('resolveVaultSecret: a secret sealed for a DIFFERENT share is rejected (item_id bind)', async () => {
+  const sealed = encryptContent(
+    SLOT,
+    Buffer.from(JSON.stringify({ item_id: 'OTHER', secret: 'sk-zzz' }), 'utf8'),
+  ).toString('base64');
+  let why = null;
+  const out = await resolveVaultSecret('v', { slotSeed: SLOT, fetchSecretEnc: async () => sealed, onReject: (_id, w) => (why = w) });
+  assert.equal(out, null, 'a relay serving the wrong share-secret must fail closed');
+  assert.match(why, /item_id mismatch/);
+});
+
+test('resolveVaultSecret: undecryptable (wrong slot_seed / corrupt) → null', async () => {
+  let why = null;
+  const out = await resolveVaultSecret('v', { slotSeed: SLOT, fetchSecretEnc: async () => 'bm90LXNlYWxlZA==', onReject: (_id, w) => (why = w) });
+  assert.equal(out, null);
+  assert.match(why, /undecryptable/);
+});
+
+test('resolveVaultSecret: an empty released secret → null', async () => {
+  const sealed = encryptContent(
+    SLOT,
+    Buffer.from(JSON.stringify({ item_id: 'v', secret: '' }), 'utf8'),
+  ).toString('base64');
+  let why = null;
+  const out = await resolveVaultSecret('v', { slotSeed: SLOT, fetchSecretEnc: async () => sealed, onReject: (_id, w) => (why = w) });
+  assert.equal(out, null);
+  assert.match(why, /empty/);
 });

@@ -17,6 +17,8 @@ import { VaultHandleStore } from '../lib/vault-handle-store.js';
 
 const AGENT = 'did:lastid:agent:zA';
 
+// resolveShare returns METADATA only — the secret is fetched JIT via
+// resolveSecret (the secret never sits in the cached share).
 const SHARE = {
   item_id: 'vault_1',
   title: 'OpenAI key',
@@ -25,14 +27,18 @@ const SHARE = {
   on_violation: { type: 'deny' },
   require_approval_per_use: false,
   granted_actions: ['use'],
-  secret: 'sk-SECRET-zzz',
 };
+
+const SECRET = 'sk-SECRET-zzz';
 
 function deps(over = {}) {
   return {
     agentDid: AGENT,
     handles: new VaultHandleStore(),
     resolveShare: async (id) => (id === 'vault_1' ? { ...SHARE } : null),
+    // JIT secret release. zeroizeCalls lets a test assert the secret was wiped.
+    resolveSecret: async (id) =>
+      id === 'vault_1' ? { secret: SECRET, zeroize: () => {} } : null,
     fetchImpl: async () => ({ status: 200, text: async () => 'OK', headers: { 'content-type': 'text/plain' } }),
     now: () => Date.now(),
     ...over,
@@ -89,6 +95,47 @@ test('http_fetch injects the secret, calls, and revokes (single-use)', async () 
   // The secret was attached to the OUTBOUND request only.
   assert.equal(seen.headers.Authorization, 'Bearer sk-SECRET-zzz');
   // Single-use: the handle is gone; a replay fails.
+  const replay = await handleVaultRequest({ op: 'http_fetch', vault_handle: used.vault_handle, url: 'https://x' }, d);
+  assert.equal(replay.error, 'handle_invalid');
+})
+
+test('http_fetch fetches the secret JIT, zeroizes it after, and records timing', async () => {
+  let zeroized = false;
+  let resolvedSecretFor = null;
+  let metric = null;
+  const d = deps({
+    resolveSecret: async (id) => {
+      resolvedSecretFor = id;
+      return { secret: SECRET, zeroize: () => { zeroized = true; } };
+    },
+    recordUse: (kind, _h, m) => { if (kind === 'consume') metric = m; },
+  });
+  const used = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  const r = await handleVaultRequest(
+    { op: 'http_fetch', vault_handle: used.vault_handle, url: 'https://api.openai.com/v1/models' },
+    d,
+  );
+  assert.equal(r.ok, true);
+  assert.equal(resolvedSecretFor, 'vault_1', 'secret fetched JIT for this share');
+  assert.equal(zeroized, true, 'secret buffer zeroized after the call');
+  // Timing captured for the guardrail metrics.
+  assert.ok(metric && typeof metric.permissioned_ms === 'number');
+  assert.ok(typeof metric.credentialed_ms === 'number');
+  assert.equal(metric.outcome, 'ok');
+  assert.equal(metric.status, 200);
+})
+
+test('http_fetch when no secret is released → secret_unavailable, handle consumed, no fetch', async () => {
+  let called = false;
+  const d = deps({
+    resolveSecret: async () => null, // IdP released nothing (revoked / 404)
+    fetchImpl: async () => ((called = true), { status: 200, text: async () => '' }),
+  });
+  const used = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  const r = await handleVaultRequest({ op: 'http_fetch', vault_handle: used.vault_handle, url: 'https://x' }, d);
+  assert.equal(r.error, 'secret_unavailable');
+  assert.equal(called, false, 'never fetched without a credential');
+  // Single-use: the handle is consumed even when the secret was unavailable.
   const replay = await handleVaultRequest({ op: 'http_fetch', vault_handle: used.vault_handle, url: 'https://x' }, d);
   assert.equal(replay.error, 'handle_invalid');
 })

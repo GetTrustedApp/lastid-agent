@@ -45,7 +45,8 @@ export function vaultSocketPath(scope = 'main') {
  *   recordUse(kind,handle) optional timing hook ('mint' | 'consume')
  */
 export async function handleVaultRequest(req, deps) {
-  const { agentDid, resolveShare, handles, fetchImpl, recordUse } = deps;
+  const { agentDid, resolveShare, resolveSecret, handles, fetchImpl, recordUse, now } = deps;
+  const clock = typeof now === 'function' ? now : () => Date.now();
   const op = req?.op;
 
   if (op === 'vault_use') {
@@ -98,45 +99,81 @@ export async function handleVaultRequest(req, deps) {
     const h = handles.lookup(token, { agentDid });
     if (!h) return { error: 'handle_invalid', detail: 'handle missing, expired, or not yours' };
 
+    // The cached share is METADATA only (the injection spec + usage). The
+    // credential itself is fetched JUST-IN-TIME and lives only from here until
+    // we zeroize it — never on disk, never beyond this one call.
     const content = await resolveShare(h.itemId);
     if (!content) {
       handles.revoke(token);
       return { error: 'share_not_found', detail: 'share gone since the handle was minted' };
     }
 
-    let injected;
+    const credStartMs = clock(); // start of the unencrypted-credential window
+    let secretObj = null;
+    let injected = null;
+    let response;
     try {
-      injected = applyInjection({
-        injection: content.injection,
-        secret: content.secret,
-        url: req.url,
-        headers: req.headers ?? {},
-        item: content,
-      });
-    } catch (e) {
-      handles.revoke(token); // single-use: consumed even on a bad spec
-      recordUse?.('consume', h);
-      return { error: 'inject_failed', detail: e?.message ?? String(e) };
-    }
+      try {
+        secretObj = await resolveSecret(h.itemId);
+      } catch (e) {
+        return { error: 'secret_unavailable', detail: e?.message ?? String(e) };
+      }
+      if (!secretObj || typeof secretObj.secret !== 'string') {
+        return { error: 'secret_unavailable', detail: 'no credential released for this handle' };
+      }
 
-    try {
-      const res = await fetchImpl(injected.url, {
-        method: req.method ?? 'GET',
-        headers: injected.headers,
-        ...(req.body != null ? { body: req.body } : {}),
-      });
-      const status = typeof res?.status === 'number' ? res.status : 0;
-      const rawBody = typeof res?.text === 'function' ? await res.text() : '';
-      const truncated = rawBody.length > BODY_CAP;
-      const body = truncated ? rawBody.slice(0, BODY_CAP) : rawBody;
-      const headers = headersToObject(res?.headers);
-      handles.revoke(token); // single-use
-      recordUse?.('consume', h);
-      return { ok: true, status, headers, body, truncated };
-    } catch (e) {
+      try {
+        injected = applyInjection({
+          injection: content.injection,
+          secret: secretObj.secret,
+          url: req.url,
+          headers: req.headers ?? {},
+          // Inject reads companion fields (basic_auth username, AWS secret) off
+          // the item; merge the JIT secret(s) onto the metadata for this call.
+          item: { ...content, secret: secretObj.secret, secret_secondary: secretObj.secret_secondary },
+        });
+      } catch (e) {
+        response = { error: 'inject_failed', detail: e?.message ?? String(e) };
+        return response;
+      }
+
+      try {
+        const res = await fetchImpl(injected.url, {
+          method: req.method ?? 'GET',
+          headers: injected.headers,
+          ...(req.body != null ? { body: req.body } : {}),
+        });
+        const status = typeof res?.status === 'number' ? res.status : 0;
+        const rawBody = typeof res?.text === 'function' ? await res.text() : '';
+        const truncated = rawBody.length > BODY_CAP;
+        const body = truncated ? rawBody.slice(0, BODY_CAP) : rawBody;
+        const headers = headersToObject(res?.headers);
+        response = { ok: true, status, headers, body, truncated };
+        return response;
+      } catch (e) {
+        response = { error: 'fetch_failed', detail: e?.message ?? String(e) };
+        return response;
+      }
+    } finally {
+      // Zeroize the decrypted secret the instant we're done, drop the injected
+      // headers (they hold the secret string), consume the handle (single-use),
+      // and record the two guardrail timings the front page surfaces:
+      //   permissioned_ms  — how long the agent held a usable handle (mint→now)
+      //   credentialed_ms  — the unencrypted-credential window (decrypt→zeroize)
+      try {
+        secretObj?.zeroize?.();
+      } catch {
+        /* best-effort */
+      }
+      injected = null;
       handles.revoke(token);
-      recordUse?.('consume', h);
-      return { error: 'fetch_failed', detail: e?.message ?? String(e) };
+      const consumeMs = clock();
+      recordUse?.('consume', h, {
+        permissioned_ms: Math.max(0, consumeMs - (h.mintedAtMs ?? consumeMs)),
+        credentialed_ms: Math.max(0, consumeMs - credStartMs),
+        status: response && 'status' in response ? response.status : null,
+        outcome: response?.ok ? 'ok' : (response?.error ?? 'error'),
+      });
     }
   }
 

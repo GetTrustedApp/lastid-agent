@@ -1056,7 +1056,7 @@ async function cmdListen(flags) {
       );
   });
 
-  const { signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed);
+  const { signingKey, signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
 
   // Drain the audit spool into the signed chain, then ship it to the IdP
   // (operator-visible cross-device). The listener is the SINGLE chain writer:
@@ -1276,13 +1276,19 @@ async function cmdListen(flags) {
   // is refused. Best-effort: a vault socket error never disrupts MLS/channel.
   let vaultServer = null;
   try {
-    const [{ startVaultServer }, { resolveVaultShare }, { VaultHandleStore }, { OperatorStore }] =
-      await Promise.all([
-        import('./vault-ipc.js'),
-        import('./vault-cache.js'),
-        import('./vault-handle-store.js'),
-        import('./operator-store.js'),
-      ]);
+    const [
+      { startVaultServer },
+      { resolveVaultShare, resolveVaultSecret },
+      { fetchVaultSecretEnc },
+      { VaultHandleStore },
+      { OperatorStore },
+    ] = await Promise.all([
+      import('./vault-ipc.js'),
+      import('./vault-cache.js'),
+      import('./vault-secret-fetch.js'),
+      import('./vault-handle-store.js'),
+      import('./operator-store.js'),
+    ]);
     const vaultHandles = new VaultHandleStore();
     const r = await startVaultServer({
       scope,
@@ -1298,11 +1304,33 @@ async function cmdListen(flags) {
             onReject: (id, why) =>
               process.stderr.write(`[lastid-agent] vault share ${id} refused: ${why}\n`),
           }),
+        // JIT credential release: fetch the sealed SECRET from the IdP at use
+        // time, decrypt with the slot_seed, hand it to inject (then zeroize).
+        // The secret is never cached — this is what keeps the credential off
+        // the agent at rest (permissioned window = the call, not "forever").
+        resolveSecret: (itemId) =>
+          resolveVaultSecret(itemId, {
+            slotSeed: loaded.slotSeed,
+            fetchSecretEnc: (id) =>
+              fetchVaultSecretEnc({
+                idpUrl,
+                agentDid: loaded.agentDid,
+                vcCompact: loaded.vcCompact,
+                signingSeed,
+                id,
+              }),
+            onReject: (id, why) =>
+              process.stderr.write(`[lastid-agent] vault secret ${id} refused: ${why}\n`),
+          }),
         fetchImpl: globalThis.fetch,
         now: () => Date.now(),
-        recordUse: (kind, h) =>
+        recordUse: (kind, h, m) =>
           process.stderr.write(
-            `[lastid-agent] vault ${kind}: item=${h.itemId} approved=${h.wasApproved}\n`,
+            `[lastid-agent] vault ${kind}: item=${h.itemId} approved=${h.wasApproved}` +
+              (m
+                ? ` permissioned=${m.permissioned_ms}ms credentialed=${m.credentialed_ms}ms status=${m.status ?? '-'} outcome=${m.outcome}`
+                : '') +
+              '\n',
           ),
       },
     });

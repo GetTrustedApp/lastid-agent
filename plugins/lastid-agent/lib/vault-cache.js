@@ -133,6 +133,76 @@ export function resolveVaultShare(scope, id, { slotSeed, operatorJwk, onReject }
 }
 
 /**
+ * Resolve the JIT-released SECRET for a share. The secret is NEVER cached:
+ * `fetchSecretEnc(id)` pulls the ciphertext from the IdP at use time
+ * (GET /v1/agent-state/vault/:id/secret), which we decrypt with the slot_seed.
+ * Returns `{ secret, secret_secondary?, zeroize() }` or null.
+ *
+ * `zeroize()` overwrites the decrypted byte buffer — call it the instant the
+ * secret has been injected. (JS strings are immutable + GC-managed, so the
+ * parsed string copy itself can't be wiped; zeroize wipes the decrypted Buffer
+ * — the controllable copy — and the caller drops references promptly. The
+ * secret never touches disk.)
+ *
+ * Fails closed: an undecryptable blob (only the operator can seal to this
+ * slot_seed; the IdP cannot), or one whose embedded item_id doesn't match the
+ * requested share (a relay serving another share's secret), returns null.
+ */
+export async function resolveVaultSecret(id, { slotSeed, fetchSecretEnc, onReject } = {}) {
+  let encSecret;
+  try {
+    encSecret = await fetchSecretEnc(id);
+  } catch (e) {
+    if (onReject) onReject(id, `secret fetch failed: ${e?.message ?? e}`);
+    return null;
+  }
+  if (typeof encSecret !== 'string' || encSecret.length === 0) {
+    if (onReject) onReject(id, 'no secret released');
+    return null;
+  }
+  let bytes;
+  try {
+    bytes = decryptContent(slotSeed, encSecret);
+  } catch {
+    if (onReject) onReject(id, 'undecryptable secret (wrong slot_seed / corrupt)');
+    return null;
+  }
+  const wipe = () => {
+    try {
+      bytes.fill(0);
+    } catch {
+      /* best-effort */
+    }
+  };
+  let parsed;
+  try {
+    parsed = JSON.parse(bytes.toString('utf8'));
+  } catch {
+    wipe();
+    if (onReject) onReject(id, 'released secret is not JSON');
+    return null;
+  }
+  // Bind the released secret to THIS share — reject a (validly-sealed) blob
+  // served under the wrong id.
+  if (parsed.item_id !== id) {
+    wipe();
+    if (onReject) onReject(id, `released secret item_id mismatch (got ${parsed.item_id})`);
+    return null;
+  }
+  if (typeof parsed.secret !== 'string' || parsed.secret.length === 0) {
+    wipe();
+    if (onReject) onReject(id, 'released secret is empty');
+    return null;
+  }
+  return {
+    secret: parsed.secret,
+    secret_secondary:
+      typeof parsed.secret_secondary === 'string' ? parsed.secret_secondary : undefined,
+    zeroize: wipe,
+  };
+}
+
+/**
  * Metadata-only view of a DECODED vault bundle — DROPS the secret. This is the
  * ONLY shape `vault_list` may return to the agent. Keep this the single choke
  * point: never spread the raw decoded bundle into a tool result.
