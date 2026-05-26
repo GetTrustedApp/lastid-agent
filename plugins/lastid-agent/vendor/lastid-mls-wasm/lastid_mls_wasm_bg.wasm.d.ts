@@ -4,6 +4,7 @@ export const memory: WebAssembly.Memory;
 export const __wbg_botmlsclient_free: (a: number, b: number) => void;
 export const __wbg_persistentbotmlsclient_free: (a: number, b: number) => void;
 export const botmlsclient_addMember: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+export const botmlsclient_addMembers: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const botmlsclient_applyLoaded: (a: number, b: number, c: number) => [number, number];
 export const botmlsclient_botDid: (a: number) => [number, number];
 export const botmlsclient_commitPendingProposals: (a: number, b: number, c: number) => [number, number, number, number];
@@ -25,6 +26,7 @@ export const botmlsclient_selfUpdate: (a: number, b: number, c: number) => [numb
 export const botmlsclient_snapshotBaseline: (a: number) => [number, number];
 export const botmlsclient_takeDiffJson: (a: number) => [number, number, number, number];
 export const ciphersuiteSupportJson: () => [number, number, number, number];
+export const computeMemberReconcilePlan: (a: number, b: number) => [number, number, number, number];
 export const createPersistentBotClient: (a: number, b: number) => any;
 export const persistentbotmlsclient_addMember: (a: number, b: number, c: number, d: number, e: number) => any;
 export const persistentbotmlsclient_botDid: (a: number) => [number, number];

@@ -57,6 +57,37 @@ class BotMlsClient {
         }
     }
     /**
+     * Add several peers in ONE commit. `key_packages_b64` is a JSON array
+     * of base64 KeyPackages. Returns JSON `AddMemberResult` (one commit,
+     * one welcome covering all). Used by device-consistency reconcile to
+     * add every missing device of a member at once.
+     * @param {string} group_id_b64
+     * @param {string} key_packages_b64_json
+     * @returns {string}
+     */
+    addMembers(group_id_b64, key_packages_b64_json) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(key_packages_b64_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ret = wasm.botmlsclient_addMembers(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var ptr3 = ret[0];
+            var len3 = ret[1];
+            if (ret[3]) {
+                ptr3 = 0; len3 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
      * Bulk-load per-key MLS state entries from durable storage. JS
      * passes a JSON array of `[key_b64, value_b64]` tuples — one tuple
      * per row read from the v2 storage table.
@@ -767,6 +798,39 @@ function ciphersuiteSupportJson() {
 exports.ciphersuiteSupportJson = ciphersuiteSupportJson;
 
 /**
+ * Device-consistency reconcile decision for ONE group member — the SAME
+ * pure logic native runs (lastid-mls-membership). Input JSON:
+ * `{ inventory_leaf_count, inventory_device_ids, active_in_group,
+ * pending_in_group, live_device_ids }`. Output JSON:
+ * `{ backfill_device_ids, evict_device_ids, add_device_ids, action }`.
+ * The JS caller does the I/O (fetch device lists / key packages, submit)
+ * and the openmls mechanics (`addMembers`); this just decides.
+ * @param {string} input_json
+ * @returns {string}
+ */
+function computeMemberReconcilePlan(input_json) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passStringToWasm0(input_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.computeMemberReconcilePlan(ptr0, len0);
+        var ptr2 = ret[0];
+        var len2 = ret[1];
+        if (ret[3]) {
+            ptr2 = 0; len2 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+exports.computeMemberReconcilePlan = computeMemberReconcilePlan;
+
+/**
  * Open or rehydrate a persistent MLS client for `bot_did`. If
  * IndexedDB has prior `mls_kv` rows for this scope they are
  * loaded into the in-mem cache; if not, the client starts
@@ -1198,17 +1262,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 737, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 739, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 558, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 560, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 544, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 546, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h06cd8775ba25515b);
             return ret;
         },

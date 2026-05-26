@@ -20,6 +20,13 @@ export class BotMlsClient {
      */
     addMember(group_id_b64: string, key_package_b64: string): string;
     /**
+     * Add several peers in ONE commit. `key_packages_b64` is a JSON array
+     * of base64 KeyPackages. Returns JSON `AddMemberResult` (one commit,
+     * one welcome covering all). Used by device-consistency reconcile to
+     * add every missing device of a member at once.
+     */
+    addMembers(group_id_b64: string, key_packages_b64_json: string): string;
+    /**
      * Bulk-load per-key MLS state entries from durable storage. JS
      * passes a JSON array of `[key_b64, value_b64]` tuples — one tuple
      * per row read from the v2 storage table.
@@ -243,6 +250,17 @@ export class PersistentBotMlsClient {
  * test from the credential-service test harness.
  */
 export function ciphersuiteSupportJson(): string;
+
+/**
+ * Device-consistency reconcile decision for ONE group member — the SAME
+ * pure logic native runs (lastid-mls-membership). Input JSON:
+ * `{ inventory_leaf_count, inventory_device_ids, active_in_group,
+ * pending_in_group, live_device_ids }`. Output JSON:
+ * `{ backfill_device_ids, evict_device_ids, add_device_ids, action }`.
+ * The JS caller does the I/O (fetch device lists / key packages, submit)
+ * and the openmls mechanics (`addMembers`); this just decides.
+ */
+export function computeMemberReconcilePlan(input_json: string): string;
 
 /**
  * Open or rehydrate a persistent MLS client for `bot_did`. If
