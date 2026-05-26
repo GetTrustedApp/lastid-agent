@@ -1262,6 +1262,51 @@ async function cmdListen(flags) {
     process.stderr.write(`[lastid-agent] embedding daemon failed (non-fatal): ${err?.message ?? err}\n`);
   }
 
+  // Vault daemon: the local trusted inject boundary. The listener is the ONLY
+  // process that holds slot_seed + the handle store + unfurls a secret, so the
+  // MCP tool process (a separate, untrusted-by-design surface the model drives)
+  // forwards vault_use / http_fetch here over the unix socket and never touches
+  // plaintext. resolveShare decrypts + verifies the operator signature per call
+  // (reading the freshly-pinned delegation key), so a forged/unverified share
+  // is refused. Best-effort: a vault socket error never disrupts MLS/channel.
+  let vaultServer = null;
+  try {
+    const [{ startVaultServer }, { resolveVaultShare }, { VaultHandleStore }, { OperatorStore }] =
+      await Promise.all([
+        import('./vault-ipc.js'),
+        import('./vault-cache.js'),
+        import('./vault-handle-store.js'),
+        import('./operator-store.js'),
+      ]);
+    const vaultHandles = new VaultHandleStore();
+    const r = await startVaultServer({
+      scope,
+      deps: {
+        agentDid: loaded.agentDid,
+        handles: vaultHandles,
+        // Fresh OperatorStore per call so we use the latest pinned delegation
+        // key (it may get pinned by a sync after the listener started).
+        resolveShare: (itemId) =>
+          resolveVaultShare(scope, itemId, {
+            slotSeed: loaded.slotSeed,
+            operatorJwk: new OperatorStore(scope).pinnedDelegationJwk,
+            onReject: (id, why) =>
+              process.stderr.write(`[lastid-agent] vault share ${id} refused: ${why}\n`),
+          }),
+        fetchImpl: globalThis.fetch,
+        now: () => Date.now(),
+        recordUse: (kind, h) =>
+          process.stderr.write(
+            `[lastid-agent] vault ${kind}: item=${h.itemId} approved=${h.wasApproved}\n`,
+          ),
+      },
+    });
+    vaultServer = r.server ?? null;
+    process.stderr.write(`[lastid-agent] vault daemon: ${r.status}\n`);
+  } catch (err) {
+    process.stderr.write(`[lastid-agent] vault daemon failed (non-fatal): ${err?.message ?? err}\n`);
+  }
+
   // Outbox drain loop. The listener is the single MLS-state writer,
   // so it is the only process that encrypts + sends. Claude's
   // `lastid_send_message` tool (a separate MCP process) only appends
@@ -1305,6 +1350,7 @@ async function cmdListen(flags) {
     clearInterval(loopMonitor);
     ws.stop();
     if (embedServer) { try { embedServer.close(); } catch { /* ignore */ } }
+    if (vaultServer) { try { vaultServer.close(); } catch { /* ignore */ } }
     try { mls.free(); } catch { /* ignore */ }
     // Release the single-instance lock if it's still ours (a listener that
     // took over from us already claimed it — don't delete a live owner's pid).
