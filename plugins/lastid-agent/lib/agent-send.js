@@ -108,8 +108,11 @@ function textToB64(text) {
  * @param {string} args.agentDid
  * @param {(frame: object) => void} args.send  ws.send-style sender.
  * @param {(line: string) => void} [args.log]
+ * @param {string} [args.idpUrl]      - enables self-heal (create a group when none exists).
+ * @param {string} [args.vcCompact]   - agent VC SD-JWT (bearer) for IdP group calls.
+ * @param {import('node:crypto').KeyObject} [args.signingKey] - agent Ed25519 (DPoP).
  */
-export async function drainOutbox({ scope, mls, agentDid, send, log }) {
+export async function drainOutbox({ scope, mls, agentDid, send, log, idpUrl, vcCompact, signingKey }) {
   const path = outboxPath(scope);
   const logLine = log ?? ((l) => process.stderr.write(`${l}\n`));
   let raw;
@@ -134,7 +137,7 @@ export async function drainOutbox({ scope, mls, agentDid, send, log }) {
       continue;
     }
     try {
-      await sendOne({ scope, mls, agentDid, send, req });
+      await sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, signingKey, log: logLine });
       logLine(
         `[lastid-agent] outbox: sent ${req.id} → operator ${req.operator_did}`,
       );
@@ -152,19 +155,38 @@ export async function drainOutbox({ scope, mls, agentDid, send, log }) {
   await rename(tmp, path);
 }
 
-async function sendOne({ scope, mls, agentDid, send, req }) {
+async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, signingKey, log }) {
   // Resolve the operator's CURRENT active group at send time (not a
   // group id baked in at enqueue) so a rotated group is picked up
   // automatically. Strict operator match — we never send to anyone
   // but the operator.
-  const resolved = await resolveActiveGroupForOperator({
+  let resolved = await resolveActiveGroupForOperator({
     scope,
     operatorDid: req.operator_did,
   });
   if (!resolved) {
-    throw new Error(
-      `no active group with operator ${req.operator_did} — waiting for a group to be established`,
-    );
+    // Self-heal: no conversation yet → the agent creates one and invites
+    // the operator's device(s), then sends. Only attempted when the
+    // listener handed us the auth material (idpUrl + VC + signing key);
+    // without it we keep the message queued for the next tick.
+    if (idpUrl && vcCompact && signingKey) {
+      const { ensureConversation } = await import('./ensure-conversation.js');
+      resolved = await ensureConversation({
+        scope,
+        mls,
+        agentDid,
+        operatorDid: req.operator_did,
+        idpUrl,
+        vcCompact,
+        signingKey,
+        log,
+      });
+    }
+    if (!resolved) {
+      throw new Error(
+        `no active group with operator ${req.operator_did} — waiting for a group to be established`,
+      );
+    }
   }
   const { groupIdB64, idpGroupId } = resolved;
 

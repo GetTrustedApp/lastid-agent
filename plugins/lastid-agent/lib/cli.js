@@ -1329,6 +1329,11 @@ async function cmdListen(flags) {
           throw new Error('ws not open');
         }
       },
+      // Self-heal auth: lets the drain create a conversation (invite the
+      // operator's devices) when none exists, instead of queuing forever.
+      idpUrl,
+      vcCompact: loaded.vcCompact,
+      signingKey,
     })
       .catch((err) =>
         process.stderr.write(`[lastid-agent] outbox drain failed: ${err.message}\n`),

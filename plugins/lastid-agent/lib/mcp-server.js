@@ -200,21 +200,16 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
     }
     const { resolveActiveGroupForOperator } = await import('./agent-groups.js');
     const { enqueueSend } = await import('./agent-send.js');
+    // No throw when there's no group: enqueue regardless. The listener
+    // (single MLS-state writer) self-heals on drain — if no conversation
+    // exists it creates one and invites the operator's devices, then
+    // delivers this message. Enqueue keyed by operator DID so the drain
+    // resolves the live group at send time.
     const group = await resolveActiveGroupForOperator({ scope, operatorDid });
-    if (!group) {
-      // No conversation yet. Agent-initiated group creation (fetch
-      // the operator's KeyPackage, create + invite) is a follow-up
-      // that must run in the listener (single MLS-state writer) and
-      // needs the create/export/add wrappers on the legacy client.
-      // Until then, the operator opens the chat first.
-      throw new Error(
-        'no active conversation with your operator yet — ask them to open the LastID chat with you first, then reply',
-      );
-    }
-    // Enqueue against the operator DID — the listener resolves the
-    // operator's current group at send time, so a rotated group is
-    // handled without the queued message getting stuck.
     const id = await enqueueSend({ scope, operatorDid, text });
+    const note = group
+      ? 'Encrypted + delivered by your listener within a couple seconds. The operator sees it in their console chat and on their phone.'
+      : "No conversation exists yet — your listener will establish one with the operator's devices, then deliver this. (If the listener isn't running, the message waits in the outbox until it is.)";
     return {
       content: [
         {
@@ -223,7 +218,8 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
             {
               queued: true,
               request_id: id,
-              note: 'Encrypted + delivered by your listener within a couple seconds. The operator sees it in their console chat and on their phone.',
+              establishing_conversation: !group,
+              note,
             },
             null,
             2,
