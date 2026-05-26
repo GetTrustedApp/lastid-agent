@@ -204,6 +204,16 @@ export class MlsClient {
   }
 
   /**
+   * Add several peers in ONE commit. `keyPackagesB64` is an array of base64
+   * KeyPackages. Returns parsed { commit_b64, welcome_b64, new_epoch } — one
+   * welcome + one commit covering all. Used by device-consistency reconcile
+   * to add every missing device of the operator at once. Persist after.
+   */
+  addMembers(groupIdB64, keyPackagesB64) {
+    return JSON.parse(this.#handle.addMembers(groupIdB64, JSON.stringify(keyPackagesB64)));
+  }
+
+  /**
    * Process an inbound message — application, commit, or proposal.
    * Returns the parsed `InboundResult` JSON. Application messages
    * include `application_b64` (the encrypted plaintext, base64);
@@ -281,4 +291,23 @@ export class MlsClient {
       // Already freed.
     }
   }
+}
+
+/**
+ * Device-consistency reconcile decision for one group member — runs the
+ * SHARED Rust planner (lastid-mls-membership) via wasm, so the agent decides
+ * exactly what native does. Input: { inventoryLeafCount, inventoryDeviceIds,
+ * activeInGroup, pendingInGroup, liveDeviceIds }. Returns
+ * { backfill_device_ids, evict_device_ids, add_device_ids, action }.
+ * No state, no I/O — the caller fetches the inputs and applies the result.
+ */
+export function computeMemberReconcilePlan(input) {
+  const payload = JSON.stringify({
+    inventory_leaf_count: input.inventoryLeafCount ?? 0,
+    inventory_device_ids: input.inventoryDeviceIds ?? [],
+    active_in_group: input.activeInGroup ?? [],
+    pending_in_group: input.pendingInGroup ?? [],
+    live_device_ids: input.liveDeviceIds ?? [],
+  });
+  return JSON.parse(wasm.computeMemberReconcilePlan(payload));
 }

@@ -113,6 +113,44 @@ export async function fetchPeerKeyPackages({
 }
 
 /**
+ * GET /v1/groups/:id/member-devices/:did — the IdP ledger's view of which of
+ * a member's devices are active in the group (and which are pending eviction).
+ * Non-consuming (unlike a key-package fetch). Used by device-consistency
+ * reconcile to diff against the member's live devices. Mirrors native
+ * `fetch_group_member_device_resolution`.
+ *
+ * @returns {Promise<{ known: boolean, activeDeviceIds: string[], pendingDeviceIds: string[] }>}
+ */
+export async function fetchGroupMemberDevices({
+  idpUrl,
+  groupId,
+  memberDid,
+  agentDid,
+  vcCompact,
+  signingKey,
+  fetchImpl,
+}) {
+  if (!groupId) throw new Error('fetchGroupMemberDevices: groupId required');
+  if (!memberDid) throw new Error('fetchGroupMemberDevices: memberDid required');
+  const body = await authedIdpFetch({
+    idpUrl,
+    method: 'GET',
+    path: `/v1/groups/${encodeURIComponent(groupId)}/member-devices/${encodeURIComponent(memberDid)}`,
+    agentDid,
+    vcCompact,
+    signingKey,
+    fetchImpl,
+  });
+  return {
+    known: body?.known === true,
+    activeDeviceIds: Array.isArray(body?.active_device_ids) ? body.active_device_ids : [],
+    pendingDeviceIds: Array.isArray(body?.pending_eviction_device_ids)
+      ? body.pending_eviction_device_ids
+      : [],
+  };
+}
+
+/**
  * POST /v1/groups — register a freshly-created group. `mlsGroupInitB64`
  * is the base64 TLS GroupInfo from `MlsClient.exportGroupInfo`; the IdP
  * hashes it to derive the canonical mls_group_id. Members are NOT added

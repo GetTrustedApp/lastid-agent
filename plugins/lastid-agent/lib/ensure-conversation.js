@@ -127,8 +127,11 @@ export async function ensureConversation({
     });
   }
 
-  // 5. Record so this + future sends resolve the group.
-  await d.recordGroup({ scope, idpGroupId: created.id, groupIdB64, operatorDid });
+  // 5. Record so this + future sends resolve the group — including which
+  //    operator devices we invited, the baseline device-consistency reconcile
+  //    diffs against.
+  const invitedDeviceIds = keyPackages.map((kp) => kp.deviceId).filter(Boolean)
+  await d.recordGroup({ scope, idpGroupId: created.id, groupIdB64, operatorDid, deviceIds: invitedDeviceIds });
   logLine(
     `[lastid-agent] established a conversation with the operator → group ${created.id} ` +
       `(invited ${keyPackages.length} device${keyPackages.length === 1 ? '' : 's'})`,

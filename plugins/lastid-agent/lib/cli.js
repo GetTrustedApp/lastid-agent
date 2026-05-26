@@ -1012,6 +1012,7 @@ async function cmdListen(flags) {
     { drainOutbox },
     { makeDoorbellHandler },
     { acquireListenerLock, releaseListenerLock },
+    { reconcileConversationDevices },
   ] = await Promise.all([
     import('./agent-provisioning.js'),
     import('./mls-client.js'),
@@ -1020,7 +1021,11 @@ async function cmdListen(flags) {
     import('./agent-send.js'),
     import('./agent-state-sync.js'),
     import('./listener-daemon.js'),
+    import('./reconcile-conversation.js'),
   ]);
+
+  // The agent's operator (parent human) — the only peer it reconciles against.
+  const operatorDid = decodeVcClaims(loaded.vcCompact)?.parent_human_did ?? null;
 
   // Single-instance enforcement. The listener is the single MLS-state writer
   // and the sole owner of the agent-state sync cursor for this scope; a second
@@ -1349,9 +1354,40 @@ async function cmdListen(flags) {
   }, OUTBOX_POLL_MS);
   if (typeof drainTimer.unref === 'function') drainTimer.unref();
 
+  // Device-consistency reconcile: periodically pick up NEW operator devices
+  // and add them to the conversation, so a device the operator added after
+  // the group was created can still read the agent's messages. Throttled (a
+  // per-device key-package fetch is involved) and best-effort; self-skips when
+  // there's no group yet (ensureConversation owns creation). The DECISION runs
+  // the shared planner — the same logic native uses.
+  const RECONCILE_INTERVAL_MS = 5 * 60_000;
+  let reconciling = false;
+  const reconcileTimer = setInterval(() => {
+    if (!wsOpen || reconciling || !operatorDid) return;
+    reconciling = true;
+    void reconcileConversationDevices({
+      scope,
+      mls,
+      agentDid: loaded.agentDid,
+      operatorDid,
+      idpUrl,
+      vcCompact: loaded.vcCompact,
+      signingKey,
+      log: (l) => process.stderr.write(`${l}\n`),
+    })
+      .catch((err) =>
+        process.stderr.write(`[lastid-agent] reconcile failed: ${err?.message ?? err}\n`),
+      )
+      .finally(() => {
+        reconciling = false;
+      });
+  }, RECONCILE_INTERVAL_MS);
+  if (typeof reconcileTimer.unref === 'function') reconcileTimer.unref();
+
   const shutdown = () => {
     process.stderr.write('[lastid-agent] shutting down\n');
     clearInterval(drainTimer);
+    clearInterval(reconcileTimer);
     clearInterval(loopMonitor);
     ws.stop();
     if (embedServer) { try { embedServer.close(); } catch { /* ignore */ } }

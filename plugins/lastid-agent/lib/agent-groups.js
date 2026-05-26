@@ -56,18 +56,29 @@ async function readAll(scope) {
  * a message-only refresh where we don't re-derive the openmls id —
  * an existing group_id_b64 is preserved in that case.
  */
-export async function recordGroup({ scope, idpGroupId, groupIdB64, operatorDid }) {
+export async function recordGroup({ scope, idpGroupId, groupIdB64, operatorDid, deviceIds }) {
   if (!idpGroupId) return;
   const all = await readAll(scope);
   const prior = all[idpGroupId] ?? {};
   all[idpGroupId] = {
     group_id_b64: groupIdB64 ?? prior.group_id_b64 ?? null,
     operator_did: operatorDid ?? prior.operator_did ?? null,
+    // Operator device ids the agent has added to this group — the local
+    // inventory device-consistency reconcile diffs against. Preserved across
+    // a message-only refresh (deviceIds omitted).
+    device_ids: Array.isArray(deviceIds) ? deviceIds : (prior.device_ids ?? []),
     updated_at: new Date().toISOString(),
   };
   const path = groupsPath(scope);
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(all, null, 2)}\n`, 'utf-8');
+}
+
+/** Operator device ids the agent has recorded as added to a group ([] if none/unknown). */
+export async function getGroupDeviceIds({ scope, idpGroupId }) {
+  const all = await readAll(scope);
+  const entry = all[idpGroupId];
+  return Array.isArray(entry?.device_ids) ? entry.device_ids : [];
 }
 
 /**
