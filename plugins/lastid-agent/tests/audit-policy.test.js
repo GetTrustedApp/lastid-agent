@@ -58,26 +58,29 @@ test('classForEvent: maps known events, null for unmapped', () => {
   assert.equal(classForEvent('AgentToolSucceeded'), 'tool_calls');
   assert.equal(classForEvent('AgentMemoryForgotten'), 'memory_writes');
   assert.equal(classForEvent('AgentMemoryRead'), 'memory_reads');
+  assert.equal(classForEvent('AgentCredentialInjected'), 'credential_use');
   assert.equal(classForEvent('AgentRuleFired'), 'rule_fires');
+  assert.equal(classForEvent('AgentFileRead'), 'file_access');
+  assert.equal(classForEvent('AgentFileWritten'), 'file_access');
+  assert.equal(classForEvent('MessageSent'), 'messages');
+  assert.equal(classForEvent('MessageReceived'), 'messages');
+  assert.equal(classForEvent('AgentSpawned'), 'sub_agents');
   assert.equal(classForEvent('ChainCheckpoint'), null, 'integrity events are unmapped → always audited');
   assert.equal(classForEvent('SomethingNew'), null);
 });
 
-test('taxonomy enumerates surfaces we do not emit yet (operator wants the toggles ready)', () => {
-  const byKey = Object.fromEntries(AUDIT_CLASSES.map((c) => [c.key, c]));
-  // Surfaces wired today.
-  assert.equal(byKey.tool_calls.emitted, true);
-  assert.equal(byKey.memory_writes.emitted, true);
-  // Surfaces NOT emitted yet but present so a toggle exists + governs on wire-up.
-  assert.equal(byKey.memory_reads.emitted, false);
-  assert.equal(byKey.credential_use.emitted, false);
-  assert.equal(byKey.messages.emitted, false);
-  assert.equal(byKey.sub_agents.emitted, false);
-  // Every class maps at least one event_type, and every event maps back.
+test('every auditable surface is WIRED (no "soon"): emitted true + round-trips', () => {
+  // The operator: these can\'t be "soon" — every class must actually emit.
   for (const c of AUDIT_CLASSES) {
+    assert.equal(c.emitted, true, `${c.key} must be wired (emitted)`);
     assert.ok(c.events.length > 0, `${c.key} has events`);
     for (const ev of c.events) assert.equal(classForEvent(ev), c.key);
   }
+  // High-volume reads default OFF (opt-in); everything else on.
+  const byKey = Object.fromEntries(AUDIT_CLASSES.map((c) => [c.key, c]));
+  assert.equal(byKey.memory_reads.default, false);
+  assert.equal(byKey.file_access.default, false);
+  assert.equal(byKey.tool_calls.default, true);
 });
 
 test('isAuditEnabled: no policy → taxonomy defaults; unmapped always on', () => {

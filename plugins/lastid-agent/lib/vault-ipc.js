@@ -47,7 +47,7 @@ export function vaultSocketPath(scope = 'main') {
  *   recordUse(kind,handle) optional timing hook ('mint' | 'consume')
  */
 export async function handleVaultRequest(req, deps) {
-  const { agentDid, resolveShare, resolveSecret, genHandleKeypair, handles, fetchImpl, recordUse, now, rateTracker = defaultRateTracker } = deps;
+  const { agentDid, resolveShare, resolveSecret, genHandleKeypair, handles, fetchImpl, recordUse, audit, now, rateTracker = defaultRateTracker } = deps;
   const clock = typeof now === 'function' ? now : () => Date.now();
   const op = req?.op;
 
@@ -241,6 +241,28 @@ export async function handleVaultRequest(req, deps) {
         status: response && 'status' in response ? response.status : null,
         outcome: response?.ok ? 'ok' : (response?.error ?? 'error'),
       });
+      // Audit chain: a credential was injected at the network boundary (the
+      // 'credential_use' class). Non-sensitive only — item id, destination host,
+      // injection kind, HTTP status, outcome, and the credentialed window. NEVER
+      // the secret. Gated + spooled by the injected audit() (audit-policy.js).
+      try {
+        let host = null;
+        try {
+          host = new URL(req.url).host;
+        } catch {
+          /* unparseable url → no host */
+        }
+        audit?.('AgentCredentialInjected', {
+          item_id: h.itemId,
+          host,
+          injection: content?.injection?.type ?? null,
+          status: response && 'status' in response ? response.status : null,
+          outcome: response?.ok ? 'ok' : (response?.error ?? 'error'),
+          credentialed_ms: metrics.credentialed_ms,
+        });
+      } catch {
+        /* audit is best-effort — never disrupt the use path */
+      }
     }
   }
 

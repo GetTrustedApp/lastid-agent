@@ -42,6 +42,7 @@ import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { resolveActiveGroupForOperator } from './agent-groups.js';
+import { enqueueAuditEvent } from './audit-spool.js';
 
 function outboxPath(scope) {
   return join(homedir(), '.lastid-agent', scope ?? 'main', 'outbox.jsonl');
@@ -217,4 +218,15 @@ async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, sig
       message_id: req.id,
     },
   });
+  // Audit chain: an outbound message to the operator (the 'messages' class).
+  // NON-sensitive — never the text; only that a message was sent + its id/epoch.
+  try {
+    enqueueAuditEvent({
+      scope,
+      eventType: 'MessageSent',
+      metadata: { to: 'operator', message_id: req.id, epoch: Number.isFinite(epoch) ? epoch : 0 },
+    });
+  } catch {
+    /* best-effort */
+  }
 }

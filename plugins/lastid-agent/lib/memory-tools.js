@@ -389,16 +389,25 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
       }
       case 'lastid_memory_get': {
         const m = store.get(args.id);
+        // Reads are audited under the 'memory_reads' class (default off, high-
+        // volume — the operator opts in). No claim text, only the id + op.
+        audit('AgentMemoryRead', args.id, { op: 'get', found: String(!!m) });
         return m ? ok({ memory: publicView(m) }) : err(`no memory with id ${args.id}`);
       }
-      case 'lastid_memory_list':
-        return ok({ memories: store.list(args).map(publicView) });
+      case 'lastid_memory_list': {
+        const memories = store.list(args).map(publicView);
+        audit('AgentMemoryRead', null, { op: 'list', count: memories.length });
+        return ok({ memories });
+      }
       case 'lastid_memory_search': {
         const hits = await searchMemories(store, args.query, {
           limit: Number.isInteger(args.limit) ? args.limit : 8,
           excludeBedrock: args.exclude_bedrock === true,
           embedder: makeEmbedder({ scope }),
         });
+        // Audit the read, not the query text (could be sensitive) — only its
+        // length + the hit count.
+        audit('AgentMemoryRead', null, { op: 'search', query_len: String(args.query ?? '').length, hits: hits.length });
         return ok({ query: args.query, hits });
       }
       case 'lastid_memory_update': {

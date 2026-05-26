@@ -52,8 +52,8 @@ export const AUDIT_CLASSES = [
     key: 'memory_reads',
     label: 'Memory reads',
     description: 'The agent searching or reading its memory (high-volume).',
-    default: false,
-    emitted: false,
+    default: false, // opt-in: high-volume, low-signal
+    emitted: true,
     events: ['AgentMemoryRead'],
   },
   {
@@ -61,7 +61,7 @@ export const AUDIT_CLASSES = [
     label: 'Credential use',
     description: 'Minting a vault handle and injecting a credential at the network boundary.',
     default: true,
-    emitted: false,
+    emitted: true,
     events: ['AgentCredentialInjected'],
   },
   {
@@ -73,11 +73,19 @@ export const AUDIT_CLASSES = [
     events: ['AgentRuleFired'],
   },
   {
+    key: 'file_access',
+    label: 'File access',
+    description: 'Files the agent reads or writes (path + change size; opt-in, high-volume).',
+    default: false, // opt-in: tool_calls already records file ops; this is the richer file view
+    emitted: true,
+    events: ['AgentFileRead', 'AgentFileWritten'],
+  },
+  {
     key: 'messages',
     label: 'Messages',
     description: 'Messages the agent sends to or receives from the operator.',
     default: true,
-    emitted: false,
+    emitted: true,
     events: ['MessageSent', 'MessageReceived'],
   },
   {
@@ -85,7 +93,7 @@ export const AUDIT_CLASSES = [
     label: 'Sub-agents',
     description: 'When the agent spawns a delegated sub-agent.',
     default: true,
-    emitted: false,
+    emitted: true,
     events: ['AgentSpawned'],
   },
 ];

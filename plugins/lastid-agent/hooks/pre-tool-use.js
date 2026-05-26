@@ -265,6 +265,14 @@ if (toolName === 'Task') {
         `sub-agent auto-enrollment is pending FFI bindings\n`,
     );
 
+    // Audit chain: a delegated sub-agent was spawned (the 'sub_agents' class).
+    // Gated + spooled by audit-policy; non-sensitive (the sub-agent class only).
+    try {
+      enqueueAuditEvent({ scope: activeScope, eventType: 'AgentSpawned', metadata: { subagent_class: classSlug } });
+    } catch {
+      /* best-effort */
+    }
+
     contextParts.push(note);
   }
 }

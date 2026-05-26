@@ -56,8 +56,49 @@ if (toolName || toolUseId) {
   } catch {
     /* audit is best-effort — never disrupt the turn */
   }
+
+  // file_access class: a richer, file-specific record (path + change size) for
+  // the file tools — distinct from the generic tool_calls event so the operator
+  // can audit file activity separately. Only on success; NEVER the file content,
+  // only a path + a byte/char delta. Gated by the policy (default off — opt-in).
+  if (!failed) {
+    try {
+      const fileEvent = fileAccessEvent(toolName, event?.tool_input ?? event?.toolInput ?? {});
+      if (fileEvent) {
+        enqueueAuditEvent({ scope: resolveScope(), eventType: fileEvent.eventType, metadata: fileEvent.metadata, toolUseId });
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
 }
 process.exit(0);
+
+// Map a file tool + its input to a file_access event (path + change size, no
+// content). Returns null for non-file tools. Path basename only would lose
+// context the operator wants, so we keep the path but never the bytes.
+function fileAccessEvent(tool, input) {
+  const path = typeof input?.file_path === 'string' ? input.file_path
+    : typeof input?.notebook_path === 'string' ? input.notebook_path
+    : null;
+  if (!path) return null;
+  const len = (v) => (typeof v === 'string' ? v.length : 0);
+  switch (tool) {
+    case 'Read':
+    case 'NotebookRead':
+      return { eventType: 'AgentFileRead', metadata: { path } };
+    case 'Write':
+      return { eventType: 'AgentFileWritten', metadata: { path, op: 'write', bytes: len(input?.content) } };
+    case 'Edit':
+      return { eventType: 'AgentFileWritten', metadata: { path, op: 'edit', delta: len(input?.new_string) - len(input?.old_string) } };
+    case 'MultiEdit':
+      return { eventType: 'AgentFileWritten', metadata: { path, op: 'multiedit', edits: Array.isArray(input?.edits) ? input.edits.length : 0 } };
+    case 'NotebookEdit':
+      return { eventType: 'AgentFileWritten', metadata: { path, op: 'notebook_edit' } };
+    default:
+      return null;
+  }
+}
 
 function safeStringify(v) {
   try {

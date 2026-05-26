@@ -1333,6 +1333,7 @@ async function cmdListen(flags) {
       { genVaultHandleKeypair, openWithHandle },
       { VaultHandleStore },
       { OperatorStore },
+      { enqueueAuditEvent },
     ] = await Promise.all([
       import('./vault-ipc.js'),
       import('./vault-cache.js'),
@@ -1341,6 +1342,7 @@ async function cmdListen(flags) {
       import('./sdk-bindings.js'),
       import('./vault-handle-store.js'),
       import('./operator-store.js'),
+      import('./audit-spool.js'),
     ]);
     const vaultHandles = new VaultHandleStore();
     const r = await startVaultServer({
@@ -1403,6 +1405,9 @@ async function cmdListen(flags) {
             metrics: m,
           });
         },
+        // Audit chain: a credential injection event (gated by the
+        // 'credential_use' class). enqueue → the listener drains its own spool.
+        audit: (eventType, metadata) => enqueueAuditEvent({ scope, eventType, metadata }),
       },
     });
     vaultServer = r.server ?? null;

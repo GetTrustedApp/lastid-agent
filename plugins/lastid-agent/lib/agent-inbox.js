@@ -26,6 +26,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { OperatorStore, redactMatches } from './operator-store.js';
+import { enqueueAuditEvent } from './audit-spool.js';
 
 function inboxPath(scope) {
   return join(homedir(), '.lastid-agent', scope ?? 'main', 'operator-inbox.jsonl');
@@ -108,12 +109,25 @@ export async function readUnreadMessages({ scope } = {}) {
           : null;
     if (!text) continue;
     const enforced = enforceInbound(store, text);
+    const groupId = rec.group_id_b64 ?? rec.idp_group_id ?? '?';
     items.push({
-      group_id: rec.group_id_b64 ?? rec.idp_group_id ?? '?',
+      group_id: groupId,
       received_at: rec.received_at ?? '',
       text: enforced.text,
       ...(enforced.policy_action ? { policy_action: enforced.policy_action } : {}),
     });
+    // Audit chain: an inbound operator message (the 'messages' class). The
+    // cursor advances past each line, so a message is surfaced + audited once.
+    // NON-sensitive — never the text; only that one arrived (+ any policy action).
+    try {
+      enqueueAuditEvent({
+        scope,
+        eventType: 'MessageReceived',
+        metadata: { from: 'operator', group_id: groupId, ...(enforced.policy_action ? { policy_action: enforced.policy_action } : {}) },
+      });
+    } catch {
+      /* best-effort */
+    }
   }
 
   // Advance past every line scanned (not just chat ones) so non-chat
