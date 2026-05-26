@@ -1,0 +1,98 @@
+/**
+ * Local cache of the agent's vault SHARES — stored SEALED at rest.
+ *
+ * The agent holds `vault:use`, never `read`: the credential secret stays
+ * encrypted on disk (the same slot_seed-sealed blob the operator published) and
+ * is unfurled ONLY by the listener at inject time. The sync writes sealed blobs
+ * here without decrypting; `vault_list` decodes on demand and returns metadata
+ * via `vaultListView`, which DROPS the secret. A regression that persists or
+ * returns the plaintext secret would put a credential in the LLM's context —
+ * the whole thing this design prevents.
+ *
+ * Single-writer: the listener's agent-state sync owns writes (same posture as
+ * the operator-store / groups map). Stored at
+ * `~/.lastid-agent/<scope>/vault-shares.json`, one entry per share id.
+ */
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { homedir } from 'node:os';
+
+export function vaultCachePath(scope = 'main') {
+  return join(homedir(), '.lastid-agent', scope ?? 'main', 'vault-shares.json');
+}
+
+function readAll(scope) {
+  try {
+    const obj = JSON.parse(readFileSync(vaultCachePath(scope), 'utf8'));
+    return obj && typeof obj === 'object' ? obj : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeAll(scope, obj) {
+  const p = vaultCachePath(scope);
+  mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
+  const tmp = `${p}.tmp`;
+  writeFileSync(tmp, JSON.stringify(obj), { mode: 0o600 });
+  renameSync(tmp, p);
+}
+
+/**
+ * Apply synced vault records. Active → upsert the SEALED blob + routing
+ * metadata (never decrypted here); revoked → delete (the agent drops it).
+ * Returns the number of entries changed. Malformed records are skipped.
+ */
+export function applyVaultRecords(scope, records) {
+  const all = readAll(scope);
+  let changed = 0;
+  for (const r of records ?? []) {
+    if (!r || typeof r.id !== 'string' || r.id.length === 0) continue;
+    if (r.status === 'revoked') {
+      if (all[r.id]) {
+        delete all[r.id];
+        changed += 1;
+      }
+      continue;
+    }
+    if (typeof r.enc_b64 !== 'string' || r.enc_b64.length === 0) continue;
+    all[r.id] = {
+      id: r.id,
+      version: Number.isInteger(r.version) ? r.version : 0,
+      status: 'active',
+      enc_b64: r.enc_b64, // SEALED — never decrypted at rest
+      for_agent_did: r.for_agent_did ?? r.target ?? null,
+      updated_at: r.updated_at ?? null,
+    };
+    changed += 1;
+  }
+  if (changed > 0) writeAll(scope, all);
+  return changed;
+}
+
+/** All cached sealed shares (newest write order not guaranteed). */
+export function listVaultCache(scope = 'main') {
+  return Object.values(readAll(scope));
+}
+
+/** One cached sealed share by id, or null. */
+export function getVaultShare(scope, id) {
+  return readAll(scope)[id] ?? null;
+}
+
+/**
+ * Metadata-only view of a DECODED vault bundle — DROPS the secret. This is the
+ * ONLY shape `vault_list` may return to the agent. Keep this the single choke
+ * point: never spread the raw decoded bundle into a tool result.
+ */
+export function vaultListView(decoded, id = null) {
+  const bundle = decoded && typeof decoded === 'object' ? decoded : {};
+  // Explicitly pull the secret OUT so it can't ride along, whatever else the
+  // bundle carries.
+  const { secret, ...meta } = bundle;
+  return {
+    id: id ?? meta.item_id ?? null,
+    ...meta,
+    has_secret: typeof secret === 'string' && secret.length > 0,
+  };
+}
