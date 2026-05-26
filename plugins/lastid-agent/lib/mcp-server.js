@@ -194,8 +194,17 @@ export async function handleLocalVault({ name, args, scope, loadedAgent, signing
       });
       return wrap(resp, resp?.error != null);
     }
-    // vault_use — pass the clock so time-window constraints evaluate against now.
-    let resp = await vaultRequest(scope, { op: 'vault_use', item_id: args.item_id, ctx: { now_ms: Date.now() } });
+    // vault_use — pass the clock (time-window constraints) AND the working-
+    // context scope map so scope_required constraints can match where the agent
+    // is working (repo/cwd/host). Without the scope, a scoped share always
+    // denies. Built from the sticky last-project + this cwd's git fingerprint.
+    const { buildVaultUseScope } = await import('./vault-scope.js');
+    const useScope = buildVaultUseScope({ scope });
+    let resp = await vaultRequest(scope, {
+      op: 'vault_use',
+      item_id: args.item_id,
+      ctx: { now_ms: Date.now(), scope: useScope },
+    });
     if (resp?.policy_approval_required === true && signingSeed) {
       const outcome = await runApprovalLoop({
         approvalBody: resp,
@@ -208,7 +217,7 @@ export async function handleLocalVault({ name, args, scope, loadedAgent, signing
         resp = await vaultRequest(scope, {
           op: 'vault_use',
           item_id: args.item_id,
-          ctx: { now_ms: Date.now() },
+          ctx: { now_ms: Date.now(), scope: useScope },
           approved: true,
           approval_id: outcome.retryArgs.approval_id,
         });
