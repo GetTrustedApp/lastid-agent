@@ -78,6 +78,20 @@ const DECAY_BY_KIND = {
 const CLAIM_MAX = 4000;
 const SUMMARY_MAX = 600;
 
+/**
+ * The `summary` is an OPTIONAL convenience field (the `claim` is the real
+ * content). So an over-long summary must NEVER block a write/update — we CLAMP
+ * it to SUMMARY_MAX, the same way bug-report slices its fields. Hard-rejecting
+ * here was a footgun: callers can't predict the exact length and end up looping
+ * on "summary exceeds 600". Trims, then truncates; empty → undefined.
+ */
+export function clampSummary(raw) {
+  if (typeof raw !== 'string') return undefined;
+  const t = raw.trim();
+  if (t.length === 0) return undefined;
+  return t.length > SUMMARY_MAX ? t.slice(0, SUMMARY_MAX) : t;
+}
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 export function memoryStatePath(scope = 'main') {
@@ -155,11 +169,8 @@ function validateWriteInput(input) {
   const claim = typeof input.claim === 'string' ? input.claim.trim() : '';
   if (!claim) errs.push('claim is required');
   if (claim.length > CLAIM_MAX) errs.push(`claim exceeds ${CLAIM_MAX} chars`);
-  const summary =
-    typeof input.summary === 'string' && input.summary.trim().length > 0
-      ? input.summary.trim()
-      : undefined;
-  if (summary && summary.length > SUMMARY_MAX) errs.push(`summary exceeds ${SUMMARY_MAX} chars`);
+  // Optional summary — clamp (never reject): the claim is the real content.
+  const summary = clampSummary(input.summary);
   const sourceKind = input.source_kind;
   if (!SOURCE_KINDS.includes(sourceKind)) {
     errs.push(`source_kind must be one of ${SOURCE_KINDS.join('|')}`);
@@ -362,8 +373,9 @@ export class MemoryStore {
       m.claim = c;
     }
     if (patch.summary !== undefined) {
-      const s = typeof patch.summary === 'string' ? patch.summary.trim() : '';
-      if (s.length > SUMMARY_MAX) throw Object.assign(new Error(`summary exceeds ${SUMMARY_MAX}`), { code: 'EVALIDATION' });
+      // Clamp, don't reject (same as the write path) — an over-long optional
+      // summary must never block an update.
+      const s = clampSummary(patch.summary) ?? '';
       if (s !== (m.summary ?? '')) embeddingDirty = true;
       if (s) m.summary = s;
       else delete m.summary;

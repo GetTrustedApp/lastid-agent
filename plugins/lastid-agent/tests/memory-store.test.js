@@ -72,6 +72,23 @@ test('write: validation rejects empty subject / claim / bad kind', () => {
   assert.throws(() => s.write({ ...baseWrite, claim: 'x'.repeat(4001) }), /4000/);
 });
 
+test('write: an over-long summary is CLAMPED to 600, never rejected (footgun fix)', () => {
+  const s = freshStore();
+  // 700-char summary must NOT throw — it's an optional convenience field.
+  const m = s.write({ ...baseWrite, summary: 'y'.repeat(700) });
+  assert.equal(m.summary.length, 600, 'summary clamped to 600');
+});
+
+test('update: an over-long summary is CLAMPED, not rejected', () => {
+  const s = freshStore();
+  const m = s.write(baseWrite);
+  const u = s.update(m.id, { summary: 'z'.repeat(900) });
+  assert.equal(u.summary.length, 600, 'updated summary clamped to 600');
+  // a whitespace-only summary clears it (not stored)
+  const u2 = s.update(m.id, { summary: '   ' });
+  assert.equal(u2.summary, undefined);
+});
+
 // ── sensitivity escalation ─────────────────────────────────────────
 
 test('escalateSensitivity: raises to high on credential-ish content, never downgrades', () => {
