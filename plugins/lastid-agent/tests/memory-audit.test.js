@@ -36,6 +36,45 @@ test('canonicalJson: deterministic key order', () => {
   assert.equal(canonicalJson({ a: { y: 1, x: 2 } }), '{"a":{"x":2,"y":1}}');
 });
 
+test('integrity_hash is blake3 over canonicalJson(core) — cross-runtime vector', async () => {
+  const { blake3 } = await import('@noble/hashes/blake3.js');
+  const { bytesToHex } = await import('@noble/hashes/utils.js');
+  // FIXED-CORE VECTOR — the console validator (TS, same @noble/hashes blake3
+  // over the same canonicalJson) MUST produce this identical hash. If either
+  // side drifts (canonicalJson shape, hash algo), this catches it.
+  const core = {
+    seq: 0,
+    timestamp: '2026-01-01T00:00:00.000Z',
+    agent_did: 'did:lastid:agent:zTEST',
+    event_type: 'AgentMemoryWritten',
+    memory_id: 'mem_1',
+    metadata: { kind: 'fact' },
+    prev_hash: null,
+  };
+  const hex = bytesToHex(blake3(Buffer.from(canonicalJson(core), 'utf-8')));
+  assert.strictEqual(hex, '3219c54bcc8526ad08c846ed57f686fc03227cc6c6e44f01616289f341e11431');
+
+  // An appended record's integrity_hash is blake3 over its own core (proves the
+  // chain uses blake3, not the old sha256).
+  const { scope, dir } = freshScope();
+  try {
+    const r = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: 'did:a', eventType: 'AgentMemoryWritten', memoryId: 'm', metadata: {} });
+    const rcore = {
+      seq: r.seq,
+      timestamp: r.timestamp,
+      agent_did: r.agent_did,
+      event_type: r.event_type,
+      memory_id: r.memory_id,
+      metadata: r.metadata,
+      prev_hash: r.prev_hash,
+    };
+    assert.strictEqual(r.integrity_hash, bytesToHex(blake3(Buffer.from(canonicalJson(rcore), 'utf-8'))));
+    assert.strictEqual(r.integrity_hash.length, 64, 'blake3-256 hex is 64 chars');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('append builds a signed, hash-linked chain that verifies', () => {
   const { scope, dir } = freshScope();
   try {

@@ -4,9 +4,11 @@
  *
  * Every memory CUD (write/draft/update/forget/promote) appends a record to an
  * append-only chain at ~/.lastid-agent/<scope>/memory-audit.jsonl. Each record
- * is sha256-linked to its predecessor (prev_hash) and Ed25519-signed with the
+ * is blake3-linked to its predecessor (prev_hash) and Ed25519-signed with the
  * agent's stable key (deriveAgentEd25519Keypair) — tamper-evident + provenance-
- * attributed, the same guarantees the desktop chain gave.
+ * attributed, the same guarantees the desktop chain gave. Each agent ships its
+ * OWN chain to the IdP; the console validates it (same @noble/hashes blake3
+ * over the same canonicalJson, so the hash is reproducible cross-runtime).
  *
  * The records carry only NON-SENSITIVE metadata (event_type, memory_id, kind,
  * bedrock, fields_changed, hard_delete, reason) — never the memory claim — so
@@ -16,7 +18,9 @@
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { createHash, sign as edSign, verify as edVerify, createPublicKey } from 'node:crypto';
+import { sign as edSign, verify as edVerify, createPublicKey } from 'node:crypto';
+import { blake3 } from '@noble/hashes/blake3.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 
 export function memoryAuditPath(scope = 'main') {
   return join(homedir(), '.lastid-agent', scope ?? 'main', 'memory-audit.jsonl');
@@ -25,8 +29,11 @@ function shipCursorPath(scope = 'main') {
   return join(homedir(), '.lastid-agent', scope ?? 'main', 'memory-audit-cursor.json');
 }
 
-function sha256Hex(buf) {
-  return createHash('sha256').update(buf).digest('hex');
+/** blake3 hex — the agent's own chain uses blake3 (matching the SDK's audit
+ *  chaining algorithm), validated cross-runtime by the console with the same
+ *  @noble/hashes blake3 over the same canonicalJson bytes. */
+function blake3Hex(buf) {
+  return bytesToHex(blake3(buf));
 }
 
 /** Deterministic JSON (sorted keys, recursive) so the signed/hashed bytes are
@@ -83,7 +90,7 @@ export function appendMemoryAudit({ scope = 'main', signingKey, agentDid = null,
     prev_hash: prev ? prev.integrity_hash : null,
   };
   const bytes = Buffer.from(canonicalJson(core), 'utf-8');
-  const integrity_hash = sha256Hex(bytes);
+  const integrity_hash = blake3Hex(bytes);
   let signature = null;
   if (signingKey) {
     try {
@@ -100,7 +107,7 @@ export function appendMemoryAudit({ scope = 'main', signingKey, agentDid = null,
 }
 
 /**
- * Verify the chain: each record's integrity_hash matches sha256(canonical
+ * Verify the chain: each record's integrity_hash matches blake3(canonical
  * core), prev_hash links correctly, and (when publicKey given) the Ed25519
  * signature verifies. Returns { intact, total, firstFailure? }.
  */
@@ -119,7 +126,7 @@ export function verifyMemoryAudit(scope = 'main', publicKey = null) {
       prev_hash: r.prev_hash ?? null,
     };
     const bytes = Buffer.from(canonicalJson(core), 'utf-8');
-    if (sha256Hex(bytes) !== r.integrity_hash) {
+    if (blake3Hex(bytes) !== r.integrity_hash) {
       return { intact: false, total: all.length, firstFailure: { seq: r.seq, kind: 'integrity_hash_mismatch' } };
     }
     if ((r.prev_hash ?? null) !== prevHash) {
