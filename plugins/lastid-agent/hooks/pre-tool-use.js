@@ -79,7 +79,7 @@ if (toolName) {
     const CAP = 4000;
     enqueueAuditEvent({
       scope: activeScope,
-      eventType: 'tool_call',
+      eventType: 'AgentToolInvoked',
       metadata: {
         tool: toolName,
         input: text.length > CAP ? text.slice(0, CAP) : text,

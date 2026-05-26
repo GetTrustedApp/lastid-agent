@@ -43,7 +43,7 @@ if (toolName || toolUseId) {
     const { text, count } = redactSecrets(asText);
     enqueueAuditEvent({
       scope: resolveScope(),
-      eventType: 'tool_result',
+      eventType: failed ? 'AgentToolFailed' : 'AgentToolSucceeded',
       metadata: {
         tool: toolName,
         status: failed ? 'error' : 'success',
