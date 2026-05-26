@@ -421,9 +421,33 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
       case 'lastid_memory_forget': {
         const before = store.get(args.id);
         if (!before) return err(`no memory with id ${args.id}`);
+        // A project-tier tombstone publishes to the SHARED project record, which
+        // needs the routing id derived from project_root_seed + project_key —
+        // same requirement as writing one. Guard the missing seed with the real
+        // reason (else publishAgentMemory fails with a misleading generic
+        // "server write failed").
+        if (before.tier === 'project' && !Buffer.isBuffer(loadedAgent.projectRootSeed)) {
+          return err(
+            "can't forget a project-tier memory: no project_root_seed is loaded for this agent in this session. " +
+              'If you just (re)provisioned, restart the session to pick it up; otherwise this agent predates project memories and needs reprovisioning.',
+          );
+        }
         const tombVersion = (Number(before.version) || 1) + 1;
         // Revoke at the IdP first; only drop locally once the server confirms.
-        if (!(await live({ id: args.id, tier: before.tier ?? 'agent', version: tombVersion }, 'revoked'))) {
+        // Carry project_key so a project-tier tombstone routes to the shared
+        // record — omitting it made EVERY project-tier forget fail to reach the
+        // server (publishAgentMemory can't derive the routing id without it).
+        if (
+          !(await live(
+            {
+              id: args.id,
+              tier: before.tier ?? 'agent',
+              ...(before.project_key ? { project_key: before.project_key } : {}),
+              version: tombVersion,
+            },
+            'revoked',
+          ))
+        ) {
           return notSaved('the forget did not reach the server');
         }
         store.forget(args.id, { hard: args.hard_delete === true });

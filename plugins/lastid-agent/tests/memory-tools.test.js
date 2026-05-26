@@ -83,6 +83,83 @@ test('a project-tier write WITH a project_root_seed passes the seed guard and pr
   }
 });
 
+// REGRESSION (project forget dropped project_key): the forget case published the
+// tombstone as { id, tier, version } with NO project_key, so a project-tier
+// tombstone couldn't derive its routing id → publishAgentMemory failed → every
+// project-tier forget returned "the forget did not reach the server". The draft
+// path worked (it carried the full record). These lock the fix.
+test('REGRESSION: forgetting a project-tier memory carries project_key so the tombstone routes + reaches the server', async () => {
+  const { scope, cleanup } = withScope();
+  const seeded = { ...loadedAgent, projectRootSeed: Buffer.alloc(32, 9) };
+  const posts = [];
+  const capturingFetch = async (_url, opts) => {
+    if (opts?.body) posts.push(JSON.parse(opts.body));
+    return { ok: true, status: 200 };
+  };
+  try {
+    const w = await handleMemoryTool({
+      name: 'lastid_memory_write',
+      args: { kind: 'fact', subject: ['x'], claim: 'project thing to forget', source_kind: 'inferred', tier: 'project', project_key: 'github.com/acme/widgets' },
+      scope, loadedAgent: seeded, claims, fetchImpl: capturingFetch,
+    });
+    assert.equal(body(w).ok, true);
+    const id = body(w).memory.id;
+    posts.length = 0; // only inspect the forget's POST(s)
+
+    const f = await handleMemoryTool({
+      name: 'lastid_memory_forget',
+      args: { id, reason: 'test cleanup', hard_delete: true },
+      scope, loadedAgent: seeded, claims, fetchImpl: capturingFetch,
+    });
+    assert.equal(f.isError ?? false, false, 'a project forget must reach the server, not fail');
+    assert.equal(body(f).ok, true);
+    const revoke = posts.find((p) => p && p.status === 'revoked');
+    assert.ok(revoke, 'a revoke tombstone was POSTed');
+    assert.equal(revoke.target, 'project');
+    assert.equal(typeof revoke.routing_id, 'string', 'tombstone routes to the project record');
+  } finally {
+    cleanup();
+  }
+});
+
+test('forgetting an agent-tier memory still reaches the server (fix did not regress non-project)', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const w = await call('lastid_memory_write', { kind: 'fact', subject: ['x'], claim: 'agent thing', source_kind: 'inferred' }, scope);
+    const id = body(w).memory.id;
+    const f = await call('lastid_memory_forget', { id, reason: 'cleanup' }, scope);
+    assert.equal(f.isError ?? false, false);
+    assert.equal(body(f).ok, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test('forgetting a project-tier memory WITHOUT a project_root_seed refuses with the real reason (not the generic failure)', async () => {
+  const { scope, cleanup } = withScope();
+  const seeded = { ...loadedAgent, projectRootSeed: Buffer.alloc(32, 9) };
+  try {
+    // Write it WITH a seed (so it exists), then attempt to forget it from a
+    // session that has NO seed loaded.
+    const w = await handleMemoryTool({
+      name: 'lastid_memory_write',
+      args: { kind: 'fact', subject: ['x'], claim: 'p', source_kind: 'inferred', tier: 'project', project_key: 'github.com/acme/widgets' },
+      scope, loadedAgent: seeded, claims, fetchImpl: okFetch,
+    });
+    const id = body(w).memory.id;
+    const f = await handleMemoryTool({
+      name: 'lastid_memory_forget',
+      args: { id, reason: 'x' },
+      scope, loadedAgent, claims, fetchImpl: okFetch, // no projectRootSeed
+    });
+    assert.equal(f.isError, true);
+    assert.match(body(f).error, /project_root_seed/);
+    assert.doesNotMatch(body(f).error, /did not reach the server/);
+  } finally {
+    cleanup();
+  }
+});
+
 // REGRESSION (made-up repos / bifurcation): the agent used to supply project_key
 // and HALLUCINATED it (github.com/LastID/lastid.co vs the real
 // github.com/GetTrustedApp/lastid.co); the old "pass project_key" error invited
