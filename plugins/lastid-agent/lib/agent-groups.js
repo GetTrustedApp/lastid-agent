@@ -56,7 +56,7 @@ async function readAll(scope) {
  * a message-only refresh where we don't re-derive the openmls id —
  * an existing group_id_b64 is preserved in that case.
  */
-export async function recordGroup({ scope, idpGroupId, groupIdB64, operatorDid, deviceIds }) {
+export async function recordGroup({ scope, idpGroupId, groupIdB64, operatorDid, deviceIds, deviceLeaves }) {
   if (!idpGroupId) return;
   const all = await readAll(scope);
   const prior = all[idpGroupId] ?? {};
@@ -67,6 +67,13 @@ export async function recordGroup({ scope, idpGroupId, groupIdB64, operatorDid, 
     // inventory device-consistency reconcile diffs against. Preserved across
     // a message-only refresh (deviceIds omitted).
     device_ids: Array.isArray(deviceIds) ? deviceIds : (prior.device_ids ?? []),
+    // device_id → MLS leaf index, captured at add time (from the wasm's
+    // assigned_leaf_indices). Needed to evict a specific device — the DID
+    // credential is ambiguous across a member's leaves. Merged with prior.
+    device_leaves:
+      deviceLeaves && typeof deviceLeaves === 'object'
+        ? { ...(prior.device_leaves ?? {}), ...deviceLeaves }
+        : (prior.device_leaves ?? {}),
     updated_at: new Date().toISOString(),
   };
   const path = groupsPath(scope);
@@ -79,6 +86,13 @@ export async function getGroupDeviceIds({ scope, idpGroupId }) {
   const all = await readAll(scope);
   const entry = all[idpGroupId];
   return Array.isArray(entry?.device_ids) ? entry.device_ids : [];
+}
+
+/** device_id → leaf-index map the agent recorded for a group ({} if none). */
+export async function getGroupDeviceLeaves({ scope, idpGroupId }) {
+  const all = await readAll(scope);
+  const entry = all[idpGroupId];
+  return entry?.device_leaves && typeof entry.device_leaves === 'object' ? entry.device_leaves : {};
 }
 
 /**

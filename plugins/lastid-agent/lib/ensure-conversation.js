@@ -112,9 +112,14 @@ export async function ensureConversation({
   //    device, and the IdP fans the commit out to members already added.
   //    Add them one at a time so a mid-loop failure leaves a smaller-but-
   //    consistent group (the message still rides it) rather than nothing.
+  const deviceLeaves = {};
   for (const kp of keyPackages) {
     const add = mls.addMember(groupIdB64, kp.keyPackageB64);
     await mls.persist();
+    // Capture device_id → leaf_index (from the wasm's assigned_leaf_indices)
+    // so a later reconcile can evict this device precisely.
+    const leaf = Array.isArray(add.assigned_leaf_indices) ? add.assigned_leaf_indices[0] : undefined;
+    if (kp.deviceId && typeof leaf === 'number') deviceLeaves[kp.deviceId] = leaf;
     await d.addGroupMember({
       idpUrl,
       groupId: created.id,
@@ -128,10 +133,10 @@ export async function ensureConversation({
   }
 
   // 5. Record so this + future sends resolve the group — including which
-  //    operator devices we invited, the baseline device-consistency reconcile
-  //    diffs against.
+  //    operator devices we invited (the reconcile baseline) and their leaf
+  //    indices (so reconcile can later evict a specific device).
   const invitedDeviceIds = keyPackages.map((kp) => kp.deviceId).filter(Boolean)
-  await d.recordGroup({ scope, idpGroupId: created.id, groupIdB64, operatorDid, deviceIds: invitedDeviceIds });
+  await d.recordGroup({ scope, idpGroupId: created.id, groupIdB64, operatorDid, deviceIds: invitedDeviceIds, deviceLeaves });
   logLine(
     `[lastid-agent] established a conversation with the operator → group ${created.id} ` +
       `(invited ${keyPackages.length} device${keyPackages.length === 1 ? '' : 's'})`,

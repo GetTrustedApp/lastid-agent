@@ -218,3 +218,80 @@ export async function addGroupMember({
     fetchImpl,
   });
 }
+
+/**
+ * POST /v1/groups/:id/member-devices/reconcile — the device-consistency ADD:
+ * submit the commit + welcome that added `targetDeviceIds` to `memberDid`, so
+ * the IdP advances the group AND updates its per-device ledger (active set).
+ * `expectedEpoch` is the epoch BEFORE the commit (new_epoch - 1). Mirrors
+ * native `submit_member_device_reconcile_to_idp`.
+ */
+export async function reconcileMemberDevicesAdd({
+  idpUrl,
+  groupId,
+  memberDid,
+  targetDeviceIds,
+  mlsCommitB64,
+  mlsWelcomeB64,
+  expectedEpoch,
+  agentDid,
+  vcCompact,
+  signingKey,
+  fetchImpl,
+}) {
+  if (!groupId) throw new Error('reconcileMemberDevicesAdd: groupId required');
+  return authedIdpFetch({
+    idpUrl,
+    method: 'POST',
+    path: `/v1/groups/${encodeURIComponent(groupId)}/member-devices/reconcile`,
+    body: {
+      member_did: memberDid,
+      target_device_ids: targetDeviceIds,
+      mls_commit: mlsCommitB64,
+      mls_welcome: mlsWelcomeB64,
+      expected_epoch: expectedEpoch,
+    },
+    agentDid,
+    vcCompact,
+    signingKey,
+    fetchImpl,
+  });
+}
+
+/**
+ * POST /v1/groups/:id/member-devices/evict — the device-consistency REMOVE:
+ * submit the remove-commit that evicted `targetDeviceIds` from `memberDid`.
+ * Pure remove (no welcome). `expectedEpoch` is the epoch before the commit.
+ * Mirrors native `submit_member_device_evict_to_idp`.
+ */
+export async function evictMemberDevices({
+  idpUrl,
+  groupId,
+  memberDid,
+  targetDeviceIds,
+  mlsCommitB64,
+  expectedEpoch,
+  reason = 'device_no_longer_active',
+  agentDid,
+  vcCompact,
+  signingKey,
+  fetchImpl,
+}) {
+  if (!groupId) throw new Error('evictMemberDevices: groupId required');
+  return authedIdpFetch({
+    idpUrl,
+    method: 'POST',
+    path: `/v1/groups/${encodeURIComponent(groupId)}/member-devices/evict`,
+    body: {
+      member_did: memberDid,
+      target_device_ids: targetDeviceIds,
+      mls_commit: mlsCommitB64,
+      expected_epoch: expectedEpoch,
+      reason,
+    },
+    agentDid,
+    vcCompact,
+    signingKey,
+    fetchImpl,
+  });
+}

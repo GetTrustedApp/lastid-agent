@@ -20,17 +20,29 @@
  * on here. Everything external is injected via `deps` for unit tests.
  */
 
-import { resolveActiveGroupForOperator, recordGroup, getGroupDeviceIds } from './agent-groups.js';
-import { fetchPeerKeyPackages, fetchGroupMemberDevices, addGroupMember } from './mls-groups-api.js';
+import {
+  resolveActiveGroupForOperator,
+  recordGroup,
+  getGroupDeviceIds,
+  getGroupDeviceLeaves,
+} from './agent-groups.js';
+import {
+  fetchPeerKeyPackages,
+  fetchGroupMemberDevices,
+  reconcileMemberDevicesAdd,
+  evictMemberDevices,
+} from './mls-groups-api.js';
 import { computeMemberReconcilePlan } from './mls-client.js';
 
 const DEFAULT_DEPS = {
   resolveActiveGroupForOperator,
   recordGroup,
   getGroupDeviceIds,
+  getGroupDeviceLeaves,
   fetchPeerKeyPackages,
   fetchGroupMemberDevices,
-  addGroupMember,
+  reconcileMemberDevicesAdd,
+  evictMemberDevices,
   computeMemberReconcilePlan,
 };
 
@@ -98,46 +110,95 @@ export async function reconcileConversationDevices({
     liveDeviceIds,
   });
 
-  if (!Array.isArray(plan.add_device_ids) || plan.add_device_ids.length === 0) {
-    return { added: 0, evictPending: plan.evict_device_ids?.length ?? 0 };
+  const addDeviceIds = Array.isArray(plan.add_device_ids) ? plan.add_device_ids : [];
+  const evictDeviceIds = Array.isArray(plan.evict_device_ids) ? plan.evict_device_ids : [];
+
+  // The device → leaf-index map (captured at add time) — needed to evict a
+  // specific device.
+  const deviceLeaves = await d.getGroupDeviceLeaves({ scope, idpGroupId: group.idpGroupId });
+  let nextRecorded = recorded.slice();
+  let added = 0;
+  let evicted = 0;
+  const evictedDeviceIds = [];
+
+  // 4a. ADD the missing devices in ONE commit, then submit to the device
+  //     ledger (member-devices/reconcile) so the IdP's active set advances.
+  if (addDeviceIds.length > 0) {
+    // Keep plan order so assigned_leaf_indices aligns to addDeviceIds.
+    const orderedKps = addDeviceIds
+      .map((did) => keyPackages.find((kp) => kp.deviceId === did))
+      .filter(Boolean);
+    if (orderedKps.length !== addDeviceIds.length) {
+      // Plan wants devices we don't hold key packages for — provisioning lag.
+      logLine('[lastid-agent] reconcile: missing key packages for some new devices — skipping add');
+    } else {
+      const result = mls.addMembers(group.groupIdB64, orderedKps.map((kp) => kp.keyPackageB64));
+      await mls.persist();
+      await d.reconcileMemberDevicesAdd({
+        idpUrl,
+        groupId: group.idpGroupId,
+        memberDid: operatorDid,
+        targetDeviceIds: addDeviceIds,
+        mlsCommitB64: result.commit_b64,
+        mlsWelcomeB64: result.welcome_b64,
+        expectedEpoch: Math.max(0, (result.new_epoch ?? 1) - 1),
+        agentDid,
+        vcCompact,
+        signingKey,
+      });
+      // Record device_id → leaf_index (aligned to addDeviceIds order).
+      const leaves = Array.isArray(result.assigned_leaf_indices) ? result.assigned_leaf_indices : [];
+      addDeviceIds.forEach((did, i) => {
+        if (typeof leaves[i] === 'number') deviceLeaves[did] = leaves[i];
+      });
+      nextRecorded = Array.from(new Set([...nextRecorded, ...addDeviceIds]));
+      added = addDeviceIds.length;
+    }
   }
 
-  // 4. Add the new devices in one commit (we already hold their key packages).
-  const addSet = new Set(plan.add_device_ids);
-  const addKps = keyPackages.filter((kp) => addSet.has(kp.deviceId)).map((kp) => kp.keyPackageB64);
-  if (addKps.length === 0) {
-    // Plan wants devices we don't have key packages for — provisioning lag.
-    return { added: 0, reason: 'no-keypackages-for-missing' };
+  // 4b. EVICT stale devices — look up each leaf, remove it, submit the
+  //     remove-commit to member-devices/evict. One commit per device (rare).
+  for (const did of evictDeviceIds) {
+    const leaf = deviceLeaves[did];
+    if (typeof leaf !== 'number') {
+      logLine(`[lastid-agent] reconcile: no leaf for stale device ${did} — skipping evict`);
+      continue;
+    }
+    try {
+      const commit = mls.removeMember(group.groupIdB64, leaf);
+      await mls.persist();
+      await d.evictMemberDevices({
+        idpUrl,
+        groupId: group.idpGroupId,
+        memberDid: operatorDid,
+        targetDeviceIds: [did],
+        mlsCommitB64: commit.commit_b64,
+        expectedEpoch: Math.max(0, (commit.new_epoch ?? 1) - 1),
+        agentDid,
+        vcCompact,
+        signingKey,
+      });
+      delete deviceLeaves[did];
+      nextRecorded = nextRecorded.filter((d2) => d2 !== did);
+      evictedDeviceIds.push(did);
+      evicted += 1;
+    } catch (e) {
+      logLine(`[lastid-agent] reconcile: evict ${did} failed: ${e?.message ?? e}`);
+    }
   }
 
-  const result = mls.addMembers(group.groupIdB64, addKps);
-  await mls.persist();
-  await d.addGroupMember({
-    idpUrl,
-    groupId: group.idpGroupId,
-    inviteeDid: operatorDid,
-    mlsWelcomeB64: result.welcome_b64,
-    mlsCommitB64: result.commit_b64,
-    agentDid,
-    vcCompact,
-    signingKey,
-  });
+  if (added === 0 && evicted === 0) {
+    return { added: 0, evicted: 0 };
+  }
 
-  const nextRecorded = Array.from(new Set([...recorded, ...plan.add_device_ids]));
   await d.recordGroup({
     scope,
     idpGroupId: group.idpGroupId,
     groupIdB64: group.groupIdB64,
     operatorDid,
     deviceIds: nextRecorded,
+    deviceLeaves,
   });
-
-  logLine(
-    `[lastid-agent] reconcile: added ${plan.add_device_ids.length} new operator device(s) to the conversation`,
-  );
-  return {
-    added: plan.add_device_ids.length,
-    addedDeviceIds: plan.add_device_ids,
-    evictPending: plan.evict_device_ids?.length ?? 0,
-  };
+  logLine(`[lastid-agent] reconcile: +${added} device(s), -${evicted} device(s)`);
+  return { added, evicted, addedDeviceIds: addDeviceIds, evictedDeviceIds };
 }

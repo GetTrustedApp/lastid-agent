@@ -214,6 +214,16 @@ export class MlsClient {
   }
 
   /**
+   * Remove a member by its MLS leaf index. Returns parsed { commit_b64,
+   * new_epoch } — broadcast the commit so peers advance; for a device-
+   * eviction reconcile, POST it to the IdP's member-devices/evict. Persist
+   * after — the ratchet advanced.
+   */
+  removeMember(groupIdB64, leafIndex) {
+    return JSON.parse(this.#handle.removeMember(groupIdB64, leafIndex));
+  }
+
+  /**
    * Process an inbound message — application, commit, or proposal.
    * Returns the parsed `InboundResult` JSON. Application messages
    * include `application_b64` (the encrypted plaintext, base64);
