@@ -13,7 +13,7 @@ import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';
 
-import { OperatorStore } from '../lib/operator-store.js';
+import { OperatorStore, deriveOperatorStateMacKey } from '../lib/operator-store.js';
 import {
   SELF_PROTECTION_RULES,
   selfProtectionRecords,
@@ -153,6 +153,41 @@ test('an UNSIGNED on-disk opt-out record is IGNORED (disable must be signed + va
         command: 'security find-generic-password -s lastid.co/agent-slot-seed:main -w',
       });
       assert.equal(d.allow, false, 'still protected — a file edit cannot turn off the guard');
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The CUSTOMER-FACING signed disable: a self_protection opt-out honored ONLY in
+// an integrity-VERIFIED (keyed) store — the MAC proves it came via the
+// delegation-verified sync, not a disk edit. A keyless store ignores it.
+test('a MAC-verified signed opt-out DISABLES it; a keyless store IGNORES the same file', () => {
+  const scope = `test-${randomUUID()}`;
+  const dir = join(homedir(), '.lastid-agent', scope);
+  const seed = Buffer.alloc(32, 3);
+  try {
+    withEnv(undefined, () => {
+      // Operator's signed opt-out, written by the keyed (listener) store → MAC'd.
+      const writer = new OperatorStore(scope, undefined, { macKey: deriveOperatorStateMacKey(seed) });
+      writer.applyRecords(
+        [{ id: 'agent-self-protection', kind: 'self_protection', target: 'global', status: 'active', version: 1, content: { enabled: false } }],
+        1,
+      );
+      // Keyed reader (the rule enforcer) → verifies the MAC → honors the opt-out.
+      const keyed = new OperatorStore(scope, undefined, { macKey: deriveOperatorStateMacKey(seed) });
+      assert.equal(keyed.selfProtectionEnabled(), false, 'signed + verified opt-out disables');
+      assert.equal(
+        keyed.matchRules('Bash', { command: 'security find-generic-password -s lastid.co/agent-slot-seed:main -w' }).allow,
+        true,
+      );
+      // Keyless reader → can't verify → ignores the opt-out → stays protected.
+      const keyless = new OperatorStore(scope);
+      assert.equal(keyless.selfProtectionEnabled(), true, 'keyless ignores the opt-out');
+      assert.equal(
+        keyless.matchRules('Bash', { command: 'security find-generic-password -s lastid.co/agent-slot-seed:main -w' }).allow,
+        false,
+      );
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });

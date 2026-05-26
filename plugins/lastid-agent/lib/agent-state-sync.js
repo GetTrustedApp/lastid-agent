@@ -29,6 +29,7 @@ export const RULES_PATH = '/v1/agent-state/rules';
 export const MEMORIES_PATH = '/v1/agent-state/memories';
 export const VAULT_PATH = '/v1/agent-state/vault';
 export const AUDIT_POLICY_PATH = '/v1/agent-state/audit-policy';
+export const SELF_PROTECTION_PATH = '/v1/agent-state/self-protection';
 
 /**
  * Decode one wire record into the OperatorStore shape. Revoked /
@@ -143,7 +144,7 @@ export async function syncAgentState({
     throw new Error('syncAgentState: no fetch implementation available');
   }
   const since = store.cursor;
-  const [rules, memories, vault, auditPolicy] = await Promise.all([
+  const [rules, memories, vault, auditPolicy, selfProtection] = await Promise.all([
     fetchKind({ idpUrl, path: RULES_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }),
     fetchKind({ idpUrl, path: MEMORIES_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }),
     // Vault shares ride the same per-operator cursor. We store them SEALED
@@ -157,6 +158,13 @@ export async function syncAgentState({
     // global rule; decoded + verified (fail-closed) + applied below, then
     // honored at the source by audit-policy.js. Fail soft to empty.
     fetchKind({ idpUrl, path: AUDIT_POLICY_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }).catch(
+      () => ({ records: [], cursor: since, operatorJwk: null }),
+    ),
+    // Self-protection opt-out (kind 'self_protection') — the operator's signed
+    // toggle to turn OFF the agent-key guard. Verified fail-closed here; only
+    // HONORED in the integrity-verified store (operator-store macKey), so a
+    // forged on-disk record can't disable the guard. Fail soft to empty.
+    fetchKind({ idpUrl, path: SELF_PROTECTION_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }).catch(
       () => ({ records: [], cursor: since, operatorJwk: null }),
     ),
   ]);
@@ -176,7 +184,7 @@ export async function syncAgentState({
   // hands over a DIFFERENT key (a compromised/forged IdP) is ignored, so it
   // can't swap the verification key and forge operator rules/memories. (A test
   // override via operatorJwk wins, for determinism.)
-  const supplied = operatorJwk ?? rules.operatorJwk ?? memories.operatorJwk ?? auditPolicy.operatorJwk ?? null;
+  const supplied = operatorJwk ?? rules.operatorJwk ?? memories.operatorJwk ?? auditPolicy.operatorJwk ?? selfProtection.operatorJwk ?? null;
   const pinned = store.pinnedDelegationJwk;
   let opJwk = pinned;
   if (!pinned && supplied) {
@@ -191,8 +199,8 @@ export async function syncAgentState({
     verifyRecord ??
     ((rec, contentBytes) => verifyRecordSignature(rec, contentBytes, opJwk, { agentDid }));
 
-  const all = [...rules.records, ...memories.records, ...auditPolicy.records];
-  let maxCursor = Math.max(since, rules.cursor, memories.cursor, vault.cursor ?? since, auditPolicy.cursor ?? since);
+  const all = [...rules.records, ...memories.records, ...auditPolicy.records, ...selfProtection.records];
+  let maxCursor = Math.max(since, rules.cursor, memories.cursor, vault.cursor ?? since, auditPolicy.cursor ?? since, selfProtection.cursor ?? since);
   const decoded = [];
   let reconciled = 0;
   for (const rec of all) {

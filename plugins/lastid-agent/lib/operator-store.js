@@ -259,16 +259,19 @@ export class OperatorStore {
    * === false, delivered on the same rails as the audit policy).
    */
   selfProtectionEnabled() {
-    // Disable is allowed ONLY from a trusted source — NEVER an unsigned edit to
-    // operator-state.json on disk. An attacker, or the agent's own Write tool,
-    // could otherwise append a `self_protection:{enabled:false}` record and turn
-    // off its own guard. So we do NOT honor any file-resident flag here.
+    // Disable comes only from a TRUSTED source — never an unsigned on-disk edit.
     //   (1) a local env override for debugging LastID itself — explicit,
     //       process-level, NOT a file edit (LASTID_SELF_PROTECTION=off);
-    //   (2) [pending] a delegation-SIGNED operator opt-out, re-verified against
-    //       the pinned key at this read (so a forged on-disk record can't pass).
+    //   (2) a delegation-signed operator opt-out (a 'self_protection' record),
+    //       honored ONLY when this store is INTEGRITY-VERIFIED (macKey set): the
+    //       MAC proves the record arrived via the delegation-verified sync and
+    //       wasn't edited on disk. A keyless store can't trust it → stays ON.
     // Default: ON.
     if (selfProtectionDisabledByEnv()) return false;
+    if (this.macKey) {
+      const rec = Object.values(this.state.records).find((r) => r.kind === 'self_protection');
+      if (rec && rec.content && rec.content.enabled === false) return false;
+    }
     return true;
   }
 
