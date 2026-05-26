@@ -1,0 +1,119 @@
+/**
+ * Vault IPC handler (lib/vault-ipc.js::handleVaultRequest) — the local trusted
+ * boundary. Tested with injected deps (no socket, no real fetch/crypto): the
+ * allow/deny/approval gate, single-use handle consumption, injection at fetch,
+ * and that an invalid/forged share or handle is refused. Plus an end-to-end
+ * round-trip over the real unix socket.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
+
+import { handleVaultRequest, startVaultServer, vaultRequest, vaultSocketPath } from '../lib/vault-ipc.js';
+import { VaultHandleStore } from '../lib/vault-handle-store.js';
+
+const AGENT = 'did:lastid:agent:zA';
+
+const SHARE = {
+  item_id: 'vault_1',
+  title: 'OpenAI key',
+  injection: { type: 'header', name: 'Authorization', format: 'Bearer {value}' },
+  constraints: [],
+  on_violation: 'deny',
+  require_approval_per_use: false,
+  granted_actions: ['use'],
+  secret: 'sk-SECRET-zzz',
+};
+
+function deps(over = {}) {
+  return {
+    agentDid: AGENT,
+    handles: new VaultHandleStore(),
+    resolveShare: async (id) => (id === 'vault_1' ? { ...SHARE } : null),
+    fetchImpl: async () => ({ status: 200, text: async () => 'OK', headers: { 'content-type': 'text/plain' } }),
+    now: () => Date.now(),
+    ...over,
+  };
+}
+
+test('vault_use (allow) mints a handle + returns injection summary, NEVER the secret', async () => {
+  const d = deps();
+  const r = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  assert.equal(r.ok, true);
+  assert.ok(r.vault_handle);
+  assert.deepEqual(r.injection, { type: 'header', name: 'Authorization', format: 'Bearer {value}' });
+  assert.equal(JSON.stringify(r).includes('sk-SECRET-zzz'), false, 'secret never in vault_use reply');
+})
+
+test('vault_use on an unknown / unverifiable share → share_not_found', async () => {
+  const r = await handleVaultRequest({ op: 'vault_use', item_id: 'nope' }, deps());
+  assert.equal(r.error, 'share_not_found');
+})
+
+test('vault_use denied by policy → policy_denied (no handle)', async () => {
+  const d = deps({ resolveShare: async () => ({ ...SHARE, constraints: [{ kind: 'time_window', start_ms: 0, end_ms: 1 }] }) });
+  const r = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1', ctx: { now_ms: 999999 } }, d);
+  assert.equal(r.error, 'policy_denied');
+  assert.equal(d.handles.size, 0);
+})
+
+test('vault_use needing approval → policy_approval_required until approved:true', async () => {
+  const d = deps({ resolveShare: async () => ({ ...SHARE, require_approval_per_use: true }) });
+  const r1 = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  assert.equal(r1.policy_approval_required, true);
+  assert.equal(d.handles.size, 0, 'no handle until approved');
+  const r2 = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1', approved: true, approval_id: 'ap_1' }, d);
+  assert.equal(r2.ok, true);
+  assert.ok(r2.vault_handle);
+})
+
+test('http_fetch injects the secret, calls, and revokes (single-use)', async () => {
+  let seen = null;
+  const d = deps({
+    fetchImpl: async (url, opts) => {
+      seen = { url, headers: opts.headers };
+      return { status: 200, text: async () => 'hello', headers: {} };
+    },
+  });
+  const used = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  const r = await handleVaultRequest(
+    { op: 'http_fetch', vault_handle: used.vault_handle, url: 'https://api.openai.com/v1/models', headers: { Accept: 'application/json' } },
+    d,
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.status, 200);
+  assert.equal(r.body, 'hello');
+  // The secret was attached to the OUTBOUND request only.
+  assert.equal(seen.headers.Authorization, 'Bearer sk-SECRET-zzz');
+  // Single-use: the handle is gone; a replay fails.
+  const replay = await handleVaultRequest({ op: 'http_fetch', vault_handle: used.vault_handle, url: 'https://x' }, d);
+  assert.equal(replay.error, 'handle_invalid');
+})
+
+test('http_fetch with a bogus / other-agent handle → handle_invalid (no fetch)', async () => {
+  let called = false;
+  const d = deps({ fetchImpl: async () => ((called = true), { status: 200, text: async () => '' }) });
+  const r = await handleVaultRequest({ op: 'http_fetch', vault_handle: 'not-a-real-token', url: 'https://x' }, d);
+  assert.equal(r.error, 'handle_invalid');
+  assert.equal(called, false);
+})
+
+test('round-trips over the real unix socket', async () => {
+  const scope = `test-${randomUUID()}`;
+  const dir = join(homedir(), '.lastid-agent', scope);
+  const { server } = await startVaultServer({ scope, deps: deps() });
+  try {
+    const used = await vaultRequest(scope, { op: 'vault_use', item_id: 'vault_1' });
+    assert.equal(used.ok, true);
+    const fetched = await vaultRequest(scope, { op: 'http_fetch', vault_handle: used.vault_handle, url: 'https://x' });
+    assert.equal(fetched.ok, true);
+    assert.equal(fetched.status, 200);
+  } finally {
+    server.close();
+    try { rmSync(vaultSocketPath(scope), { force: true }); } catch { /* ignore */ }
+    rmSync(dir, { recursive: true, force: true });
+  }
+})
