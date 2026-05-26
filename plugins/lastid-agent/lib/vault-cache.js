@@ -16,6 +16,8 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { decryptContent } from './agent-content-crypto.js';
+import { verifyRecordSignature } from './agent-sig-verify.js';
 
 export function vaultCachePath(scope = 'main') {
   return join(homedir(), '.lastid-agent', scope ?? 'main', 'vault-shares.json');
@@ -61,6 +63,10 @@ export function applyVaultRecords(scope, records) {
       version: Number.isInteger(r.version) ? r.version : 0,
       status: 'active',
       enc_b64: r.enc_b64, // SEALED — never decrypted at rest
+      // target + sig are kept so the inject path can verify the operator
+      // signature at use time (the bundle isn't decrypted at sync).
+      target: r.target ?? r.for_agent_did ?? null,
+      sig: typeof r.sig === 'string' ? r.sig : null,
       for_agent_did: r.for_agent_did ?? r.target ?? null,
       updated_at: r.updated_at ?? null,
     };
@@ -78,6 +84,52 @@ export function listVaultCache(scope = 'main') {
 /** One cached sealed share by id, or null. */
 export function getVaultShare(scope, id) {
   return readAll(scope)[id] ?? null;
+}
+
+/**
+ * Resolve a cached share to its DECODED + VERIFIED bundle, or null. Decrypts
+ * the sealed blob with the agent's slot_seed, then verifies the operator's
+ * delegation signature over {kind:vault,id,target,version,status,content_sha256}
+ * AND that content_sha256 matches the decrypted bytes. A blob the IdP can't
+ * have produced (wrong slot_seed → garbage) or an unsigned/forged share returns
+ * null — so neither vault_list nor the inject path will ever use it.
+ *
+ * Used by both the listener (inject) and vault_list. The DECODED bundle carries
+ * the secret — callers MUST strip it (vaultListView) before returning anything
+ * to the agent; only the inject path reads the secret.
+ *
+ * @returns {object|null} the decoded share content (incl. secret)
+ */
+export function resolveVaultShare(scope, id, { slotSeed, operatorJwk, onReject } = {}) {
+  const entry = getVaultShare(scope, id);
+  if (!entry || !entry.enc_b64) return null;
+  let bytes;
+  try {
+    bytes = decryptContent(slotSeed, entry.enc_b64);
+  } catch {
+    if (onReject) onReject(id, 'undecryptable (wrong slot_seed / corrupt)');
+    return null;
+  }
+  const record = {
+    kind: 'vault',
+    id,
+    target: entry.target ?? entry.for_agent_did ?? null,
+    version: entry.version ?? 0,
+    status: 'active',
+    sig: entry.sig ?? null,
+    author: 'operator',
+  };
+  const v = verifyRecordSignature(record, bytes, operatorJwk ?? null, {});
+  if (!(v === true || (v && v.ok === true))) {
+    if (onReject) onReject(id, `unverified: ${(v && v.reason) || 'bad signature'}`);
+    return null;
+  }
+  try {
+    return JSON.parse(Buffer.from(bytes).toString('utf8'));
+  } catch {
+    if (onReject) onReject(id, 'decoded bytes are not JSON');
+    return null;
+  }
 }
 
 /**

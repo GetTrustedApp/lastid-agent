@@ -15,9 +15,11 @@ import {
   applyVaultRecords,
   listVaultCache,
   getVaultShare,
+  resolveVaultShare,
   vaultListView,
   vaultCachePath,
 } from '../lib/vault-cache.js';
+import { encryptContent } from '../lib/agent-content-crypto.js';
 
 function freshScope() {
   const scope = `test-${randomUUID()}`;
@@ -99,4 +101,48 @@ test('vaultListView: a bundle with no secret reports has_secret=false (no crash)
   const view = vaultListView({ item_id: 'x', title: 'T' });
   assert.equal(view.has_secret, false);
   assert.equal('secret' in view, false);
+});
+
+// resolveVaultShare — the decrypt + operator-signature gate. The negative
+// paths are the security-critical ones: anything not provably the operator's
+// must resolve to null so neither vault_list nor inject can use it.
+const SLOT = Buffer.alloc(32, 9);
+
+test('resolveVaultShare: missing share → null', () => {
+  const { scope, dir } = freshScope();
+  try {
+    assert.equal(resolveVaultShare(scope, 'nope', { slotSeed: SLOT, operatorJwk: null }), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolveVaultShare: undecryptable blob (wrong slot_seed) → null + onReject', () => {
+  const { scope, dir } = freshScope();
+  try {
+    applyVaultRecords(scope, [{ id: 'v', version: 1, status: 'active', enc_b64: 'bm90LXNlYWxlZA==', sig: 'x', target: 'did:a' }]);
+    let rejected = null;
+    const r = resolveVaultShare(scope, 'v', { slotSeed: SLOT, operatorJwk: null, onReject: (_id, why) => (rejected = why) });
+    assert.equal(r, null);
+    assert.match(rejected, /undecryptable/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolveVaultShare: decrypts but UNSIGNED → null (fails the operator-sig gate)', () => {
+  const { scope, dir } = freshScope();
+  try {
+    // A real slot_seed-sealed bundle (decrypt will succeed)…
+    const bundle = { item_id: 'v', title: 'k', secret: 'sk-zzz', injection: { type: 'header', name: 'A' } };
+    const enc_b64 = encryptContent(SLOT, Buffer.from(JSON.stringify(bundle), 'utf8')).toString('base64');
+    // …but stored with NO signature → must be rejected (provenance unproven).
+    applyVaultRecords(scope, [{ id: 'v', version: 1, status: 'active', enc_b64, sig: null, target: 'did:a' }]);
+    let rejected = null;
+    const r = resolveVaultShare(scope, 'v', { slotSeed: SLOT, operatorJwk: { x_b64u: 'x', y_b64u: 'y' }, onReject: (_id, why) => (rejected = why) });
+    assert.equal(r, null, 'unsigned share must not resolve');
+    assert.match(rejected, /unverified/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
