@@ -598,6 +598,102 @@ export function sdkSignup(password: string, use_biometrics: boolean, persona_jso
 export function sdkUpsertConversation(conversation_id: string, record_json: string): Promise<void>;
 
 /**
+ * Apply one inbound `sync.vault_changed` frame: decrypt the transport
+ * envelope with the vault transport key, then run the SHARED
+ * `apply_vault_sync_to_storage` (deterministic conflict resolution).
+ * Returns the outcome as JSON (`{"outcome":"applied_item","item_id":…}` /
+ * `applied_tombstone` / `skipped`) so the console can refresh the row.
+ */
+export function sdkVaultApplySync(transport_b64: string): Promise<string>;
+
+/**
+ * Open a vault-item envelope (base64 LIDE) under the operator's `vault_kek`,
+ * returning the item JSON bytes. Console read-back so the operator can view +
+ * edit their own vault items. vault_kek is derived in-WASM and never crosses
+ * into JS. Errors on a wrong key or tampering.
+ */
+export function sdkVaultDecryptItem(enc_b64: string): Promise<Uint8Array>;
+
+/**
+ * Delete a vault item locally + write a tombstone + ENQUEUE a sync
+ * change. Returns whether a local item existed. `revision` should be the
+ * deleting revision (one past the last known).
+ */
+export function sdkVaultDeleteItem(item_id: string, revision: number): Promise<boolean>;
+
+/**
+ * Drain up to `limit` pending outbound changes into sealed transport
+ * frames. For each outbox entry this loads the current item (upsert) or
+ * tombstone (delete), assembles the `VaultSyncPayload`, and seals it with
+ * the transport key. Returns a JSON array of [`VaultOutboundFrame`]. The
+ * caller sends each over the WS and marks it sent.
+ */
+export function sdkVaultDrainOutbound(limit: number): Promise<string>;
+
+/**
+ * Seal a vault item (operator's own vault) under the operator's `vault_kek`.
+ * `content` is the item JSON (kind + fields incl. the secret). The vault_kek
+ * is derived in-WASM from the unsealed bundle's `vault_item_root_seed` and
+ * NEVER crosses into JS; the returned base64 is the canonical LIDE envelope —
+ * byte-compatible with the desktop vault (`vault_helpers::encrypt_vault_payload`),
+ * so the same item is readable by the desktop wallet. The operator's vault is
+ * THEIRS: this is for the console's vault (create/edit items); sharing to an
+ * agent re-seals to the agent's slot_seed separately.
+ */
+export function sdkVaultEncryptItem(content: Uint8Array): Promise<string>;
+
+/**
+ * Fetch one full vault item (all fields, for the edit form) as JSON, or
+ * `null` if absent.
+ */
+export function sdkVaultGetItem(item_id: string): Promise<string | undefined>;
+
+/**
+ * List the operator's vault items as list-view entries (title/subtitle/
+ * section + share count). Returns a JSON array of `VaultEntry`.
+ */
+export function sdkVaultListEntries(): Promise<string>;
+
+/**
+ * Record a failed delivery attempt (increments attempts, stores the
+ * error). The entry stays in the outbox for retry.
+ */
+export function sdkVaultMarkSyncFailed(outbox_id: string, error: string): Promise<void>;
+
+/**
+ * Mark an outbound change delivered (drop it from the outbox). Called by
+ * the JS after the WS send for that frame's `outbox_id` succeeds.
+ */
+export function sdkVaultMarkSyncSent(outbox_id: string): Promise<void>;
+
+/**
+ * Upsert a vault item (create or edit). `item_json` is a full
+ * `VaultItemDetails`. Persists it sealed under the vault_kek and ENQUEUES
+ * a sync change for the other devices. Caller bumps `revision` +
+ * `updated_at_ms` on edits.
+ */
+export function sdkVaultPutItem(item_json: string): Promise<void>;
+
+/**
+ * Open an inbound vault SYNC envelope (base64 LIDE) under the operator's
+ * `vault_transport_key`, returning the VaultSyncPayload JSON bytes. The
+ * transport key is derived in-WASM and never crosses into JS. Errors on a
+ * wrong key or tampering.
+ */
+export function sdkVaultSyncDecrypt(enc_b64: string): Promise<Uint8Array>;
+
+/**
+ * Seal a cross-device vault SYNC payload under the operator's
+ * `vault_transport_key` (derived in-WASM from the unsealed bundle's
+ * `vault_transport_root_seed`, never into JS). The browser broadcasts the
+ * returned base64 over the `sync.vault_changed` WebSocket event so the
+ * operator's other devices converge — vault items are NOT stored server-side,
+ * they transit this envelope. Byte-compatible with
+ * `lastid-runtime::sync::encrypt_vault_sync_payload`.
+ */
+export function sdkVaultSyncEncrypt(payload: Uint8Array): Promise<string>;
+
+/**
  * Sign an arbitrary payload with an Ed25519 signing key. Returns the
  * raw 64-byte signature. The keypair this wraps is the agent's
  * stable identity keypair, derived earlier via

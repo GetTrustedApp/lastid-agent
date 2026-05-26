@@ -1315,6 +1315,197 @@ function sdkUpsertConversation(conversation_id, record_json) {
 exports.sdkUpsertConversation = sdkUpsertConversation;
 
 /**
+ * Apply one inbound `sync.vault_changed` frame: decrypt the transport
+ * envelope with the vault transport key, then run the SHARED
+ * `apply_vault_sync_to_storage` (deterministic conflict resolution).
+ * Returns the outcome as JSON (`{"outcome":"applied_item","item_id":…}` /
+ * `applied_tombstone` / `skipped`) so the console can refresh the row.
+ * @param {string} transport_b64
+ * @returns {Promise<string>}
+ */
+function sdkVaultApplySync(transport_b64) {
+    const ptr0 = passStringToWasm0(transport_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkVaultApplySync(ptr0, len0);
+    return ret;
+}
+exports.sdkVaultApplySync = sdkVaultApplySync;
+
+/**
+ * Open a vault-item envelope (base64 LIDE) under the operator's `vault_kek`,
+ * returning the item JSON bytes. Console read-back so the operator can view +
+ * edit their own vault items. vault_kek is derived in-WASM and never crosses
+ * into JS. Errors on a wrong key or tampering.
+ * @param {string} enc_b64
+ * @returns {Promise<Uint8Array>}
+ */
+function sdkVaultDecryptItem(enc_b64) {
+    const ptr0 = passStringToWasm0(enc_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkVaultDecryptItem(ptr0, len0);
+    return ret;
+}
+exports.sdkVaultDecryptItem = sdkVaultDecryptItem;
+
+/**
+ * Delete a vault item locally + write a tombstone + ENQUEUE a sync
+ * change. Returns whether a local item existed. `revision` should be the
+ * deleting revision (one past the last known).
+ * @param {string} item_id
+ * @param {number} revision
+ * @returns {Promise<boolean>}
+ */
+function sdkVaultDeleteItem(item_id, revision) {
+    const ptr0 = passStringToWasm0(item_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkVaultDeleteItem(ptr0, len0, revision);
+    return ret;
+}
+exports.sdkVaultDeleteItem = sdkVaultDeleteItem;
+
+/**
+ * Drain up to `limit` pending outbound changes into sealed transport
+ * frames. For each outbox entry this loads the current item (upsert) or
+ * tombstone (delete), assembles the `VaultSyncPayload`, and seals it with
+ * the transport key. Returns a JSON array of [`VaultOutboundFrame`]. The
+ * caller sends each over the WS and marks it sent.
+ * @param {number} limit
+ * @returns {Promise<string>}
+ */
+function sdkVaultDrainOutbound(limit) {
+    const ret = wasm.sdkVaultDrainOutbound(limit);
+    return ret;
+}
+exports.sdkVaultDrainOutbound = sdkVaultDrainOutbound;
+
+/**
+ * Seal a vault item (operator's own vault) under the operator's `vault_kek`.
+ * `content` is the item JSON (kind + fields incl. the secret). The vault_kek
+ * is derived in-WASM from the unsealed bundle's `vault_item_root_seed` and
+ * NEVER crosses into JS; the returned base64 is the canonical LIDE envelope —
+ * byte-compatible with the desktop vault (`vault_helpers::encrypt_vault_payload`),
+ * so the same item is readable by the desktop wallet. The operator's vault is
+ * THEIRS: this is for the console's vault (create/edit items); sharing to an
+ * agent re-seals to the agent's slot_seed separately.
+ * @param {Uint8Array} content
+ * @returns {Promise<string>}
+ */
+function sdkVaultEncryptItem(content) {
+    const ptr0 = passArray8ToWasm0(content, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkVaultEncryptItem(ptr0, len0);
+    return ret;
+}
+exports.sdkVaultEncryptItem = sdkVaultEncryptItem;
+
+/**
+ * Fetch one full vault item (all fields, for the edit form) as JSON, or
+ * `null` if absent.
+ * @param {string} item_id
+ * @returns {Promise<string | undefined>}
+ */
+function sdkVaultGetItem(item_id) {
+    const ptr0 = passStringToWasm0(item_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkVaultGetItem(ptr0, len0);
+    return ret;
+}
+exports.sdkVaultGetItem = sdkVaultGetItem;
+
+/**
+ * List the operator's vault items as list-view entries (title/subtitle/
+ * section + share count). Returns a JSON array of `VaultEntry`.
+ * @returns {Promise<string>}
+ */
+function sdkVaultListEntries() {
+    const ret = wasm.sdkVaultListEntries();
+    return ret;
+}
+exports.sdkVaultListEntries = sdkVaultListEntries;
+
+/**
+ * Record a failed delivery attempt (increments attempts, stores the
+ * error). The entry stays in the outbox for retry.
+ * @param {string} outbox_id
+ * @param {string} error
+ * @returns {Promise<void>}
+ */
+function sdkVaultMarkSyncFailed(outbox_id, error) {
+    const ptr0 = passStringToWasm0(outbox_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(error, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkVaultMarkSyncFailed(ptr0, len0, ptr1, len1);
+    return ret;
+}
+exports.sdkVaultMarkSyncFailed = sdkVaultMarkSyncFailed;
+
+/**
+ * Mark an outbound change delivered (drop it from the outbox). Called by
+ * the JS after the WS send for that frame's `outbox_id` succeeds.
+ * @param {string} outbox_id
+ * @returns {Promise<void>}
+ */
+function sdkVaultMarkSyncSent(outbox_id) {
+    const ptr0 = passStringToWasm0(outbox_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkVaultMarkSyncSent(ptr0, len0);
+    return ret;
+}
+exports.sdkVaultMarkSyncSent = sdkVaultMarkSyncSent;
+
+/**
+ * Upsert a vault item (create or edit). `item_json` is a full
+ * `VaultItemDetails`. Persists it sealed under the vault_kek and ENQUEUES
+ * a sync change for the other devices. Caller bumps `revision` +
+ * `updated_at_ms` on edits.
+ * @param {string} item_json
+ * @returns {Promise<void>}
+ */
+function sdkVaultPutItem(item_json) {
+    const ptr0 = passStringToWasm0(item_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkVaultPutItem(ptr0, len0);
+    return ret;
+}
+exports.sdkVaultPutItem = sdkVaultPutItem;
+
+/**
+ * Open an inbound vault SYNC envelope (base64 LIDE) under the operator's
+ * `vault_transport_key`, returning the VaultSyncPayload JSON bytes. The
+ * transport key is derived in-WASM and never crosses into JS. Errors on a
+ * wrong key or tampering.
+ * @param {string} enc_b64
+ * @returns {Promise<Uint8Array>}
+ */
+function sdkVaultSyncDecrypt(enc_b64) {
+    const ptr0 = passStringToWasm0(enc_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkVaultSyncDecrypt(ptr0, len0);
+    return ret;
+}
+exports.sdkVaultSyncDecrypt = sdkVaultSyncDecrypt;
+
+/**
+ * Seal a cross-device vault SYNC payload under the operator's
+ * `vault_transport_key` (derived in-WASM from the unsealed bundle's
+ * `vault_transport_root_seed`, never into JS). The browser broadcasts the
+ * returned base64 over the `sync.vault_changed` WebSocket event so the
+ * operator's other devices converge — vault items are NOT stored server-side,
+ * they transit this envelope. Byte-compatible with
+ * `lastid-runtime::sync::encrypt_vault_sync_payload`.
+ * @param {Uint8Array} payload
+ * @returns {Promise<string>}
+ */
+function sdkVaultSyncEncrypt(payload) {
+    const ptr0 = passArray8ToWasm0(payload, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkVaultSyncEncrypt(ptr0, len0);
+    return ret;
+}
+exports.sdkVaultSyncEncrypt = sdkVaultSyncEncrypt;
+
+/**
  * Sign an arbitrary payload with an Ed25519 signing key. Returns the
  * raw 64-byte signature. The keypair this wraps is the agent's
  * stable identity keypair, derived earlier via
@@ -2344,28 +2535,28 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1289, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1487, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h07eda6f9933457e4);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 872, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 1069, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1725375cb213b3e4);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 814, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hfba200ffcbc2c4fb);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 1011, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h0863b872d6f8b8ab);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 468, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h23499dd81690a033);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1157, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3c6c61154a9359bf);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 959, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3c6c61154a9359bf);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 569, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h23499dd81690a033);
             return ret;
         },
         __wbindgen_cast_0000000000000006: function(arg0) {
@@ -2416,20 +2607,20 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__h23499dd81690a033(arg0, arg1) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h23499dd81690a033(arg0, arg1);
-}
-
 function wasm_bindgen__convert__closures_____invoke__h3c6c61154a9359bf(arg0, arg1) {
     wasm.wasm_bindgen__convert__closures_____invoke__h3c6c61154a9359bf(arg0, arg1);
+}
+
+function wasm_bindgen__convert__closures_____invoke__h23499dd81690a033(arg0, arg1) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h23499dd81690a033(arg0, arg1);
 }
 
 function wasm_bindgen__convert__closures_____invoke__h1725375cb213b3e4(arg0, arg1, arg2) {
     wasm.wasm_bindgen__convert__closures_____invoke__h1725375cb213b3e4(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__hfba200ffcbc2c4fb(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__hfba200ffcbc2c4fb(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h0863b872d6f8b8ab(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h0863b872d6f8b8ab(arg0, arg1, arg2);
 }
 
 function wasm_bindgen__convert__closures_____invoke__h07eda6f9933457e4(arg0, arg1, arg2) {
