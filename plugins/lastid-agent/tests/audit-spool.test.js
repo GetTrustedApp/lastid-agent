@@ -54,10 +54,10 @@ test('drain chains spooled events IN ORDER, signs them, and unlinks the spool', 
     const chained = drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
     assert.equal(chained, 3);
 
-    const chain = readMemoryAudit(scope);
+    const chain = readMemoryAudit(scope, 'did:a');
     assert.deepEqual(chain.map((r) => r.metadata.n), [1, 2, 3], 'chained in enqueue order');
     assert.deepEqual(chain.map((r) => r.seq), [0, 1, 2], 'seq is contiguous');
-    assert.equal(verifyMemoryAudit(scope, publicKey).intact, true, 'hash-linked + signature verifies');
+    assert.equal(verifyMemoryAudit(scope, 'did:a', publicKey).intact, true, 'hash-linked + signature verifies');
     // Spool emptied.
     assert.equal(listSpooled(scope).length, 0);
     assert.equal(readdirSync(auditSpoolDir(scope)).filter((f) => f.endsWith('.json')).length, 0);
@@ -72,7 +72,7 @@ test('tool_use_id rides into the chain metadata so a result correlates to its ca
     enqueueAuditEvent({ scope, eventType: 'tool_call', metadata: { tool: 'Bash' }, toolUseId: 'tu_42' });
     enqueueAuditEvent({ scope, eventType: 'tool_result', metadata: { tool: 'Bash', status: 'success' }, toolUseId: 'tu_42' });
     drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
-    const chain = readMemoryAudit(scope);
+    const chain = readMemoryAudit(scope, 'did:a');
     assert.equal(chain[0].metadata.tool_use_id, 'tu_42');
     assert.equal(chain[1].metadata.tool_use_id, 'tu_42');
     assert.equal(chain[0].event_type, 'tool_call');
@@ -93,7 +93,7 @@ test('a corrupt spool file is dropped and never wedges the drain', () => {
     const chained = drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
     assert.equal(chained, 2, 'the two valid events chain; the corrupt one is skipped');
     assert.equal(listSpooled(scope).length, 0, 'corrupt file removed too');
-    assert.equal(verifyMemoryAudit(scope, publicKey).intact, true);
+    assert.equal(verifyMemoryAudit(scope, 'did:a', publicKey).intact, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -119,7 +119,7 @@ test('an append failure is retryable: chained-so-far are unlinked, the rest stay
     // A second drain (now healthy, real append) finishes the job in order.
     const more = drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
     assert.equal(more, 2);
-    assert.deepEqual(readMemoryAudit(scope).map((r) => r.metadata.n), [2, 3]);
+    assert.deepEqual(readMemoryAudit(scope, 'did:a').map((r) => r.metadata.n), [2, 3]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

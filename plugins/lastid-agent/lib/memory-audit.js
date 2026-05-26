@@ -1,37 +1,59 @@
 /**
- * Agent memory audit chain (local, signed) — replaces the desktop audit
- * chain for locally-served memory tools.
+ * Agent memory audit chain (local, signed) — PER-AGENT, genesis + checkpointed.
  *
- * Every memory CUD (write/draft/update/forget/promote) appends a record to an
- * append-only chain at ~/.lastid-agent/<scope>/memory-audit.jsonl. Each record
- * is blake3-linked to its predecessor (prev_hash) and Ed25519-signed with the
- * agent's stable key (deriveAgentEd25519Keypair) — tamper-evident + provenance-
- * attributed, the same guarantees the desktop chain gave. Each agent ships its
- * OWN chain to the IdP; the console validates it (same @noble/hashes blake3
- * over the same canonicalJson, so the hash is reproducible cross-runtime).
+ * Every memory/tool CUD appends a record to an append-only chain. Each record is
+ * blake3-linked to its predecessor (prev_hash) and Ed25519-signed with the
+ * agent's stable key (deriveAgentEd25519Keypair) — tamper-evident + provenance.
+ *
+ * KEYED PER AGENT, not per scope. A scope (~/.lastid-agent/<scope>/) can host
+ * TWO agents at once (e.g. two slots both running in 'main'); a single
+ * per-scope chain would interleave their records and two writers would fork it,
+ * so every per-agent verify reads "broken." Instead each agent gets its own
+ * chain file under `<scope>/audit/<slug>.jsonl` with its own seq/prev_hash, so
+ * concurrent agents never collide and each chain verifies on its own.
+ *
+ *   - GENESIS: an agent's first record is seq 0 with prev_hash=null.
+ *   - CHECKPOINT: every CHECKPOINT_INTERVAL records a `ChainCheckpoint` record
+ *     is appended (anchors the chain so a partial/drained view still verifies,
+ *     and marks a segment boundary the console renders as a divider).
  *
  * The records carry only NON-SENSITIVE metadata (event_type, memory_id, kind,
- * bedrock, fields_changed, hard_delete, reason) — never the memory claim — so
- * they can be shipped to the IdP (see shipUnshipped / agent-state /audit) for
+ * fields_changed, …) — never the memory claim — so they can ship to the IdP for
  * the operator to view cross-device without leaking content.
  */
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { sign as edSign, verify as edVerify, createPublicKey } from 'node:crypto';
+import { sign as edSign, verify as edVerify, createPublicKey, randomBytes } from 'node:crypto';
 import { blake3 } from '@noble/hashes/blake3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 
-export function memoryAuditPath(scope = 'main') {
-  return join(homedir(), '.lastid-agent', scope ?? 'main', 'memory-audit.jsonl');
-}
-function shipCursorPath(scope = 'main') {
-  return join(homedir(), '.lastid-agent', scope ?? 'main', 'memory-audit-cursor.json');
+/** Event type for a checkpoint record (mirrors lastid-core AuditEventType). */
+export const CHECKPOINT_EVENT = 'ChainCheckpoint';
+/** Append a checkpoint every N records (count includes checkpoints). */
+export const CHECKPOINT_INTERVAL = 500;
+
+/** Filesystem-safe slug for an agent DID, so one file maps to one agent. A
+ *  blake3 prefix keeps it short, collision-free, and free of path characters. */
+export function agentChainSlug(agentDid) {
+  const did = typeof agentDid === 'string' && agentDid.length > 0 ? agentDid : 'unknown';
+  return bytesToHex(blake3(Buffer.from(did, 'utf-8'))).slice(0, 24);
 }
 
-/** blake3 hex — the agent's own chain uses blake3 (matching the SDK's audit
- *  chaining algorithm), validated cross-runtime by the console with the same
- *  @noble/hashes blake3 over the same canonicalJson bytes. */
+function auditDir(scope = 'main') {
+  return join(homedir(), '.lastid-agent', scope ?? 'main', 'audit');
+}
+
+/** This agent's chain file within the scope. */
+export function memoryAuditPath(scope = 'main', agentDid = null) {
+  return join(auditDir(scope), `${agentChainSlug(agentDid)}.jsonl`);
+}
+function shipCursorPath(scope = 'main', agentDid = null) {
+  return join(auditDir(scope), `${agentChainSlug(agentDid)}.cursor.json`);
+}
+
+/** blake3 hex — matches the SDK's audit chaining algorithm, reproduced
+ *  cross-runtime by the console with the same @noble/hashes blake3. */
 function blake3Hex(buf) {
   return bytesToHex(blake3(buf));
 }
@@ -47,10 +69,10 @@ export function canonicalJson(value) {
   return JSON.stringify(value ?? null);
 }
 
-export function readMemoryAudit(scope = 'main') {
+export function readMemoryAudit(scope = 'main', agentDid = null) {
   let raw;
   try {
-    raw = readFileSync(memoryAuditPath(scope), 'utf8');
+    raw = readFileSync(memoryAuditPath(scope, agentDid), 'utf8');
   } catch {
     return [];
   }
@@ -67,28 +89,57 @@ export function readMemoryAudit(scope = 'main') {
   return out;
 }
 
-function lastEntry(scope) {
-  const all = readMemoryAudit(scope);
+function lastEntry(scope, agentDid) {
+  const all = readMemoryAudit(scope, agentDid);
   return all.length > 0 ? all[all.length - 1] : null;
 }
 
-/**
- * Append a signed, hash-linked audit record. `signingKey` is the agent's
- * Ed25519 private KeyObject (from deriveAgentEd25519Keypair). Returns the
- * record. Best-effort caller wrapping recommended — a failed audit append
- * should not fail the underlying memory op, but it SHOULD be logged.
- */
-export function appendMemoryAudit({ scope = 'main', signingKey, agentDid = null, eventType, memoryId = null, metadata = {} }) {
-  const prev = lastEntry(scope);
-  const core = {
+/** A fresh chain generation id, minted at every genesis. Lets the console group
+ *  by (agent_did, chain_id) so a re-rooted run (re-provision, on-break self-heal)
+ *  is a SEPARATE segment from older records under the same DID — old broken
+ *  per-scope records never merge with / collide seq against the new clean run. */
+function newChainId() {
+  return bytesToHex(randomBytes(16));
+}
+
+/** The core that is hashed + signed — field set + null defaults MUST match the
+ *  console verifier (agent-audit-verify.ts). A genesis record (prev=null) mints
+ *  a new chain_id; every later record inherits its predecessor's. */
+function recordCore(prev, { agentDid, eventType, memoryId, metadata }) {
+  return {
+    chain_id: prev ? prev.chain_id : newChainId(),
     seq: prev ? Number(prev.seq) + 1 : 0,
     timestamp: new Date().toISOString(),
-    agent_did: agentDid,
+    agent_did: agentDid ?? null,
     event_type: eventType,
-    memory_id: memoryId,
+    memory_id: memoryId ?? null,
     metadata: metadata ?? {},
     prev_hash: prev ? prev.integrity_hash : null,
   };
+}
+
+/** Reconstruct the hashed core of an EXISTING record (same field set + null
+ *  defaults as recordCore) — shared by verify + the tail-integrity check. */
+function coreFromRecord(r) {
+  return {
+    chain_id: r.chain_id ?? null,
+    seq: r.seq,
+    timestamp: r.timestamp,
+    agent_did: r.agent_did ?? null,
+    event_type: r.event_type,
+    memory_id: r.memory_id ?? null,
+    metadata: r.metadata ?? {},
+    prev_hash: r.prev_hash ?? null,
+  };
+}
+
+/** O(1) tail check: does the head record's integrity_hash still match its core?
+ *  If not, the chain's tail is corrupt/tampered and we must not link onto it. */
+function tailIntact(rec) {
+  return blake3Hex(Buffer.from(canonicalJson(coreFromRecord(rec)), 'utf-8')) === rec.integrity_hash;
+}
+
+function signAndWrite(scope, agentDid, signingKey, core) {
   const bytes = Buffer.from(canonicalJson(core), 'utf-8');
   const integrity_hash = blake3Hex(bytes);
   let signature = null;
@@ -100,32 +151,73 @@ export function appendMemoryAudit({ scope = 'main', signingKey, agentDid = null,
     }
   }
   const record = { ...core, integrity_hash, signature };
-  const path = memoryAuditPath(scope);
-  mkdirSync(dirname(path), { recursive: true });
+  const path = memoryAuditPath(scope, agentDid);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   appendFileSync(path, `${JSON.stringify(record)}\n`, { mode: 0o600 });
   return record;
 }
 
 /**
- * Verify the chain: each record's integrity_hash matches blake3(canonical
- * core), prev_hash links correctly, and (when publicKey given) the Ed25519
- * signature verifies. Returns { intact, total, firstFailure? }.
+ * Append a signed, hash-linked audit record to THIS AGENT's chain. The agent's
+ * first record is the genesis (seq 0, prev_hash=null). After a normal append,
+ * a checkpoint is stamped when the chain crosses a CHECKPOINT_INTERVAL boundary.
+ * Best-effort caller wrapping recommended — a failed audit append should not
+ * fail the underlying op, but it SHOULD be logged.
  */
-export function verifyMemoryAudit(scope = 'main', publicKey = null) {
-  const all = readMemoryAudit(scope);
+export function appendMemoryAudit({ scope = 'main', signingKey, agentDid = null, eventType, memoryId = null, metadata = {} }) {
+  let prev = lastEntry(scope, agentDid);
+  // ON-BREAK SELF-HEAL: never chain onto a corrupt tail. If the head record's
+  // hash no longer matches its core (tampered/truncated/partial write), re-root
+  // a NEW generation (genesis: new chain_id, seq 0, prev_hash null) instead of
+  // extending a broken link — so a break flags + heals forward rather than
+  // poisoning every future record. The console shows the old generation as
+  // broken history and the new one verifies from its genesis.
+  if (prev && !tailIntact(prev)) {
+    process.stderr.write(`[lastid-agent] audit tail broken at seq ${prev.seq} — re-rooting a new chain generation\n`);
+    metadata = { ...(metadata ?? {}), healed_from_break: true, broke_after_seq: Number(prev.seq) };
+    prev = null;
+  }
+  const record = signAndWrite(scope, agentDid, signingKey, recordCore(prev, { agentDid, eventType, memoryId, metadata }));
+  // Checkpoint boundary: stamp a ChainCheckpoint right after the record that
+  // crosses a multiple of the interval. Never recurse on checkpoints.
+  if (eventType !== CHECKPOINT_EVENT) {
+    const seq = Number(record.seq);
+    if (seq > 0 && (seq + 1) % CHECKPOINT_INTERVAL === 0) {
+      maybeCheckpoint({ scope, signingKey, agentDid });
+    }
+  }
+  return record;
+}
+
+/**
+ * Append a ChainCheckpoint record anchoring the chain at its current head. The
+ * checkpoint links like any record; its metadata carries the anchored seq +
+ * head integrity_hash so a verifier (or a partial/drained view) can re-root
+ * from it. The console renders checkpoints as segment dividers.
+ */
+export function maybeCheckpoint({ scope = 'main', signingKey, agentDid = null } = {}) {
+  const prev = lastEntry(scope, agentDid);
+  if (!prev) return null; // nothing to checkpoint yet (no genesis)
+  return signAndWrite(scope, agentDid, signingKey, recordCore(prev, {
+    agentDid,
+    eventType: CHECKPOINT_EVENT,
+    memoryId: null,
+    metadata: { anchored_seq: Number(prev.seq), anchored_hash: prev.integrity_hash },
+  }));
+}
+
+/**
+ * Verify THIS agent's chain: each record's integrity_hash matches blake3(core),
+ * prev_hash links correctly (seq 0 ⇒ prev_hash null = genesis), and (when
+ * publicKey given) the Ed25519 signature verifies. Returns { intact, total,
+ * firstFailure? }.
+ */
+export function verifyMemoryAudit(scope = 'main', agentDid = null, publicKey = null) {
+  const all = readMemoryAudit(scope, agentDid);
   let prevHash = null;
   for (let i = 0; i < all.length; i++) {
     const r = all[i];
-    const core = {
-      seq: r.seq,
-      timestamp: r.timestamp,
-      agent_did: r.agent_did ?? null,
-      event_type: r.event_type,
-      memory_id: r.memory_id ?? null,
-      metadata: r.metadata ?? {},
-      prev_hash: r.prev_hash ?? null,
-    };
-    const bytes = Buffer.from(canonicalJson(core), 'utf-8');
+    const bytes = Buffer.from(canonicalJson(coreFromRecord(r)), 'utf-8');
     if (blake3Hex(bytes) !== r.integrity_hash) {
       return { intact: false, total: all.length, firstFailure: { seq: r.seq, kind: 'integrity_hash_mismatch' } };
     }
@@ -152,60 +244,67 @@ export function publicKeyFor(signingKey) {
   }
 }
 
-// ── IdP shipping cursor (entries past `shipped` haven't reached the IdP) ──
-
-function readShipCursor(scope) {
+/** Every agent DID slug that has a chain file in this scope (for shipping all
+ *  agents' chains, since a scope can host more than one). Returns slugs. */
+export function listChainSlugs(scope = 'main') {
   try {
-    const n = JSON.parse(readFileSync(shipCursorPath(scope), 'utf8'))?.shipped;
+    return readdirSync(auditDir(scope))
+      .filter((f) => f.endsWith('.jsonl'))
+      .map((f) => f.slice(0, -'.jsonl'.length));
+  } catch {
+    return [];
+  }
+}
+
+// ── IdP shipping cursor (per agent: entries past `shipped` haven't reached the IdP) ──
+
+function readShipCursor(scope, agentDid) {
+  try {
+    const n = JSON.parse(readFileSync(shipCursorPath(scope, agentDid), 'utf8'))?.shipped;
     return Number.isInteger(n) ? n : 0;
   } catch {
     return 0;
   }
 }
-function writeShipCursor(scope, shipped) {
-  const path = shipCursorPath(scope);
-  mkdirSync(dirname(path), { recursive: true });
+function writeShipCursor(scope, agentDid, shipped) {
+  const path = shipCursorPath(scope, agentDid);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.tmp`;
   writeFileSync(tmp, JSON.stringify({ shipped }), { mode: 0o600 });
   renameSync(tmp, path);
 }
 
-/** Records not yet shipped to the IdP (seq >= cursor). */
-export function unshippedEntries(scope = 'main') {
-  const cursor = readShipCursor(scope);
-  return readMemoryAudit(scope).filter((r) => Number(r.seq) >= cursor);
+/** This agent's records not yet shipped to the IdP (seq >= cursor). */
+export function unshippedEntries(scope = 'main', agentDid = null) {
+  const cursor = readShipCursor(scope, agentDid);
+  return readMemoryAudit(scope, agentDid).filter((r) => Number(r.seq) >= cursor);
 }
 
-// Drain in SIZE-BOUNDED chunks. The IdP caps the request body (1mb) — shipping
-// the whole chain in one POST means a large backlog (e.g. a long session that
-// never reached the IdP) can NEVER drain: the body exceeds the limit, the POST
-// 413s, the cursor never advances, the backlog grows forever. So we ship oldest-
-// first chunks that each stay well under the limit, advancing the cursor per
-// chunk (offline-safe: a failed chunk leaves the cursor there to retry).
-const MAX_BATCH_BYTES = 512 * 1024; // half the IdP's 1mb limit — headroom for framing
-const MAX_BATCH_COUNT = 200; // also under the IdP handler's 500/POST cap
-const MAX_BATCHES_PER_RUN = 100; // bound one invocation; the rest drains next tick
+// Drain in SIZE-BOUNDED chunks. The IdP caps the request body (1mb); shipping a
+// large backlog in one POST 413s and the cursor never advances. So ship oldest-
+// first chunks well under the limit, advancing the cursor per chunk (offline-
+// safe: a failed chunk leaves the cursor to retry).
+const MAX_BATCH_BYTES = 512 * 1024;
+const MAX_BATCH_COUNT = 200;
+const MAX_BATCHES_PER_RUN = 100;
 
 /**
- * Ship unshipped audit records to the IdP via the injected `post` fn
- * (async (records) => boolean), in size-bounded oldest-first CHUNKS. Advances
+ * Ship THIS agent's unshipped audit records to the IdP via the injected `post`
+ * fn (async (records) => boolean), in size-bounded oldest-first CHUNKS. Advances
  * the cursor after each successful chunk; a failed chunk stops the run and
  * leaves the cursor so we retry. Best-effort + offline-safe. Returns the total
- * number shipped across chunks.
+ * shipped across chunks.
  */
 export async function shipUnshipped(
   scope,
+  agentDid,
   post,
   { maxBatchBytes = MAX_BATCH_BYTES, maxBatchCount = MAX_BATCH_COUNT, maxBatches = MAX_BATCHES_PER_RUN } = {},
 ) {
   let shipped = 0;
   for (let i = 0; i < maxBatches; i += 1) {
-    const pending = unshippedEntries(scope).sort((a, b) => Number(a.seq) - Number(b.seq));
+    const pending = unshippedEntries(scope, agentDid).sort((a, b) => Number(a.seq) - Number(b.seq));
     if (pending.length === 0) break;
-    // Build the next chunk from the oldest records, bounded by serialized size
-    // AND count. The first record always goes in (even if oversized on its own)
-    // so a single big record can't wedge the cursor — the source already caps
-    // per-record metadata, so it stays within the body limit.
     const batch = [];
     let bytes = 2; // "[]"
     for (const r of pending) {
@@ -215,10 +314,10 @@ export async function shipUnshipped(
       bytes += sz;
     }
     const ok = await Promise.resolve(post(batch)).catch(() => false);
-    if (!ok) break; // failed → cursor unchanged; retry on the next drain
-    writeShipCursor(scope, Math.max(...batch.map((r) => Number(r.seq))) + 1);
+    if (!ok) break;
+    writeShipCursor(scope, agentDid, Math.max(...batch.map((r) => Number(r.seq))) + 1);
     shipped += batch.length;
-    if (batch.length === pending.length) break; // drained everything available
+    if (batch.length === pending.length) break;
   }
   return shipped;
 }

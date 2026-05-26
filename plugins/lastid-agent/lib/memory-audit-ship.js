@@ -23,7 +23,9 @@ export async function shipMemoryAudit({
 }) {
   if (typeof fetchImpl !== 'function') return 0;
   const base = `${idpUrl}${AUDIT_PATH}`;
-  return shipUnshipped(scope, async (records) => {
+  // Ship THIS agent's chain (the file is keyed by the listener's agentDid — the
+  // same key that signs the records and the same VC that authenticates here).
+  return shipUnshipped(scope, agentDid, async (records) => {
     let res;
     try {
       res = await fetchImpl(base, {
