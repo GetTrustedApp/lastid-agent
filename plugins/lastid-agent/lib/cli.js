@@ -1279,8 +1279,9 @@ async function cmdListen(flags) {
     const [
       { startVaultServer },
       { resolveVaultShare, resolveVaultSecret },
-      { fetchVaultSecretEnc },
+      { fetchWrappedVaultSecret },
       { publishCredentialedUse },
+      { genVaultHandleKeypair, openWithHandle },
       { VaultHandleStore },
       { OperatorStore },
     ] = await Promise.all([
@@ -1288,6 +1289,7 @@ async function cmdListen(flags) {
       import('./vault-cache.js'),
       import('./vault-secret-fetch.js'),
       import('./vault-use-metrics.js'),
+      import('./sdk-bindings.js'),
       import('./vault-handle-store.js'),
       import('./operator-store.js'),
     ]);
@@ -1306,21 +1308,28 @@ async function cmdListen(flags) {
             onReject: (id, why) =>
               process.stderr.write(`[lastid-agent] vault share ${id} refused: ${why}\n`),
           }),
-        // JIT credential release: fetch the sealed SECRET from the IdP at use
-        // time, decrypt with the slot_seed, hand it to inject (then zeroize).
-        // The secret is never cached — this is what keeps the credential off
-        // the agent at rest (permissioned window = the call, not "forever").
-        resolveSecret: (itemId) =>
+        // Per vault-use: mint the ephemeral handle keypair the secret is wrapped
+        // to (its private key never leaves this listener's memory).
+        genHandleKeypair: () => genVaultHandleKeypair(),
+        // JIT credential release (two-layer envelope): POST the handle public
+        // key → the IdP wraps the sealed secret to it → open with the handle
+        // private key → unseal with the slot_seed → inject → zeroize. The secret
+        // is never cached: the permissioned window is the call, not "forever".
+        resolveSecret: (itemId, handle) =>
           resolveVaultSecret(itemId, {
             slotSeed: loaded.slotSeed,
-            fetchSecretEnc: (id) =>
-              fetchVaultSecretEnc({
+            handle,
+            fetchWrappedSecret: (id, handlePubB64, handleId) =>
+              fetchWrappedVaultSecret({
                 idpUrl,
                 agentDid: loaded.agentDid,
                 vcCompact: loaded.vcCompact,
                 signingSeed,
                 id,
+                handlePubB64,
+                handleId,
               }),
+            openWithHandle,
             onReject: (id, why) =>
               process.stderr.write(`[lastid-agent] vault secret ${id} refused: ${why}\n`),
           }),

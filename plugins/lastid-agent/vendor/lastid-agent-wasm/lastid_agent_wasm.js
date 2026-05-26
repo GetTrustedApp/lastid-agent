@@ -1035,6 +1035,32 @@ function sdkFetchAgentProvisioningPending(user_code, idp_url) {
 exports.sdkFetchAgentProvisioningPending = sdkFetchAgentProvisioningPending;
 
 /**
+ * Generate a fresh ephemeral handle keypair. Returns a JSON string
+ * `{ "secret_sec1_b64", "public_sec1_b64" }` (base64, P-256 SEC1) — a
+ * string, like the other sdk* exports, so JS does JSON.parse (not a Map).
+ * @returns {string}
+ */
+function sdkGenVaultHandleKeypair() {
+    let deferred2_0;
+    let deferred2_1;
+    try {
+        const ret = wasm.sdkGenVaultHandleKeypair();
+        var ptr1 = ret[0];
+        var len1 = ret[1];
+        if (ret[3]) {
+            ptr1 = 0; len1 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred2_0 = ptr1;
+        deferred2_1 = len1;
+        return getStringFromWasm0(ptr1, len1);
+    } finally {
+        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+    }
+}
+exports.sdkGenVaultHandleKeypair = sdkGenVaultHandleKeypair;
+
+/**
  * Load the full message-array JSON for a conversation. Returns
  * `null` when nothing has been persisted yet.
  * @param {string} conversation_id
@@ -1190,6 +1216,31 @@ function sdkMldsaPublicKey(key_id) {
 exports.sdkMldsaPublicKey = sdkMldsaPublicKey;
 
 /**
+ * Open a handle-wrapped blob with the handle's secret key, returning the
+ * INNER blob (still slot-sealed). Verifies `handle_id`. Run by the agent.
+ * @param {string} handle_secret_sec1_b64
+ * @param {string} handle_id
+ * @param {string} sealed_b64
+ * @returns {Uint8Array}
+ */
+function sdkOpenWithHandle(handle_secret_sec1_b64, handle_id, sealed_b64) {
+    const ptr0 = passStringToWasm0(handle_secret_sec1_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(handle_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(sealed_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkOpenWithHandle(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+exports.sdkOpenWithHandle = sdkOpenWithHandle;
+
+/**
  * Persist the full message-array JSON for a conversation
  * (sealed). The caller passes the complete array; this
  * overwrites the prior blob.
@@ -1229,6 +1280,40 @@ function sdkRegisterDelegationAuthority(idp_url) {
     return ret;
 }
 exports.sdkRegisterDelegationAuthority = sdkRegisterDelegationAuthority;
+
+/**
+ * Wrap an opaque INNER blob to a handle public key, binding it to
+ * `handle_id`. Inputs/outputs base64. Run by the holder (broker).
+ * @param {string} handle_public_sec1_b64
+ * @param {string} handle_id
+ * @param {string} inner_b64
+ * @returns {string}
+ */
+function sdkSealToHandle(handle_public_sec1_b64, handle_id, inner_b64) {
+    let deferred5_0;
+    let deferred5_1;
+    try {
+        const ptr0 = passStringToWasm0(handle_public_sec1_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(handle_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(inner_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.sdkSealToHandle(ptr0, len0, ptr1, len1, ptr2, len2);
+        var ptr4 = ret[0];
+        var len4 = ret[1];
+        if (ret[3]) {
+            ptr4 = 0; len4 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred5_0 = ptr4;
+        deferred5_1 = len4;
+        return getStringFromWasm0(ptr4, len4);
+    } finally {
+        wasm.__wbindgen_free(deferred5_0, deferred5_1, 1);
+    }
+}
+exports.sdkSealToHandle = sdkSealToHandle;
 
 /**
  * Sign an agent-state record (rule/memory) with the operator's
@@ -2574,22 +2659,22 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1498, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1504, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h07eda6f9933457e4);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 1080, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 1086, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1725375cb213b3e4);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 1011, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 1017, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h0863b872d6f8b8ab);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1168, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1174, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3c6c61154a9359bf);
             return ret;
         },

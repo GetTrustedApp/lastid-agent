@@ -36,9 +36,12 @@ function deps(over = {}) {
     agentDid: AGENT,
     handles: new VaultHandleStore(),
     resolveShare: async (id) => (id === 'vault_1' ? { ...SHARE } : null),
-    // JIT secret release. zeroizeCalls lets a test assert the secret was wiped.
-    resolveSecret: async (id) =>
+    // JIT secret release (now handle-aware): the secret is wrapped to the
+    // handle's keypair, fetched + opened in resolveSecret.
+    resolveSecret: async (id, _handle) =>
       id === 'vault_1' ? { secret: SECRET, zeroize: () => {} } : null,
+    // Mints the ephemeral handle keypair at vault_use (wasm in prod).
+    genHandleKeypair: async () => ({ public_sec1_b64: 'PUBKEY', secret_sec1_b64: 'PRIVKEY' }),
     fetchImpl: async () => ({ status: 200, text: async () => 'OK', headers: { 'content-type': 'text/plain' } }),
     now: () => Date.now(),
     ...over,
@@ -99,13 +102,32 @@ test('http_fetch injects the secret, calls, and revokes (single-use)', async () 
   assert.equal(replay.error, 'handle_invalid');
 })
 
-test('http_fetch fetches the secret JIT, zeroizes it after, and records timing', async () => {
+test('vault_use mints the handle WITH an ephemeral keypair (for the wrap)', async () => {
+  const d = deps();
+  const used = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  const h = d.handles.lookup(used.vault_handle, { agentDid: AGENT });
+  assert.equal(h.handlePubB64, 'PUBKEY');
+  assert.equal(h.handlePrivB64, 'PRIVKEY');
+  // The keypair is internal — it must NOT be in the agent-facing reply.
+  assert.equal(JSON.stringify(used).includes('PRIVKEY'), false);
+})
+
+test('vault_use fails closed if the handle keypair cannot be minted', async () => {
+  const d = deps({ genHandleKeypair: async () => { throw new Error('wasm down'); } });
+  const r = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  assert.equal(r.error, 'handle_keypair_failed');
+  assert.equal(d.handles.size, 0, 'no handle minted without a keypair');
+})
+
+test('http_fetch fetches the secret JIT (wrapped to the handle), zeroizes, records timing', async () => {
   let zeroized = false;
   let resolvedSecretFor = null;
+  let sawHandleKeypair = false;
   let metric = null;
   const d = deps({
-    resolveSecret: async (id) => {
+    resolveSecret: async (id, handle) => {
       resolvedSecretFor = id;
+      sawHandleKeypair = handle?.handlePubB64 === 'PUBKEY' && handle?.handlePrivB64 === 'PRIVKEY';
       return { secret: SECRET, zeroize: () => { zeroized = true; } };
     },
     recordUse: (kind, _h, m) => { if (kind === 'consume') metric = m; },
@@ -117,6 +139,7 @@ test('http_fetch fetches the secret JIT, zeroizes it after, and records timing',
   );
   assert.equal(r.ok, true);
   assert.equal(resolvedSecretFor, 'vault_1', 'secret fetched JIT for this share');
+  assert.equal(sawHandleKeypair, true, 'the handle (with its keypair) is passed to resolveSecret');
   assert.equal(zeroized, true, 'secret buffer zeroized after the call');
   // Timing captured for the guardrail metrics.
   assert.ok(metric && typeof metric.permissioned_ms === 'number');

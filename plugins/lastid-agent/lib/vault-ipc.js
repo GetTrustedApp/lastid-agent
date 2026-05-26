@@ -45,7 +45,7 @@ export function vaultSocketPath(scope = 'main') {
  *   recordUse(kind,handle) optional timing hook ('mint' | 'consume')
  */
 export async function handleVaultRequest(req, deps) {
-  const { agentDid, resolveShare, resolveSecret, handles, fetchImpl, recordUse, now } = deps;
+  const { agentDid, resolveShare, resolveSecret, genHandleKeypair, handles, fetchImpl, recordUse, now } = deps;
   const clock = typeof now === 'function' ? now : () => Date.now();
   const op = req?.op;
 
@@ -72,12 +72,26 @@ export async function handleVaultRequest(req, deps) {
         require_approval_per_use: content.require_approval_per_use === true,
       };
     }
+    // Mint an ephemeral handle keypair: the public key goes to the holder to
+    // wrap the released credential to; the private key stays here and opens the
+    // wrap exactly once. Required — the secret is delivered wrapped to it.
+    let kp;
+    try {
+      kp = await genHandleKeypair();
+    } catch (e) {
+      return { error: 'handle_keypair_failed', detail: e?.message ?? String(e) };
+    }
+    if (!kp || typeof kp.public_sec1_b64 !== 'string' || typeof kp.secret_sec1_b64 !== 'string') {
+      return { error: 'handle_keypair_failed', detail: 'keypair generator returned no keys' };
+    }
     const h = handles.mint({
       agentDid,
       itemId,
       shareId: content.share_id ?? null,
       wasApproved: req.approved === true,
       approvalId: typeof req.approval_id === 'string' ? req.approval_id : null,
+      handlePubB64: kp.public_sec1_b64,
+      handlePrivB64: kp.secret_sec1_b64,
     });
     recordUse?.('mint', h);
     return {
@@ -114,7 +128,9 @@ export async function handleVaultRequest(req, deps) {
     let response;
     try {
       try {
-        secretObj = await resolveSecret(h.itemId);
+        // Pass the handle so the secret is fetched WRAPPED to its keypair and
+        // opened with the in-memory private key (two-layer envelope).
+        secretObj = await resolveSecret(h.itemId, h);
       } catch (e) {
         return { error: 'secret_unavailable', detail: e?.message ?? String(e) };
       }

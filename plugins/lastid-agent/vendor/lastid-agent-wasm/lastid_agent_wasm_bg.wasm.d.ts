@@ -1,9 +1,6 @@
 /* tslint:disable */
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
-export const sdkAuditEmit: (a: any) => any;
-export const sdkAuditList: (a: number) => any;
-export const sdkAuditVerifyChain: () => any;
 export const __wbg_agentkeypairjs_free: (a: number, b: number) => void;
 export const __wbg_verifiedagentvcjs_free: (a: number, b: number) => void;
 export const __wbg_verifiedhumanauthorizationjs_free: (a: number, b: number) => void;
@@ -41,6 +38,7 @@ export const sdkDeriveProjectRoutingId: (a: number, b: number) => any;
 export const sdkEncryptAgentContentForSlot: (a: number, b: number, c: number) => any;
 export const sdkEncryptProjectContent: (a: number, b: number, c: number, d: number) => any;
 export const sdkFetchAgentProvisioningPending: (a: number, b: number, c: number, d: number) => any;
+export const sdkGenVaultHandleKeypair: () => [number, number, number, number];
 export const sdkGetChatThread: (a: number, b: number) => any;
 export const sdkGetConversation: (a: number, b: number) => any;
 export const sdkGetRecoveryQr: (a: number, b: number) => any;
@@ -49,8 +47,10 @@ export const sdkHasV2DeviceKey: (a: number, b: number) => any;
 export const sdkListConversations: () => any;
 export const sdkLogin: () => any;
 export const sdkMldsaPublicKey: (a: number, b: number) => any;
+export const sdkOpenWithHandle: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const sdkPutChatThread: (a: number, b: number, c: number, d: number) => any;
 export const sdkRegisterDelegationAuthority: (a: number, b: number) => any;
+export const sdkSealToHandle: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const sdkSignAgentStateRecord: (a: any) => any;
 export const sdkSignVaultShareAcl: (a: number, b: number) => any;
 export const sdkSignWithPqDeviceKey: (a: number, b: number, c: number, d: number) => any;
@@ -85,6 +85,9 @@ export const verifyEd25519: (a: number, b: number, c: number, d: number, e: numb
 export const verifyHumanAuthorization: (a: number, b: number, c: any, d: bigint) => [number, number, number];
 export const verifyPopJwt: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: bigint, j: number) => [number, number, number];
 export const verifySessionFingerprint: (a: any) => [number, number, number];
+export const sdkAuditEmit: (a: any) => any;
+export const sdkAuditList: (a: number) => any;
+export const sdkAuditVerifyChain: () => any;
 export const wasm_bindgen__convert__closures_____invoke__h07eda6f9933457e4: (a: number, b: number, c: any) => [number, number];
 export const wasm_bindgen__convert__closures_____invoke__h0242163d3b2fc76a: (a: number, b: number, c: any, d: any) => void;
 export const wasm_bindgen__convert__closures_____invoke__h1725375cb213b3e4: (a: number, b: number, c: any) => void;

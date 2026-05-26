@@ -433,6 +433,13 @@ export function sdkEncryptProjectContent(project_key: string, content: Uint8Arra
 export function sdkFetchAgentProvisioningPending(user_code: string, idp_url: string): Promise<any>;
 
 /**
+ * Generate a fresh ephemeral handle keypair. Returns a JSON string
+ * `{ "secret_sec1_b64", "public_sec1_b64" }` (base64, P-256 SEC1) — a
+ * string, like the other sdk* exports, so JS does JSON.parse (not a Map).
+ */
+export function sdkGenVaultHandleKeypair(): string;
+
+/**
  * Load the full message-array JSON for a conversation. Returns
  * `null` when nothing has been persisted yet.
  */
@@ -533,6 +540,12 @@ export function sdkLogin(): Promise<any>;
 export function sdkMldsaPublicKey(key_id: string): Promise<Uint8Array>;
 
 /**
+ * Open a handle-wrapped blob with the handle's secret key, returning the
+ * INNER blob (still slot-sealed). Verifies `handle_id`. Run by the agent.
+ */
+export function sdkOpenWithHandle(handle_secret_sec1_b64: string, handle_id: string, sealed_b64: string): Uint8Array;
+
+/**
  * Persist the full message-array JSON for a conversation
  * (sealed). The caller passes the complete array; this
  * overwrites the prior blob.
@@ -553,6 +566,12 @@ export function sdkPutChatThread(conversation_id: string, messages_json: string)
  * the trust anchor for subsequent provisions.
  */
 export function sdkRegisterDelegationAuthority(idp_url: string): Promise<any>;
+
+/**
+ * Wrap an opaque INNER blob to a handle public key, binding it to
+ * `handle_id`. Inputs/outputs base64. Run by the holder (broker).
+ */
+export function sdkSealToHandle(handle_public_sec1_b64: string, handle_id: string, inner_b64: string): string;
 
 /**
  * Sign an agent-state record (rule/memory) with the operator's

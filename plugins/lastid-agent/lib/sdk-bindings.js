@@ -200,6 +200,19 @@ export async function initializeSdkBindings() {
       return wasm.capabilitiesIsSubsetOf(child, parent);
     },
 
+    // ── Vault handle envelope (JIT credential delivery, agent side) ──
+    // Mint an ephemeral handle keypair per vault-use; the public key goes to
+    // the holder (IdP) to wrap the released credential to, the private key
+    // stays in the listener's memory and opens the wrapped blob exactly once.
+    genVaultHandleKeypair() {
+      return JSON.parse(wasm.sdkGenVaultHandleKeypair());
+    },
+    // Open a handle-wrapped blob → the inner (still slot-sealed) bytes
+    // (Uint8Array). Verifies handle_id; throws on a wrong key/id or tamper.
+    openWithHandle(handleSecretSec1B64, handleId, sealedB64) {
+      return wasm.sdkOpenWithHandle(handleSecretSec1B64, handleId, sealedB64);
+    },
+
     // ── Convenience wrappers matching the previous stub shape ──────
     async computeEd25519JwkThumbprint(jwk) {
       if (typeof jwk === 'object' && jwk?.x) {
@@ -258,4 +271,14 @@ export async function mintOid4vciProofJwt(keypair, opts) {
 export async function computeEd25519JwkThumbprint(jwk) {
   const sdk = await initializeSdkBindings();
   return sdk.computeEd25519JwkThumbprint(jwk);
+}
+
+export async function genVaultHandleKeypair() {
+  const sdk = await initializeSdkBindings();
+  return sdk.genVaultHandleKeypair();
+}
+
+export async function openWithHandle(handleSecretSec1B64, handleId, sealedB64) {
+  const sdk = await initializeSdkBindings();
+  return sdk.openWithHandle(handleSecretSec1B64, handleId, sealedB64);
 }

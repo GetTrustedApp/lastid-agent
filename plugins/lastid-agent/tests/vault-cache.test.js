@@ -200,53 +200,121 @@ test('resolveVaultShare: decrypts but UNSIGNED → null (fails the operator-sig 
   }
 });
 
-// resolveVaultSecret — the JIT credential release: fetch the sealed secret,
-// decrypt with the slot_seed, bind it to the share id, expose a zeroize().
-// The negative paths (no release, undecryptable, wrong share) must fail closed.
-test('resolveVaultSecret: decrypts the JIT-released secret + companion, bound to the id', async () => {
-  const sealed = encryptContent(
-    SLOT,
-    Buffer.from(JSON.stringify({ item_id: 'v', secret: 'sk-zzz', secret_secondary: 'refresh-q' }), 'utf8'),
-  ).toString('base64');
-  const out = await resolveVaultSecret('v', { slotSeed: SLOT, fetchSecretEnc: async () => sealed });
+// resolveVaultSecret — the TWO-LAYER JIT release: fetch wrapped → open the
+// handle wrap (outer) → unseal with slot_seed (inner) → bind to the share id →
+// zeroize. The negative paths (no release, bad unwrap, undecryptable, wrong
+// share) must all fail closed.
+const HANDLE = { token: 'h1', handlePubB64: 'PUB', handlePrivB64: 'PRIV' };
+// The INNER blob the IdP wrapped: the secret JSON sealed to the slot_seed. In
+// the live path the IdP wraps this to the handle; here openWithHandle hands it
+// back directly (the wrap/open round-trip is covered by the SDK's own tests).
+const innerSealed = (obj) => encryptContent(SLOT, Buffer.from(JSON.stringify(obj), 'utf8'));
+
+test('resolveVaultSecret: opens the wrap, unseals, returns the secret bound to the id', async () => {
+  const inner = innerSealed({ item_id: 'v', secret: 'sk-zzz', secret_secondary: 'refresh-q' });
+  let sentPub = null;
+  let sentHandleId = null;
+  const out = await resolveVaultSecret('v', {
+    slotSeed: SLOT,
+    handle: HANDLE,
+    fetchWrappedSecret: async (_id, pub, hid) => {
+      sentPub = pub;
+      sentHandleId = hid;
+      return 'WRAPPED-b64';
+    },
+    openWithHandle: (priv, hid, wrapped) => {
+      assert.equal(priv, 'PRIV');
+      assert.equal(hid, 'h1');
+      assert.equal(wrapped, 'WRAPPED-b64');
+      return inner;
+    },
+  });
+  assert.equal(sentPub, 'PUB', 'sends the handle public key to be wrapped to');
+  assert.equal(sentHandleId, 'h1', 'binds to the handle token');
   assert.equal(out.secret, 'sk-zzz');
   assert.equal(out.secret_secondary, 'refresh-q');
   assert.equal(typeof out.zeroize, 'function');
-  out.zeroize(); // wipes the decrypted buffer; must not throw
+  out.zeroize(); // wipes the decrypted buffers; must not throw
+});
+
+test('resolveVaultSecret: a handle with no keypair cannot unwrap → null', async () => {
+  let why = null;
+  const out = await resolveVaultSecret('v', {
+    slotSeed: SLOT,
+    handle: { token: 'h1' }, // no handlePubB64 / handlePrivB64
+    fetchWrappedSecret: async () => 'WRAPPED',
+    openWithHandle: () => Buffer.from('x'),
+    onReject: (_id, w) => (why = w),
+  });
+  assert.equal(out, null);
+  assert.match(why, /keypair/);
 });
 
 test('resolveVaultSecret: no secret released (404 → null) → null + onReject', async () => {
   let why = null;
-  const out = await resolveVaultSecret('v', { slotSeed: SLOT, fetchSecretEnc: async () => null, onReject: (_id, w) => (why = w) });
+  const out = await resolveVaultSecret('v', {
+    slotSeed: SLOT,
+    handle: HANDLE,
+    fetchWrappedSecret: async () => null,
+    openWithHandle: () => Buffer.from('x'),
+    onReject: (_id, w) => (why = w),
+  });
   assert.equal(out, null);
   assert.match(why, /no secret released/);
 });
 
-test('resolveVaultSecret: a secret sealed for a DIFFERENT share is rejected (item_id bind)', async () => {
-  const sealed = encryptContent(
-    SLOT,
-    Buffer.from(JSON.stringify({ item_id: 'OTHER', secret: 'sk-zzz' }), 'utf8'),
-  ).toString('base64');
+test('resolveVaultSecret: a failed handle unwrap (wrong key/id/tamper) → null', async () => {
   let why = null;
-  const out = await resolveVaultSecret('v', { slotSeed: SLOT, fetchSecretEnc: async () => sealed, onReject: (_id, w) => (why = w) });
-  assert.equal(out, null, 'a relay serving the wrong share-secret must fail closed');
-  assert.match(why, /item_id mismatch/);
+  const out = await resolveVaultSecret('v', {
+    slotSeed: SLOT,
+    handle: HANDLE,
+    fetchWrappedSecret: async () => 'WRAPPED',
+    openWithHandle: () => {
+      throw new Error('handle_id in envelope does not match');
+    },
+    onReject: (_id, w) => (why = w),
+  });
+  assert.equal(out, null);
+  assert.match(why, /unwrap failed/);
 });
 
-test('resolveVaultSecret: undecryptable (wrong slot_seed / corrupt) → null', async () => {
+test('resolveVaultSecret: an undecryptable inner blob (wrong slot_seed / corrupt) → null', async () => {
   let why = null;
-  const out = await resolveVaultSecret('v', { slotSeed: SLOT, fetchSecretEnc: async () => 'bm90LXNlYWxlZA==', onReject: (_id, w) => (why = w) });
+  const out = await resolveVaultSecret('v', {
+    slotSeed: SLOT,
+    handle: HANDLE,
+    fetchWrappedSecret: async () => 'WRAPPED',
+    openWithHandle: () => Buffer.from('not-a-sealed-envelope'),
+    onReject: (_id, w) => (why = w),
+  });
   assert.equal(out, null);
   assert.match(why, /undecryptable/);
 });
 
-test('resolveVaultSecret: an empty released secret → null', async () => {
-  const sealed = encryptContent(
-    SLOT,
-    Buffer.from(JSON.stringify({ item_id: 'v', secret: '' }), 'utf8'),
-  ).toString('base64');
+test('resolveVaultSecret: an inner sealed for a DIFFERENT share is rejected (item_id bind)', async () => {
+  const inner = innerSealed({ item_id: 'OTHER', secret: 'sk-zzz' });
   let why = null;
-  const out = await resolveVaultSecret('v', { slotSeed: SLOT, fetchSecretEnc: async () => sealed, onReject: (_id, w) => (why = w) });
+  const out = await resolveVaultSecret('v', {
+    slotSeed: SLOT,
+    handle: HANDLE,
+    fetchWrappedSecret: async () => 'WRAPPED',
+    openWithHandle: () => inner,
+    onReject: (_id, w) => (why = w),
+  });
+  assert.equal(out, null, 'a relay serving the wrong share-secret must fail closed');
+  assert.match(why, /item_id mismatch/);
+});
+
+test('resolveVaultSecret: an empty released secret → null', async () => {
+  const inner = innerSealed({ item_id: 'v', secret: '' });
+  let why = null;
+  const out = await resolveVaultSecret('v', {
+    slotSeed: SLOT,
+    handle: HANDLE,
+    fetchWrappedSecret: async () => 'WRAPPED',
+    openWithHandle: () => inner,
+    onReject: (_id, w) => (why = w),
+  });
   assert.equal(out, null);
   assert.match(why, /empty/);
 });

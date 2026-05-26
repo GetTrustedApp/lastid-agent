@@ -30,7 +30,16 @@ export class VaultHandleStore {
    * caller returns ONLY { vault_handle: token, expires_at_ms, item_id,
    * injection } to the agent.
    */
-  mint({ agentDid, itemId, ttlMs = DEFAULT_TTL_MS, shareId = null, wasApproved = false, approvalId = null }) {
+  mint({
+    agentDid,
+    itemId,
+    ttlMs = DEFAULT_TTL_MS,
+    shareId = null,
+    wasApproved = false,
+    approvalId = null,
+    handlePubB64 = null,
+    handlePrivB64 = null,
+  }) {
     if (!agentDid || !itemId) throw new Error("mint needs agentDid + itemId");
     const mintedAtMs = this.#now();
     const token = this.#genToken();
@@ -44,6 +53,11 @@ export class VaultHandleStore {
       mintedAtMs,
       expiresAtMs: mintedAtMs + ttlMs,
       ttlMs,
+      // Ephemeral handle keypair (JIT credential wrap). The PUBLIC key is sent
+      // to the holder to wrap the released credential to; the PRIVATE key lives
+      // ONLY here, in memory, and opens the wrap exactly once before revoke.
+      handlePubB64,
+      handlePrivB64,
     };
     this.#handles.set(token, handle);
     return handle;

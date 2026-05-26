@@ -133,43 +133,74 @@ export function resolveVaultShare(scope, id, { slotSeed, operatorJwk, onReject }
 }
 
 /**
- * Resolve the JIT-released SECRET for a share. The secret is NEVER cached:
- * `fetchSecretEnc(id)` pulls the ciphertext from the IdP at use time
- * (GET /v1/agent-state/vault/:id/secret), which we decrypt with the slot_seed.
+ * Resolve the JIT-released SECRET for a share, via the TWO-LAYER envelope. The
+ * secret is NEVER cached:
+ *   1. `fetchWrappedSecret(id, handlePubB64, handleId)` POSTs the handle's
+ *      public key to the IdP, which wraps the (opaque, slot-sealed) secret to it
+ *      → `wrapped_secret_b64`.
+ *   2. `openWithHandle(handlePrivB64, handleId, wrapped)` opens the OUTER layer
+ *      with the handle's private key → the inner (slot-sealed) bytes.
+ *   3. `decryptContent(slotSeed, inner)` opens the INNER layer → the secret JSON.
  * Returns `{ secret, secret_secondary?, zeroize() }` or null.
  *
- * `zeroize()` overwrites the decrypted byte buffer — call it the instant the
+ * `zeroize()` overwrites the decrypted byte buffers — call it the instant the
  * secret has been injected. (JS strings are immutable + GC-managed, so the
- * parsed string copy itself can't be wiped; zeroize wipes the decrypted Buffer
- * — the controllable copy — and the caller drops references promptly. The
- * secret never touches disk.)
+ * parsed string copy itself can't be wiped; zeroize wipes the decrypted Buffers
+ * — the controllable copies — and the caller drops references. The secret never
+ * touches disk; the handle private key lives only in memory and is revoked.)
  *
- * Fails closed: an undecryptable blob (only the operator can seal to this
- * slot_seed; the IdP cannot), or one whose embedded item_id doesn't match the
- * requested share (a relay serving another share's secret), returns null.
+ * Fails closed: no release (404 → null), an outer-layer open failure (wrong
+ * handle key / handle_id / tamper), an undecryptable inner blob (only the
+ * operator can seal to this slot_seed), or an embedded item_id that doesn't
+ * match the requested share (a relay serving another share's secret).
  */
-export async function resolveVaultSecret(id, { slotSeed, fetchSecretEnc, onReject } = {}) {
-  let encSecret;
+export async function resolveVaultSecret(
+  id,
+  { slotSeed, handle, fetchWrappedSecret, openWithHandle, onReject } = {},
+) {
+  const handlePubB64 = handle?.handlePubB64;
+  const handlePrivB64 = handle?.handlePrivB64;
+  const handleId = handle?.token;
+  if (!handlePubB64 || !handlePrivB64 || !handleId) {
+    if (onReject) onReject(id, 'handle has no ephemeral keypair (cannot unwrap)');
+    return null;
+  }
+  let wrapped;
   try {
-    encSecret = await fetchSecretEnc(id);
+    wrapped = await fetchWrappedSecret(id, handlePubB64, handleId);
   } catch (e) {
     if (onReject) onReject(id, `secret fetch failed: ${e?.message ?? e}`);
     return null;
   }
-  if (typeof encSecret !== 'string' || encSecret.length === 0) {
+  if (typeof wrapped !== 'string' || wrapped.length === 0) {
     if (onReject) onReject(id, 'no secret released');
     return null;
   }
+  // Outer layer: open the handle wrap with the (in-memory) handle private key.
+  let inner;
+  try {
+    inner = Buffer.from(await openWithHandle(handlePrivB64, handleId, wrapped));
+  } catch (e) {
+    if (onReject) onReject(id, `handle unwrap failed (wrong key/id or tamper): ${e?.message ?? e}`);
+    return null;
+  }
+  // Inner layer: unseal with the agent's slot_seed.
   let bytes;
   try {
-    bytes = decryptContent(slotSeed, encSecret);
+    bytes = decryptContent(slotSeed, inner);
   } catch {
+    try {
+      inner.fill(0);
+    } catch {
+      /* best-effort */
+    }
     if (onReject) onReject(id, 'undecryptable secret (wrong slot_seed / corrupt)');
     return null;
   }
   const wipe = () => {
     try {
       bytes.fill(0);
+      inner.fill(0);
     } catch {
       /* best-effort */
     }
