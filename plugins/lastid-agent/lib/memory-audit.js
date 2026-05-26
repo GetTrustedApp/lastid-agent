@@ -176,20 +176,49 @@ export function unshippedEntries(scope = 'main') {
   return readMemoryAudit(scope).filter((r) => Number(r.seq) >= cursor);
 }
 
+// Drain in SIZE-BOUNDED chunks. The IdP caps the request body (1mb) — shipping
+// the whole chain in one POST means a large backlog (e.g. a long session that
+// never reached the IdP) can NEVER drain: the body exceeds the limit, the POST
+// 413s, the cursor never advances, the backlog grows forever. So we ship oldest-
+// first chunks that each stay well under the limit, advancing the cursor per
+// chunk (offline-safe: a failed chunk leaves the cursor there to retry).
+const MAX_BATCH_BYTES = 512 * 1024; // half the IdP's 1mb limit — headroom for framing
+const MAX_BATCH_COUNT = 200; // also under the IdP handler's 500/POST cap
+const MAX_BATCHES_PER_RUN = 100; // bound one invocation; the rest drains next tick
+
 /**
  * Ship unshipped audit records to the IdP via the injected `post` fn
- * (async (records) => boolean). Advances the cursor only on success.
- * Best-effort + offline-safe: a failed post leaves the cursor so we retry.
- * Returns the number shipped.
+ * (async (records) => boolean), in size-bounded oldest-first CHUNKS. Advances
+ * the cursor after each successful chunk; a failed chunk stops the run and
+ * leaves the cursor so we retry. Best-effort + offline-safe. Returns the total
+ * number shipped across chunks.
  */
-export async function shipUnshipped(scope, post) {
-  const pending = unshippedEntries(scope);
-  if (pending.length === 0) return 0;
-  const ok = await Promise.resolve(post(pending)).catch(() => false);
-  if (ok) {
-    const maxSeq = Math.max(...pending.map((r) => Number(r.seq)));
-    writeShipCursor(scope, maxSeq + 1);
-    return pending.length;
+export async function shipUnshipped(
+  scope,
+  post,
+  { maxBatchBytes = MAX_BATCH_BYTES, maxBatchCount = MAX_BATCH_COUNT, maxBatches = MAX_BATCHES_PER_RUN } = {},
+) {
+  let shipped = 0;
+  for (let i = 0; i < maxBatches; i += 1) {
+    const pending = unshippedEntries(scope).sort((a, b) => Number(a.seq) - Number(b.seq));
+    if (pending.length === 0) break;
+    // Build the next chunk from the oldest records, bounded by serialized size
+    // AND count. The first record always goes in (even if oversized on its own)
+    // so a single big record can't wedge the cursor — the source already caps
+    // per-record metadata, so it stays within the body limit.
+    const batch = [];
+    let bytes = 2; // "[]"
+    for (const r of pending) {
+      const sz = JSON.stringify(r).length + 1;
+      if (batch.length > 0 && (bytes + sz > maxBatchBytes || batch.length >= maxBatchCount)) break;
+      batch.push(r);
+      bytes += sz;
+    }
+    const ok = await Promise.resolve(post(batch)).catch(() => false);
+    if (!ok) break; // failed → cursor unchanged; retry on the next drain
+    writeShipCursor(scope, Math.max(...batch.map((r) => Number(r.seq))) + 1);
+    shipped += batch.length;
+    if (batch.length === pending.length) break; // drained everything available
   }
-  return 0;
+  return shipped;
 }

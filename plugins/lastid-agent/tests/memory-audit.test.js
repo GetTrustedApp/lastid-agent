@@ -214,3 +214,43 @@ test('memory tools SPOOL audit records (write/update/forget); draft does NOT; li
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// REGRESSION (PayloadTooLargeError / 0 records at the IdP): a large backlog used
+// to ship in ONE POST that exceeded the IdP's 1mb body limit, so it 413'd, the
+// cursor never advanced, and the backlog grew forever. shipUnshipped now drains
+// in size-bounded chunks, advancing the cursor per chunk.
+test('shipUnshipped drains a large backlog in size-bounded chunks (per-chunk cursor)', async () => {
+  const { scope, dir } = freshScope();
+  try {
+    for (let i = 0; i < 250; i += 1) {
+      appendMemoryAudit({ scope, signingKey: privateKey, agentDid: 'did:a', eventType: 'AgentToolInvoked', memoryId: `m${i}`, metadata: { input: 'x'.repeat(3000) } });
+    }
+    const batchSizes = [];
+    const shipped = await shipUnshipped(scope, async (recs) => { batchSizes.push(recs.length); return true; }, { maxBatchBytes: 50 * 1024 });
+    assert.equal(shipped, 250, 'all records drained');
+    assert.ok(batchSizes.length > 1, 'drained across multiple chunks, not one oversized POST');
+    assert.ok(Math.max(...batchSizes) <= 200, 'each chunk under the count cap');
+    assert.equal(unshippedEntries(scope).length, 0, 'cursor fully advanced — backlog cleared');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('shipUnshipped: a failed chunk stops + leaves the cursor (offline-safe, resumable)', async () => {
+  const { scope, dir } = freshScope();
+  try {
+    for (let i = 0; i < 300; i += 1) {
+      appendMemoryAudit({ scope, signingKey: privateKey, agentDid: 'did:a', eventType: 'AgentToolInvoked', memoryId: `m${i}`, metadata: { input: 'x'.repeat(3000) } });
+    }
+    let call = 0;
+    const shipped1 = await shipUnshipped(scope, async () => (++call === 1), { maxBatchBytes: 50 * 1024 });
+    assert.ok(shipped1 > 0 && shipped1 < 300, 'shipped only the first chunk, then stopped on the failure');
+    assert.equal(shipped1 + unshippedEntries(scope).length, 300, 'cursor left at the failed chunk; the rest is still pending');
+    // Resume: everything succeeds → drains the remainder (no records lost or double-shipped).
+    const shipped2 = await shipUnshipped(scope, async () => true, { maxBatchBytes: 50 * 1024 });
+    assert.equal(shipped1 + shipped2, 300);
+    assert.equal(unshippedEntries(scope).length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
