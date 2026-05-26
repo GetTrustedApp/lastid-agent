@@ -28,6 +28,7 @@ import {
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { canonicalTool } from './tool-taxonomy.js';
+import { selfProtectionRecords, selfProtectionDisabledByEnv } from './self-protection.js';
 
 // Most-restrictive-wins precedence when several rules match one call.
 const SEVERITY_RANK = { deny: 3, rewrite: 2, warn: 1 };
@@ -165,6 +166,26 @@ export class OperatorStore {
   }
 
   /**
+   * Is agent self-protection (deny reading LastID's own keys) active? ON by
+   * default — disabled only by a local env override (debugging LastID itself)
+   * or a synced operator opt-out (a 'self_protection' record, content.enabled
+   * === false, delivered on the same rails as the audit policy).
+   */
+  selfProtectionEnabled() {
+    // Disable is allowed ONLY from a trusted source — NEVER an unsigned edit to
+    // operator-state.json on disk. An attacker, or the agent's own Write tool,
+    // could otherwise append a `self_protection:{enabled:false}` record and turn
+    // off its own guard. So we do NOT honor any file-resident flag here.
+    //   (1) a local env override for debugging LastID itself — explicit,
+    //       process-level, NOT a file edit (LASTID_SELF_PROTECTION=off);
+    //   (2) [pending] a delegation-SIGNED operator opt-out, re-verified against
+    //       the pinned key at this read (so a forged on-disk record can't pass).
+    // Default: ON.
+    if (selfProtectionDisabledByEnv()) return false;
+    return true;
+  }
+
+  /**
    * Evaluate the local rules against a tool call. Output mirrors the
    * desktop /policy/check shape so the PreToolUse hook can consume it
    * unchanged:
@@ -191,7 +212,14 @@ export class OperatorStore {
     const flat = flattenInput(toolInput);
     let best = null;
     let bestUpdatedAt = '';
-    for (const r of this.listRules()) {
+    // Synced operator rules PLUS the built-in agent self-protection rules (deny
+    // reading LastID's own keys) unless disabled — one matcher, one deny/audit/
+    // metric path; a self-protection deny wins (most-restrictive). Built-in so a
+    // brand-new agent is protected before its first sync.
+    const candidates = this.selfProtectionEnabled()
+      ? [...this.listRules(), ...selfProtectionRecords()]
+      : this.listRules();
+    for (const r of candidates) {
       const c = r.content || {};
       // Per-agent opt-out: skip a rule this agent is exempt from.
       if (selfDid && Array.isArray(c.exempt_agents) && c.exempt_agents.includes(selfDid)) continue;
@@ -219,6 +247,9 @@ export class OperatorStore {
         ...(c.curated === true
           ? { curated: true, pack: c.pack ?? null, rule: c.rule ?? null, pack_version: c.pack_version ?? null }
           : {}),
+        // Mark a self-protection deny so the hook/console can present it
+        // distinctly ("agent protecting its own keys") from operator rules.
+        ...(c.self_protection === true ? { self_protection: true } : {}),
       };
       const better =
         !best ||
