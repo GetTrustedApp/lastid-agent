@@ -14,6 +14,7 @@ import { rmSync } from 'node:fs';
 
 import { handleVaultRequest, startVaultServer, vaultRequest, vaultSocketPath } from '../lib/vault-ipc.js';
 import { VaultHandleStore } from '../lib/vault-handle-store.js';
+import { VaultRateTracker } from '../lib/vault-rate.js';
 
 const AGENT = 'did:lastid:agent:zA';
 
@@ -169,6 +170,46 @@ test('http_fetch with a bogus / other-agent handle → handle_invalid (no fetch)
   const r = await handleVaultRequest({ op: 'http_fetch', vault_handle: 'not-a-real-token', url: 'https://x' }, d);
   assert.equal(r.error, 'handle_invalid');
   assert.equal(called, false);
+})
+
+test('rate_per_minute enforces across calls — the listener supplies the count', async () => {
+  // A shared tracker + fixed clock: max 1/min, so the 2nd use within the window
+  // is denied. Proves the listener feeds uses_last_minute (previously always 0,
+  // so the limit never tripped) and only counts successful mints.
+  const rateTracker = new VaultRateTracker();
+  const now = 1_000_000;
+  const d = deps({
+    rateTracker,
+    now: () => now,
+    resolveShare: async () => ({ ...SHARE, constraints: [{ type: 'rate_per_minute', max: 1 }] }),
+  });
+  const first = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  assert.equal(first.ok, true, 'first use under the limit is allowed + minted');
+  const second = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  assert.equal(second.error, 'policy_denied');
+  assert.equal(second.reason_kind, 'rate_limited');
+  assert.equal(second.constraint_kind, 'rate_per_minute');
+})
+
+test('a denied use does not consume rate budget', async () => {
+  // First use denied for a DIFFERENT reason (time window) must not record a mint,
+  // so a later in-window use still has full budget.
+  const rateTracker = new VaultRateTracker();
+  const now = Date.parse('2026-03-01T12:00:00Z');
+  const d = deps({
+    rateTracker,
+    now: () => now,
+    resolveShare: async () => ({
+      ...SHARE,
+      constraints: [
+        { type: 'time_window', not_before: '2026-01-01T00:00:00Z', not_after: '2026-02-01T00:00:00Z' }, // expired
+        { type: 'rate_per_minute', max: 1 },
+      ],
+    }),
+  });
+  const denied = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  assert.equal(denied.error, 'policy_denied');
+  assert.equal(rateTracker.count('vault_1', 60_000, now), 0, 'denied use recorded no mint');
 })
 
 test('round-trips over the real unix socket', async () => {

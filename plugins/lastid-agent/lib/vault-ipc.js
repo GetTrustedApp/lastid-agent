@@ -24,6 +24,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { evalShareForUse, OUTCOME } from './vault-policy.js';
+import { defaultRateTracker } from './vault-rate.js';
 import { applyInjection, injectionSummary } from './vault-inject.js';
 import { usageContext, summarizeConstraints } from './vault-cache.js';
 
@@ -45,7 +46,7 @@ export function vaultSocketPath(scope = 'main') {
  *   recordUse(kind,handle) optional timing hook ('mint' | 'consume')
  */
 export async function handleVaultRequest(req, deps) {
-  const { agentDid, resolveShare, resolveSecret, genHandleKeypair, handles, fetchImpl, recordUse, now } = deps;
+  const { agentDid, resolveShare, resolveSecret, genHandleKeypair, handles, fetchImpl, recordUse, now, rateTracker = defaultRateTracker } = deps;
   const clock = typeof now === 'function' ? now : () => Date.now();
   const op = req?.op;
 
@@ -55,7 +56,11 @@ export async function handleVaultRequest(req, deps) {
     const content = await resolveShare(itemId);
     if (!content) return { error: 'share_not_found', detail: 'no verified share for this item' };
 
-    const policy = evalShareForUse({ content, ctx: req.ctx ?? {} });
+    // The listener is the single point that sees every mint, so IT supplies the
+    // authoritative recent-use count for rate_per_minute (the caller can't be
+    // trusted to count its own uses). Overrides any client-sent value.
+    const ctx = { ...(req.ctx ?? {}), uses_last_minute: rateTracker.count(itemId, 60_000, clock()) };
+    const policy = evalShareForUse({ content, ctx });
     if (policy.outcome === OUTCOME.DENY) {
       return { error: 'policy_denied', reason_kind: policy.reason_kind, reason_detail: policy.reason_detail, constraint_kind: policy.constraint_kind };
     }
@@ -93,6 +98,9 @@ export async function handleVaultRequest(req, deps) {
       handlePubB64: kp.public_sec1_b64,
       handlePrivB64: kp.secret_sec1_b64,
     });
+    // Count this mint toward the per-item rate window (only successful mints —
+    // a denied/pending use must not consume rate budget).
+    rateTracker.record(itemId, clock());
     recordUse?.('mint', h);
     return {
       ok: true,
