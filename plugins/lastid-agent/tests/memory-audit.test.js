@@ -18,6 +18,7 @@ import { rmSync, writeFileSync } from 'node:fs';
 import {
   appendMemoryAudit,
   maybeCheckpoint,
+  auditSelfCheck,
   readMemoryAudit,
   verifyMemoryAudit,
   publicKeyFor,
@@ -209,6 +210,62 @@ test('self-heal: a corrupt tail re-roots a NEW generation instead of chaining on
       return fresh.integrity_hash === healed.integrity_hash;
     })();
     assert.ok(recomputed, 'the healed genesis is persisted intact');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('auditSelfCheck: intact chain is a no-op (no reset record added)', () => {
+  const { scope, dir } = freshScope();
+  try {
+    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm0' });
+    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
+    const before = readMemoryAudit(scope, AGENT).length;
+    const r = auditSelfCheck({ scope, signingKey: privateKey, agentDid: AGENT, publicKey });
+    assert.equal(r.intact, true);
+    assert.equal(r.healed, undefined);
+    assert.equal(readMemoryAudit(scope, AGENT).length, before, 'no record added when intact');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// THE DEEP-BREAK case the append-time tail-heal can't catch: a MIDDLE record is
+// tampered (the tail still verifies). auditSelfCheck must detect it and re-root
+// a clean generation via a genesis ChainCheckpoint, so future events chain off
+// the reset, not the broken generation.
+test('auditSelfCheck: a deep (middle) break → checkpoint + re-genesis reset', () => {
+  const { scope, dir } = freshScope();
+  try {
+    const a = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm0' });
+    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
+    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm2' });
+    // Tamper the MIDDLE record (seq 1); the tail (seq 2) still verifies on its own.
+    const path = memoryAuditPath(scope, AGENT);
+    const lines = readMemoryAudit(scope, AGENT);
+    lines[1].memory_id = 'm1_TAMPERED';
+    writeFileSync(path, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+
+    const r = auditSelfCheck({ scope, signingKey: privateKey, agentDid: AGENT, publicKey });
+    assert.equal(r.intact, false);
+    assert.equal(r.healed, true);
+    assert.equal(r.firstFailure.seq, 1, 'detected the middle break');
+
+    // A genesis-rooted reset ChainCheckpoint was appended.
+    const after = readMemoryAudit(scope, AGENT);
+    const reset = after[after.length - 1];
+    assert.equal(reset.event_type, CHECKPOINT_EVENT);
+    assert.equal(reset.seq, 0, 'reset is a fresh genesis');
+    assert.equal(reset.prev_hash, null);
+    assert.notEqual(reset.chain_id, a.chain_id, 'a new generation');
+    assert.equal(reset.metadata.chain_reset, true);
+    assert.equal(reset.metadata.broke_at_seq, 1);
+
+    // A subsequent append chains onto the clean reset (seq 1, same new chain_id).
+    const next = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm3' });
+    assert.equal(next.chain_id, reset.chain_id);
+    assert.equal(next.seq, 1);
+    assert.equal(next.prev_hash, reset.integrity_hash);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

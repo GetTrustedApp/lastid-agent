@@ -1107,6 +1107,18 @@ async function cmdListen(flags) {
     if (auditFlushing) return;
     auditFlushing = true;
     try {
+      // RANDOM self-verification (~1 in 5 flushes): the append-time self-heal
+      // only catches a broken TAIL; this catches a DEEP break and re-roots a
+      // clean generation BEFORE we drain new events onto it. Cheap + best-effort.
+      if (Math.random() < 0.2) {
+        try {
+          const { auditSelfCheck, publicKeyFor } = await import('./memory-audit.js');
+          const r = auditSelfCheck({ scope, signingKey, agentDid: loaded.agentDid, publicKey: publicKeyFor(signingKey) });
+          if (r.healed) process.stderr.write(`[lastid-agent] audit chain healed (was broken at seq ${r.firstFailure?.seq})\n`);
+        } catch (e) {
+          process.stderr.write(`[lastid-agent] audit self-check failed: ${e?.message ?? e}\n`);
+        }
+      }
       try {
         const { drainAuditSpool } = await import('./audit-spool.js');
         const chained = drainAuditSpool({ scope, signingKey, agentDid: loaded.agentDid });

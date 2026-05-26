@@ -244,6 +244,48 @@ export function publicKeyFor(signingKey) {
   }
 }
 
+/**
+ * Self-check THIS agent's chain and HEAL a deep break. The append-time self-heal
+ * only catches a broken TAIL; a break in the MIDDLE leaves an intact tail, so a
+ * plain append keeps extending the broken generation. This verifies the whole
+ * chain and, on ANY break, stamps a genesis-rooted ChainCheckpoint (new
+ * chain_id, seq 0, prev_hash null) flagging the break — so the chain
+ * "checkpoints and starts chaining again" from a clean root (the console shows
+ * the broken generation as history + this reset as a red divider + new genesis).
+ * The listener runs this RANDOMLY (not only on demand). Returns the report
+ * (with healed:true when a reset was written). Best-effort; never throws.
+ */
+export function auditSelfCheck({ scope = 'main', signingKey, agentDid = null, publicKey = null } = {}) {
+  let report;
+  try {
+    report = verifyMemoryAudit(scope, agentDid, publicKey);
+  } catch (err) {
+    process.stderr.write(`[lastid-agent] audit self-check failed to read: ${err?.message ?? err}\n`);
+    return { intact: true, total: 0 };
+  }
+  if (report.intact || report.total === 0) return report;
+  process.stderr.write(
+    `[lastid-agent] audit self-check: chain broken at seq ${report.firstFailure?.seq} ` +
+      `(${report.firstFailure?.kind}) — checkpoint + re-genesis\n`,
+  );
+  try {
+    signAndWrite(scope, agentDid, signingKey, recordCore(null, {
+      agentDid,
+      eventType: CHECKPOINT_EVENT,
+      memoryId: null,
+      metadata: {
+        chain_reset: true,
+        broke_at_seq: report.firstFailure?.seq ?? null,
+        failure_kind: report.firstFailure?.kind ?? null,
+      },
+    }));
+  } catch (err) {
+    process.stderr.write(`[lastid-agent] audit self-check heal failed: ${err?.message ?? err}\n`);
+    return report;
+  }
+  return { ...report, healed: true };
+}
+
 /** Every agent DID slug that has a chain file in this scope (for shipping all
  *  agents' chains, since a scope can host more than one). Returns slugs. */
 export function listChainSlugs(scope = 'main') {
