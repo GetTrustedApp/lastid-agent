@@ -25,6 +25,7 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { evalShareForUse, OUTCOME } from './vault-policy.js';
 import { defaultRateTracker } from './vault-rate.js';
+import { exchangeClientCredentials } from './oauth-exchange.js';
 import { applyInjection, injectionSummary } from './vault-inject.js';
 import { usageContext, summarizeConstraints } from './vault-cache.js';
 
@@ -132,6 +133,7 @@ export async function handleVaultRequest(req, deps) {
 
     let secretObj = null;
     let injected = null;
+    let mintedToken = null;
     let response;
     try {
       try {
@@ -145,10 +147,35 @@ export async function handleVaultRequest(req, deps) {
         return { error: 'secret_unavailable', detail: 'no credential released for this handle' };
       }
 
+      // OAuth client_credentials: the sealed secret is the CLIENT SECRET, not a
+      // bearer token (we never store a minted token — it would be stale). Mint a
+      // fresh access token here, from the agent's machine (so IP-allowlisted
+      // apps see the right source), and inject THAT. Other injections (incl. an
+      // already-captured authorization_code token) inject the sealed value as-is.
+      let injectSecret = secretObj.secret;
+      const inj = content.injection;
+      if (inj?.type === 'oauth_bearer' && inj.grant_type === 'client_credentials') {
+        try {
+          mintedToken = await exchangeClientCredentials(
+            {
+              tokenEndpoint: inj.token_endpoint,
+              clientId: inj.client_id,
+              clientSecret: secretObj.secret,
+              scope: inj.scope,
+            },
+            fetchImpl,
+          );
+        } catch (e) {
+          response = { error: 'oauth_exchange_failed', detail: e?.message ?? String(e) };
+          return response;
+        }
+        injectSecret = mintedToken;
+      }
+
       try {
         injected = applyInjection({
           injection: content.injection,
-          secret: secretObj.secret,
+          secret: injectSecret,
           url: req.url,
           headers: req.headers ?? {},
           // Inject reads companion fields (basic_auth username, AWS secret) off
@@ -190,6 +217,9 @@ export async function handleVaultRequest(req, deps) {
         /* best-effort */
       }
       injected = null;
+      // Drop the minted access token reference too (a JS string can't be wiped
+      // in place, same as the injected secret — but don't retain it past use).
+      mintedToken = null;
       handles.revoke(token);
       // permissioned_ms = how long the agent held a usable handle (mint→now).
       // credentialed_ms = the TRUE unencrypted-credential window: from when the

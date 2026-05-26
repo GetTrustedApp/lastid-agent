@@ -212,6 +212,64 @@ test('a denied use does not consume rate budget', async () => {
   assert.equal(rateTracker.count('vault_1', 60_000, now), 0, 'denied use recorded no mint');
 })
 
+test('oauth client_credentials: listener mints a token from the sealed secret and injects THAT (never the client_secret)', async () => {
+  const TOKEN_ENDPOINT = 'https://idp.example.com/oauth/token';
+  const CLIENT_SECRET = 'cs-DO-NOT-LEAK';
+  let sentAuth = null;
+  const d = deps({
+    resolveShare: async () => ({
+      ...SHARE,
+      injection: {
+        type: 'oauth_bearer',
+        name: 'Authorization',
+        format: 'Bearer {value}',
+        grant_type: 'client_credentials',
+        token_endpoint: TOKEN_ENDPOINT,
+        client_id: 'cid',
+        scope: 'read',
+      },
+    }),
+    // The sealed secret IS the client secret, not a bearer token.
+    resolveSecret: async () => ({ secret: CLIENT_SECRET, zeroize: () => {} }),
+    fetchImpl: async (url, opts) => {
+      if (url === TOKEN_ENDPOINT) {
+        // The token exchange carries the client secret in its body...
+        assert.match(opts.body, /client_secret=cs-DO-NOT-LEAK/);
+        return { status: 200, json: async () => ({ access_token: 'minted-AT', token_type: 'Bearer' }) };
+      }
+      // ...but the OUTBOUND request must carry the MINTED token, not the secret.
+      sentAuth = opts.headers.Authorization;
+      return { status: 200, text: async () => 'OK', headers: {} };
+    },
+  });
+  const used = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  assert.equal(used.ok, true);
+  const r = await handleVaultRequest({ op: 'http_fetch', vault_handle: used.vault_handle, url: 'https://api.example.com/x' }, d);
+  assert.equal(r.ok, true);
+  assert.equal(sentAuth, 'Bearer minted-AT', 'injected the minted token, not the client secret');
+  assert.equal(JSON.stringify(r).includes(CLIENT_SECRET), false, 'client secret never in the response');
+})
+
+test('oauth client_credentials: a failed token exchange → oauth_exchange_failed, no outbound call', async () => {
+  let outboundCalled = false;
+  const d = deps({
+    resolveShare: async () => ({
+      ...SHARE,
+      injection: { type: 'oauth_bearer', name: 'Authorization', format: 'Bearer {value}', grant_type: 'client_credentials', token_endpoint: 'https://idp/token', client_id: 'cid' },
+    }),
+    resolveSecret: async () => ({ secret: 'cs', zeroize: () => {} }),
+    fetchImpl: async (url) => {
+      if (url === 'https://idp/token') return { status: 401, json: async () => ({ error: 'invalid_client' }) };
+      outboundCalled = true;
+      return { status: 200, text: async () => 'OK', headers: {} };
+    },
+  });
+  const used = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  const r = await handleVaultRequest({ op: 'http_fetch', vault_handle: used.vault_handle, url: 'https://api/x' }, d);
+  assert.equal(r.error, 'oauth_exchange_failed');
+  assert.equal(outboundCalled, false, 'never made the outbound call without a token');
+})
+
 test('round-trips over the real unix socket', async () => {
   const scope = `test-${randomUUID()}`;
   const dir = join(homedir(), '.lastid-agent', scope);
