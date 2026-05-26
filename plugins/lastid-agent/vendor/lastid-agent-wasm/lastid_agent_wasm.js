@@ -1244,6 +1244,38 @@ function sdkSignAgentStateRecord(record_json) {
 exports.sdkSignAgentStateRecord = sdkSignAgentStateRecord;
 
 /**
+ * Build + sign a canonical `VaultShareAcl` (claim_version 3) granting an
+ * agent the right to USE a vault item under policy constraints. This is
+ * the browser exposure of the proven native vault-sharing flow
+ * (`lastid-runtime::vault_sharing_runtime` v3): the SAME
+ * `canonical_vault_share_claim_bytes_v3` signed with the device's
+ * hardware operational key via the SAME `default_device_signing_key_id`
+ * + `sign_with_device_key` path the verified device-auth JWT uses — so
+ * the desktop verifier resolves the `kid` + signature identically. The
+ * WebAuthn assertion the signature pops IS the operator's consent.
+ *
+ * `params_json`:
+ * `{ item_id, agent_did, granted_actions: ["use"|"read"|"write"],
+ *    expires_at_ms?: number|null, constraints: [{type,...}],
+ *    on_violation: {type,...}, require_approval_per_use: bool,
+ *    policy_version: number }`
+ * — `constraints`/`on_violation` MUST be the canonical lastid-core serde
+ * shapes; they're deserialized into the Rust types here so the signed
+ * bytes are byte-identical to what the desktop recomputes.
+ *
+ * Returns the full signed `VaultShareAcl` as JSON.
+ * @param {string} params_json
+ * @returns {Promise<string>}
+ */
+function sdkSignVaultShareAcl(params_json) {
+    const ptr0 = passStringToWasm0(params_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkSignVaultShareAcl(ptr0, len0);
+    return ret;
+}
+exports.sdkSignVaultShareAcl = sdkSignVaultShareAcl;
+
+/**
  * Sign `data` with the ML-DSA-65 operational key bound to
  * `key_id`. Pops one WebAuthn assertion (operator presence) to
  * recover the PRF output, unwraps the at-rest-encrypted secret,
@@ -2235,6 +2267,13 @@ function __wbg_get_imports() {
             const ret = arg0.msCrypto;
             return ret;
         },
+        __wbg_name_d7bb38b41d6d953e: function(arg0, arg1) {
+            const ret = arg1.name;
+            const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        },
         __wbg_navigator_9b09ea705d03d227: function(arg0) {
             const ret = arg0.navigator;
             return ret;
@@ -2535,12 +2574,12 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1487, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1498, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h07eda6f9933457e4);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 1069, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 1080, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1725375cb213b3e4);
             return ret;
         },
@@ -2550,12 +2589,12 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1157, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1168, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3c6c61154a9359bf);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 569, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 578, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h23499dd81690a033);
             return ret;
         },

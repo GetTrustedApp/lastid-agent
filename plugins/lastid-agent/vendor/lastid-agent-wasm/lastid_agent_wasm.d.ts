@@ -562,6 +562,30 @@ export function sdkRegisterDelegationAuthority(idp_url: string): Promise<any>;
 export function sdkSignAgentStateRecord(record_json: any): Promise<string>;
 
 /**
+ * Build + sign a canonical `VaultShareAcl` (claim_version 3) granting an
+ * agent the right to USE a vault item under policy constraints. This is
+ * the browser exposure of the proven native vault-sharing flow
+ * (`lastid-runtime::vault_sharing_runtime` v3): the SAME
+ * `canonical_vault_share_claim_bytes_v3` signed with the device's
+ * hardware operational key via the SAME `default_device_signing_key_id`
+ * + `sign_with_device_key` path the verified device-auth JWT uses — so
+ * the desktop verifier resolves the `kid` + signature identically. The
+ * WebAuthn assertion the signature pops IS the operator's consent.
+ *
+ * `params_json`:
+ * `{ item_id, agent_did, granted_actions: ["use"|"read"|"write"],
+ *    expires_at_ms?: number|null, constraints: [{type,...}],
+ *    on_violation: {type,...}, require_approval_per_use: bool,
+ *    policy_version: number }`
+ * — `constraints`/`on_violation` MUST be the canonical lastid-core serde
+ * shapes; they're deserialized into the Rust types here so the signed
+ * bytes are byte-identical to what the desktop recomputes.
+ *
+ * Returns the full signed `VaultShareAcl` as JSON.
+ */
+export function sdkSignVaultShareAcl(params_json: string): Promise<string>;
+
+/**
  * Sign `data` with the ML-DSA-65 operational key bound to
  * `key_id`. Pops one WebAuthn assertion (operator presence) to
  * recover the PRF output, unwraps the at-rest-encrypted secret,
