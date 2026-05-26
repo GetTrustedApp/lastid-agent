@@ -120,6 +120,110 @@ const PLUGIN_TOOL_CAPS = new Map(
   PLUGIN_TOOLS.map((t) => [t.name, t.requiredCapability ?? null]),
 );
 
+// vault_use + http_fetch run against the LOCAL listener (the SaaS / no-desktop
+// path): the listener holds slot_seed, mints the handle + its keypair, fetches
+// the JIT-wrapped secret from the IdP, opens it, injects, calls, and zeroizes —
+// the secret never enters the model's context. Advertised ONLY when a desktop
+// isn't already publishing them (a connected desktop wins, so we don't shadow
+// its native vault). Routed via the vault unix-socket IPC, not handlePluginTool.
+const LOCAL_VAULT_TOOLS = [
+  {
+    name: 'vault_use',
+    description:
+      'Mint a single-use, short-lived handle for a vault credential your operator shared with you (find its id via vault_list). Returns the handle + an injection summary + usage context — NEVER the secret value. Pass the handle to http_fetch to make the call. Mint a fresh handle per request.',
+    requiredCapability: { resource: 'vault:use', action: 'Use' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        item_id: { type: 'string', description: 'The vault item id from vault_list.' },
+        purpose: { type: 'string', description: 'Optional: why you need it (recorded for the operator).' },
+      },
+      required: ['item_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'http_fetch',
+    description:
+      'Make an outbound HTTP request with a vault credential attached. Pass the vault_handle from vault_use; the listener injects the credential at the network boundary (you never see it), makes the call, and returns the response. Single-use — the handle is consumed.',
+    requiredCapability: { resource: 'vault:use', action: 'Use' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'The full URL to request.' },
+        vault_handle: { type: 'string', description: 'The handle returned by vault_use.' },
+        method: { type: 'string', description: 'HTTP method (default GET).' },
+        headers: { type: 'object', description: 'Extra request headers; the credential header is added by the listener.' },
+        body: { type: 'string', description: 'Request body (POST/PUT/PATCH).' },
+      },
+      required: ['url', 'vault_handle'],
+      additionalProperties: false,
+    },
+  },
+];
+const LOCAL_VAULT_TOOL_NAMES = new Set(LOCAL_VAULT_TOOLS.map((t) => t.name));
+
+/**
+ * Route vault_use / http_fetch to the LOCAL listener over the vault unix socket.
+ * Capability (vault:use) is enforced HERE — the listener trusts this process.
+ * vault_use drives the cross-device approval loop transparently when the share
+ * requires per-use approval, the same as the desktop path.
+ */
+export async function handleLocalVault({ name, args, scope, loadedAgent, signingSeed, vaultRequest: injectedVaultRequest } = {}) {
+  const wrap = (obj, isError = false) => ({
+    content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }],
+    ...(isError ? { isError: true } : {}),
+  });
+  if (!loadedAgent) {
+    return wrap({ error: 'not_provisioned', message: 'run `lastid-agent provision` first' }, true);
+  }
+  const claims = decodeVcClaims(loadedAgent.vcCompact) ?? {};
+  if (!hasCapability(claims, 'vault:use', 'Use')) {
+    return wrap({ error: 'capability_denied', message: "this agent credential does not grant Use on 'vault:use'" }, true);
+  }
+  const vaultRequest = injectedVaultRequest ?? (await import('./vault-ipc.js')).vaultRequest;
+  try {
+    if (name === 'http_fetch') {
+      const resp = await vaultRequest(scope, {
+        op: 'http_fetch',
+        vault_handle: args.vault_handle,
+        url: args.url,
+        ...(args.method ? { method: args.method } : {}),
+        ...(args.headers ? { headers: args.headers } : {}),
+        ...(args.body != null ? { body: args.body } : {}),
+      });
+      return wrap(resp, resp?.error != null);
+    }
+    // vault_use — pass the clock so time-window constraints evaluate against now.
+    let resp = await vaultRequest(scope, { op: 'vault_use', item_id: args.item_id, ctx: { now_ms: Date.now() } });
+    if (resp?.policy_approval_required === true && signingSeed) {
+      const outcome = await runApprovalLoop({
+        approvalBody: resp,
+        originalArgs: args,
+        agentDid: loadedAgent.agentDid,
+        vcCompact: loadedAgent.vcCompact,
+        signingSeed,
+      });
+      if (outcome.retryArgs) {
+        resp = await vaultRequest(scope, {
+          op: 'vault_use',
+          item_id: args.item_id,
+          ctx: { now_ms: Date.now() },
+          approved: true,
+          approval_id: outcome.retryArgs.approval_id,
+        });
+      } else if (outcome.expired) {
+        return wrap({ error: 'policy_approval_expired', reason_detail: 'operator did not decide within the pending window' }, true);
+      } else if (outcome.denied) {
+        return wrap(outcome.body, true);
+      }
+    }
+    return wrap(resp, resp?.error != null);
+  } catch (e) {
+    return wrap({ error: 'vault_local_failed', tool: name, message: e?.message ?? String(e) }, true);
+  }
+}
+
 /**
  * Central capability gate. Throws if the tool declares a
  * `requiredCapability` the agent's VC doesn't grant. Called before any
@@ -414,7 +518,11 @@ async function buildServer({ scope }) {
     // De-dupe by name in case the desktop ever exposes a plugin
     // tool name; plugin tools win.
     const remoteFiltered = remote.filter((t) => !PLUGIN_TOOL_NAMES.has(t.name));
-    return { tools: [...PLUGIN_TOOLS, ...remoteFiltered] };
+    const remoteNames = new Set(remoteFiltered.map((t) => t.name));
+    // Advertise the LOCAL vault tools unless a connected desktop already
+    // publishes them (desktop wins so we don't shadow its native vault).
+    const localVault = LOCAL_VAULT_TOOLS.filter((t) => !remoteNames.has(t.name));
+    return { tools: [...PLUGIN_TOOLS, ...remoteFiltered, ...localVault] };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -499,6 +607,12 @@ async function buildServer({ scope }) {
           isError: true,
         };
       }
+    }
+    // SaaS / no-desktop path: route vault_use + http_fetch to the LOCAL listener.
+    // signingSeed was resolved by ensureDesktop() above (derived from the agent's
+    // slot_seed even when no desktop is present) so the approval loop can sign.
+    if (LOCAL_VAULT_TOOL_NAMES.has(name)) {
+      return handleLocalVault({ name, args: args ?? {}, scope, loadedAgent, signingSeed });
     }
     throw new Error(`unknown tool: ${name}`);
   });
