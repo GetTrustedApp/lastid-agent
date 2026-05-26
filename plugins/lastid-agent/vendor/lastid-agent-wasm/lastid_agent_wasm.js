@@ -1679,6 +1679,10 @@ function __wbg_get_imports() {
             const ret = arg0.arrayBuffer();
             return ret;
         }, arguments); },
+        __wbg_call_368fa9c372d473ba: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = arg0.call(arg1, arg2, arg3);
+            return ret;
+        }, arguments); },
         __wbg_call_7f2987183bb62793: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.call(arg1);
             return ret;
