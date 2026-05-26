@@ -482,9 +482,19 @@ async function cmdProvision(flags) {
   // per-identity), so we only prompt when this host has no model yet. Asked,
   // never silently auto-installed; best-effort, so it never fails provisioning.
   try {
-    const { embeddingsInstalled } = await import('./embeddings.js');
+    const { embeddingsInstalled, modelInstalled, ensureEmbeddingsRuntime } = await import('./embeddings.js');
     if (await embeddingsInstalled()) {
       console.log('   semantic mem: enabled (shared model already on this host)');
+    } else if (modelInstalled()) {
+      // Opted in before (the model is cached) but the runtime dep was orphaned
+      // by a plugin update — reinstall it. No prompt, no re-download: they
+      // already chose semantic memory, so keep them in.
+      const res = await ensureEmbeddingsRuntime({ log: (l) => console.log(`   ${l}`) });
+      console.log(
+        res.ok
+          ? '   semantic mem: re-enabled (runtime reinstalled, kept you opted in)'
+          : `   semantic mem: reinstall ${res.action} — run \`lastid-agent memory-setup\``,
+      );
     } else {
       const choice = await promptEnableEmbeddings();
       if (choice === true) {
@@ -780,28 +790,25 @@ async function cmdMemorySearch(flags) {
  * the model, then backfills embeddings for the agent's local memories.
  */
 async function cmdMemorySetup(flags) {
-  const { spawnSync } = await import('node:child_process');
-  const { mkdirSync } = await import('node:fs');
-
-  const { embeddingsInstalled, embeddingsRuntimeDir } = await import('./embeddings.js');
   // Install into a STABLE, version-independent dir (~/.lastid-agent/
   // embeddings-runtime), NOT the per-version plugin node_modules — otherwise
   // every `/plugin update` orphans the dep and silently drops semantic memory
   // to keyword until this re-runs. The dir + the global model cache both
-  // survive updates, so semantic memory keeps working across versions.
+  // survive updates, so semantic memory keeps working across versions. The
+  // listener self-heals this automatically when the model is already cached;
+  // this command is the explicit first-time (or forced) path.
+  const { embeddingsInstalled, installEmbeddingsRuntime } = await import('./embeddings.js');
   if (!(await embeddingsInstalled())) {
-    const runtimeDir = embeddingsRuntimeDir();
-    mkdirSync(runtimeDir, { recursive: true });
-    process.stdout.write(
-      `Installing local embeddings (@xenova/transformers, ~137MB) into ${runtimeDir}…\n`,
-    );
-    const r = spawnSync(
-      'npm',
-      ['install', '@xenova/transformers', '--prefix', runtimeDir, '--omit=dev', '--no-audit', '--no-fund'],
-      { stdio: ['ignore', process.stderr, process.stderr] },
-    );
-    if (r.status !== 0) {
-      process.stderr.write(`memory-setup: dependency install failed (exit ${r.status ?? 'n/a'})\n`);
+    const { status, locked } = installEmbeddingsRuntime({
+      log: (l) => process.stdout.write(`${l}\n`),
+      stdio: ['ignore', process.stderr, process.stderr],
+    });
+    if (locked) {
+      process.stderr.write('memory-setup: another install is in progress — retry shortly.\n');
+      process.exit(1);
+    }
+    if (status !== 0) {
+      process.stderr.write(`memory-setup: dependency install failed (exit ${status})\n`);
       process.exit(1);
     }
   } else {

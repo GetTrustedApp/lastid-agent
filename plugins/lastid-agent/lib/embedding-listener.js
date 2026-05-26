@@ -13,11 +13,41 @@ import { createServer } from 'node:net';
 import { unlink, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { embedSocketPath, embedInProcess, embeddingsInstalled } from './embeddings.js';
+import {
+  embedSocketPath,
+  embedInProcess,
+  embeddingsInstalled,
+  modelInstalled,
+  ensureEmbeddingsRuntime,
+} from './embeddings.js';
 
 export async function startEmbeddingServer({ scope = 'main' } = {}) {
   if (!(await embeddingsInstalled())) {
-    return { status: 'disabled', reason: 'embeddings not installed (run `lastid-agent memory-setup`)' };
+    // Opted in (the ~137MB model is cached) but the runtime dep is gone? That's
+    // almost always a `/plugin update` orphaning the dep. Keep them in: reinstall
+    // it into the stable dir (NO model re-download) in the BACKGROUND so we never
+    // block the listener's MLS/vault startup, then bind the socket once ready.
+    // Never opted in (no model) → stay disabled until `memory-setup`.
+    if (!modelInstalled()) {
+      return { status: 'disabled', reason: 'embeddings not installed (run `lastid-agent memory-setup`)' };
+    }
+    void (async () => {
+      const res = await ensureEmbeddingsRuntime({
+        log: (l) => process.stderr.write(`${l}\n`),
+      });
+      if (res.ok && res.action === 'installed') {
+        process.stderr.write(
+          '[lastid-agent] embeddings runtime reinstalled after update — starting daemon\n',
+        );
+        await startEmbeddingServer({ scope }).catch(() => {});
+      } else if (res.action !== 'present') {
+        process.stderr.write(`[lastid-agent] embeddings auto-setup: ${res.action}\n`);
+      }
+    })();
+    return {
+      status: 'installing',
+      reason: 'reinstalling embeddings runtime after update (model already cached)',
+    };
   }
   const sockPath = embedSocketPath(scope);
   await mkdir(dirname(sockPath), { recursive: true });

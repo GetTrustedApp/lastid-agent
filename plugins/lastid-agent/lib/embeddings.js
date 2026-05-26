@@ -16,6 +16,8 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { connect } from 'node:net';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { memoryEmbeddingText } from './memory-store.js';
@@ -154,6 +156,97 @@ async function loadPipeline() {
  *  `opts.runtimeDir` overrides the stable dir (tests only). */
 export async function embeddingsInstalled(opts = {}) {
   return resolveTransformers(opts) !== null;
+}
+
+/**
+ * Is the embedding MODEL cached on this host? This is the durable OPT-IN
+ * signal: the operator ran memory-setup at some point and downloaded the
+ * ~137MB model. The model cache (modelCacheDir, global, version-independent)
+ * survives plugin updates even when the runtime dep gets orphaned — so a
+ * cached model means "they opted in" and we must keep semantic memory working
+ * for them across updates rather than silently dropping to keyword.
+ * `opts.cacheDir` overrides the cache dir (tests only).
+ */
+export function modelInstalled({ cacheDir } = {}) {
+  const onnx = join(
+    cacheDir ?? modelCacheDir(),
+    'Xenova',
+    'all-MiniLM-L6-v2',
+    'onnx',
+    'model_quantized.onnx',
+  );
+  return existsSync(onnx);
+}
+
+/**
+ * Install the embeddings runtime dep (@xenova/transformers) into the STABLE,
+ * version-independent dir (survives `/plugin update`). The single source of
+ * truth for the install command + target, shared by `memory-setup` and the
+ * listener self-heal. A mkdir-based lock serializes concurrent installs (two
+ * scopes' listeners can start at once and would otherwise corrupt the prefix).
+ * Returns `{ status, locked }` — status is the npm exit code (0 = ok); locked
+ * is true when another process holds the install lock (caller should no-op).
+ */
+export function installEmbeddingsRuntime({ log, stdio = ['ignore', 'pipe', 'pipe'] } = {}) {
+  const runtimeDir = embeddingsRuntimeDir();
+  mkdirSync(runtimeDir, { recursive: true });
+  const lockDir = join(runtimeDir, '.install.lock');
+  try {
+    mkdirSync(lockDir); // atomic: throws EEXIST if another process holds it
+  } catch {
+    return { status: 1, locked: true };
+  }
+  try {
+    log?.(
+      `[lastid-agent] installing local embeddings runtime (@xenova/transformers) into ${runtimeDir}…`,
+    );
+    const r = spawnSync(
+      'npm',
+      [
+        'install',
+        '@xenova/transformers',
+        '--prefix',
+        runtimeDir,
+        '--omit=dev',
+        '--no-audit',
+        '--no-fund',
+      ],
+      { stdio },
+    );
+    return { status: r.status ?? 1, locked: false };
+  } finally {
+    try {
+      rmSync(lockDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * Keep an opted-in host's semantic memory working across plugin updates.
+ * Idempotent + best-effort:
+ *   - dep already resolvable        → { ok: true,  action: 'present' }
+ *   - dep missing, model cached     → reinstall the dep into the stable dir
+ *     (NO model re-download)        → { ok, action: 'installed' | 'install-failed' | 'install-in-progress' }
+ *   - dep missing, model NOT cached → { ok: false, action: 'not-opted-in' }
+ *
+ * The decision inputs are injected (`_embeddingsInstalled` / `_modelInstalled`
+ * / `_install`) so the logic is unit-testable without touching the filesystem
+ * or running npm.
+ */
+export async function ensureEmbeddingsRuntime({
+  log,
+  _embeddingsInstalled = embeddingsInstalled,
+  _modelInstalled = modelInstalled,
+  _install = installEmbeddingsRuntime,
+} = {}) {
+  if (await _embeddingsInstalled()) return { ok: true, action: 'present' };
+  if (!_modelInstalled()) return { ok: false, action: 'not-opted-in' };
+  const { status, locked } = _install({ log });
+  if (locked) return { ok: false, action: 'install-in-progress' };
+  if (status !== 0) return { ok: false, action: 'install-failed' };
+  return { ok: await _embeddingsInstalled(), action: 'installed' };
 }
 
 /** In-process embed: load the model in THIS process and embed. ~0.2s on a
