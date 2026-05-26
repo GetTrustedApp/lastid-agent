@@ -197,6 +197,12 @@ export async function resolveVaultSecret(
     if (onReject) onReject(id, 'undecryptable secret (wrong slot_seed / corrupt)');
     return null;
   }
+  // The secret is now in plaintext (in `bytes`). This timestamp opens the
+  // CREDENTIALED window — the true exposure span the metric reports is from
+  // here to zeroize (after inject + the outbound call). Measuring from the
+  // decrypt (not from the start of the JIT fetch) excludes the time the secret
+  // was still wrapped/in-flight from the IdP.
+  const decryptedAtMs = Date.now();
   const wipe = () => {
     try {
       bytes.fill(0);
@@ -229,6 +235,8 @@ export async function resolveVaultSecret(
     secret: parsed.secret,
     secret_secondary:
       typeof parsed.secret_secondary === 'string' ? parsed.secret_secondary : undefined,
+    // When the secret entered plaintext — the start of the credentialed window.
+    decryptedAtMs,
     zeroize: wipe,
   };
 }

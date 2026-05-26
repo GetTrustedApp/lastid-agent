@@ -29,17 +29,17 @@ test('mint row: minted status, ttl in seconds, auto_allow, no consumed/credentia
   assert.equal('credentialed_secs' in b, false);
 });
 
-test('consume row: consumed status + credentialed_secs from the unencrypted window', () => {
+test('consume row: consumed status + credentialed_secs as FRACTIONAL seconds (ms precision)', () => {
   const b = credentialedUseBody('consume', HANDLE, { credentialed_ms: 1600 });
   assert.equal(b.status, 'consumed');
   assert.ok(b.consumed_at, 'consumed_at stamped');
-  assert.equal(b.credentialed_secs, 2); // round(1600/1000)
+  assert.equal(b.credentialed_secs, 1.6); // 1600ms → 1.6s, not rounded to 2
   assert.equal(b.ttl_secs, 300);
 });
 
-test('consume row: a sub-second credentialed window floors at 1s (per-use counting)', () => {
-  const b = credentialedUseBody('consume', HANDLE, { credentialed_ms: 180 });
-  assert.equal(b.credentialed_secs, 1);
+test('consume row: a sub-second window stays sub-second (NOT floored to 1s)', () => {
+  assert.equal(credentialedUseBody('consume', HANDLE, { credentialed_ms: 180 }).credentialed_secs, 0.18);
+  assert.equal(credentialedUseBody('consume', HANDLE, { credentialed_ms: 42 }).credentialed_secs, 0.042);
 });
 
 test('an approved handle records decision_kind=approval + the approval_id', () => {

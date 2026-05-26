@@ -122,7 +122,6 @@ export async function handleVaultRequest(req, deps) {
       return { error: 'share_not_found', detail: 'share gone since the handle was minted' };
     }
 
-    const credStartMs = clock(); // start of the unencrypted-credential window
     let secretObj = null;
     let injected = null;
     let response;
@@ -176,6 +175,7 @@ export async function handleVaultRequest(req, deps) {
       // and record the two guardrail timings the front page surfaces:
       //   permissioned_ms  — how long the agent held a usable handle (mint→now)
       //   credentialed_ms  — the unencrypted-credential window (decrypt→zeroize)
+      const consumeMs = clock();
       try {
         secretObj?.zeroize?.();
       } catch {
@@ -183,10 +183,23 @@ export async function handleVaultRequest(req, deps) {
       }
       injected = null;
       handles.revoke(token);
-      const consumeMs = clock();
-      recordUse?.('consume', h, {
+      // permissioned_ms = how long the agent held a usable handle (mint→now).
+      // credentialed_ms = the TRUE unencrypted-credential window: from when the
+      // secret was decrypted (secretObj.decryptedAtMs) to zeroize — sub-second
+      // precision, NOT rounded up to a whole second. Surfaced on the response so
+      // the caller (and the operator's audit) sees the real exposure per call.
+      const metrics = {
         permissioned_ms: Math.max(0, consumeMs - (h.mintedAtMs ?? consumeMs)),
-        credentialed_ms: Math.max(0, consumeMs - credStartMs),
+        credentialed_ms: secretObj?.decryptedAtMs
+          ? Math.max(0, consumeMs - secretObj.decryptedAtMs)
+          : 0,
+      };
+      if (response && typeof response === 'object') {
+        response.permissioned_ms = metrics.permissioned_ms;
+        response.credentialed_ms = metrics.credentialed_ms;
+      }
+      recordUse?.('consume', h, {
+        ...metrics,
         status: response && 'status' in response ? response.status : null,
         outcome: response?.ok ? 'ok' : (response?.error ?? 'error'),
       });

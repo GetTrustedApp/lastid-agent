@@ -29,10 +29,13 @@ export function credentialedUseBody(kind, handle, metrics) {
   } else {
     body.status = 'consumed';
     body.consumed_at = new Date().toISOString();
-    // credentialed_secs = the actual UNENCRYPTED window (decrypt→zeroize),
-    // floored at 1s to match the aggregate's per-use counting.
+    // credentialed_secs = the actual UNENCRYPTED window (decrypt→zeroize), as
+    // FRACTIONAL seconds at ms precision. Do NOT floor to a whole second — a
+    // 0.3s window must read as 0.3s, not "1s" (that inflated the number and
+    // buried the whole point: the credential was exposed for a fraction of a
+    // second, vs a standing key for weeks).
     if (metrics && typeof metrics.credentialed_ms === 'number') {
-      body.credentialed_secs = Math.max(1, Math.round(metrics.credentialed_ms / 1000));
+      body.credentialed_secs = Math.round(metrics.credentialed_ms) / 1000;
     }
   }
   return body;
