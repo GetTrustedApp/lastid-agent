@@ -40,12 +40,13 @@ export async function authedIdpFetch({
 }) {
   const trimmed = String(idpUrl ?? '').replace(/\/$/, '');
   if (!trimmed) throw new Error('authedIdpFetch: idpUrl required');
-  // DPoP htu is the origin+path with NO query string (matches ws-client /
-  // agent-state-sync). For these endpoints the request URL == htu.
-  const httpUri = `${trimmed}${path}`;
+  const url = `${trimmed}${path}`;
+  // DPoP htu is origin+path with NO query string (RFC 9449; matches the
+  // agent-state-sync precedent which signs `base` but fetches `?since=…`).
+  const htu = url.split('?')[0];
   const headers = {
     Authorization: `Bearer ${vcCompact}`,
-    DPoP: mintDpopJwt({ agentDid, httpMethod: method, httpUri, signingKey }),
+    DPoP: mintDpopJwt({ agentDid, httpMethod: method, httpUri: htu, signingKey }),
     accept: 'application/json',
   };
   const init = { method, headers };
@@ -53,7 +54,7 @@ export async function authedIdpFetch({
     headers['content-type'] = 'application/json';
     init.body = JSON.stringify(body);
   }
-  const res = await fetchImpl(httpUri, init);
+  const res = await fetchImpl(url, init);
   if (!res.ok) {
     const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
     throw new Error(`${method} ${path} failed: HTTP ${res.status} ${text}`);
@@ -66,26 +67,32 @@ export async function authedIdpFetch({
 
 /**
  * GET /v1/mls/keypackages/:did — claim the peer's published KeyPackage(s).
- * The IdP atomically CONSUMES what it returns (one per add), so a caller
- * inviting N devices may need to call this N times (see `remainingCount`).
- * Returns the claimed packages (one per device the IdP handed back) plus
- * how many remain on file. Mirror of lastid.co `fetchPeerKeyPackage`.
+ * `perDevice` (default true) asks the IdP for ONE KeyPackage per device,
+ * deduped + sorted server-side — so inviting all of the operator's devices
+ * is a single fetch + an addMember per returned package. The IdP atomically
+ * CONSUMES what it returns. Mirror of the IdP bot's `fetchKeyPackagesAsBot`.
  *
  * @returns {Promise<{ keyPackages: Array<{ keyPackageB64: string, ref: string, deviceId: string|null }>, remainingCount: number }>}
  */
 export async function fetchPeerKeyPackages({
   idpUrl,
   targetDid,
+  perDevice = true,
+  count,
   agentDid,
   vcCompact,
   signingKey,
   fetchImpl,
 }) {
   if (!targetDid) throw new Error('fetchPeerKeyPackages: targetDid required');
+  const query = [];
+  if (perDevice) query.push('per_device=true');
+  if (count !== undefined) query.push(`count=${count}`);
+  const qs = query.length > 0 ? `?${query.join('&')}` : '';
   const body = await authedIdpFetch({
     idpUrl,
     method: 'GET',
-    path: `/v1/mls/keypackages/${encodeURIComponent(targetDid)}`,
+    path: `/v1/mls/keypackages/${encodeURIComponent(targetDid)}${qs}`,
     agentDid,
     vcCompact,
     signingKey,

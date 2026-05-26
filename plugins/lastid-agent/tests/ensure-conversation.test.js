@@ -32,7 +32,8 @@ function fakeMls(trace) {
     },
     addMember(id, kp) {
       trace.push(`addMember:${id}:${kp}`);
-      return { commit_b64: 'COMMIT', welcome_b64: 'WELCOME', new_epoch: 1 };
+      // Encode the KP so per-device welcome/commit delivery is assertable.
+      return { commit_b64: `C-${kp}`, welcome_b64: `W-${kp}`, new_epoch: 1 };
     },
     async persist() {
       trace.push('persist');
@@ -59,59 +60,67 @@ test('reuses an existing group with the operator (never forks)', async () => {
   assert.deepEqual(trace, []); // no MLS ops either
 });
 
-test('creates + registers + invites + records when no group exists', async () => {
+test('creates + registers + invites EVERY operator device + records', async () => {
   const trace = [];
-  const calls = {};
+  const addCalls = [];
+  let createArgs;
+  let recordArgs;
   const out = await ensureConversation({
     ...BASE,
     mls: fakeMls(trace),
     deps: {
       resolveActiveGroupForOperator: async () => null,
-      fetchPeerKeyPackages: async (a) => {
-        calls.fetch = a;
-        return { keyPackages: [{ keyPackageB64: 'KP-A', ref: 'r1', deviceId: 'devA' }], remainingCount: 0 };
-      },
+      // Two devices, deduped/sorted by the IdP (per_device=true).
+      fetchPeerKeyPackages: async () => ({
+        keyPackages: [
+          { keyPackageB64: 'KP-A', ref: 'r1', deviceId: 'devA' },
+          { keyPackageB64: 'KP-B', ref: 'r2', deviceId: 'devB' },
+        ],
+        remainingCount: 0,
+      }),
       randomGroupIdB64: () => 'NEWGID',
       createGroupOnIdp: async (a) => {
-        calls.create = a;
+        createArgs = a;
         return { id: 'idp-uuid-1', mls_group_id: 'mgid' };
       },
       addGroupMember: async (a) => {
-        calls.add = a;
+        addCalls.push(a);
         return { ok: true };
       },
       recordGroup: async (a) => {
-        calls.record = a;
+        recordArgs = a;
       },
     },
   });
 
-  assert.deepEqual(out, {
-    idpGroupId: 'idp-uuid-1',
-    groupIdB64: 'NEWGID',
-    operatorDid: BASE.operatorDid,
-  });
+  assert.deepEqual(out, { idpGroupId: 'idp-uuid-1', groupIdB64: 'NEWGID', operatorDid: BASE.operatorDid });
 
-  // MLS ops happened in order, each followed by a persist.
+  // Register at epoch 0 (before any add), then add each device, each
+  // followed by a persist.
   assert.deepEqual(trace, [
     'createGroup:NEWGID',
     'persist',
     'exportGroupInfo:NEWGID',
     'addMember:NEWGID:KP-A',
     'persist',
+    'addMember:NEWGID:KP-B',
+    'persist',
   ]);
+  assert.equal(createArgs.mlsGroupInitB64, 'GINFO');
+  assert.equal(createArgs.groupType, 'direct');
 
-  // IdP register got the exported GroupInfo.
-  assert.equal(calls.create.mlsGroupInitB64, 'GINFO');
-  assert.equal(calls.create.groupType, 'direct');
-  // Invite delivered the welcome + commit from addMember to the operator.
+  // One invite per device, each carrying THAT device's welcome + commit,
+  // all addressed to the operator.
+  assert.equal(addCalls.length, 2);
   assert.deepEqual(
-    { groupId: calls.add.groupId, inviteeDid: calls.add.inviteeDid, w: calls.add.mlsWelcomeB64, c: calls.add.mlsCommitB64 },
-    { groupId: 'idp-uuid-1', inviteeDid: BASE.operatorDid, w: 'WELCOME', c: 'COMMIT' },
+    addCalls.map((a) => ({ g: a.groupId, did: a.inviteeDid, w: a.mlsWelcomeB64, c: a.mlsCommitB64 })),
+    [
+      { g: 'idp-uuid-1', did: BASE.operatorDid, w: 'W-KP-A', c: 'C-KP-A' },
+      { g: 'idp-uuid-1', did: BASE.operatorDid, w: 'W-KP-B', c: 'C-KP-B' },
+    ],
   );
-  // Recorded the mapping so future sends resolve it.
   assert.deepEqual(
-    { idpGroupId: calls.record.idpGroupId, groupIdB64: calls.record.groupIdB64, operatorDid: calls.record.operatorDid },
+    { idpGroupId: recordArgs.idpGroupId, groupIdB64: recordArgs.groupIdB64, operatorDid: recordArgs.operatorDid },
     { idpGroupId: 'idp-uuid-1', groupIdB64: 'NEWGID', operatorDid: BASE.operatorDid },
   );
 });

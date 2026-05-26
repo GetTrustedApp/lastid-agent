@@ -106,29 +106,32 @@ export async function ensureConversation({
     throw new Error('createGroupOnIdp returned no group id');
   }
 
-  // 4. Invite the operator's device(s). Phase 3: primary device only.
-  //    PHASE 4 SEAM: loop over `keyPackages` (and reconcile new devices
-  //    over time) for full device consistency — each addMember past the
-  //    first commits to prior members, which the IdP fans out.
-  const primary = keyPackages[0];
-  const add = mls.addMember(groupIdB64, primary.keyPackageB64);
-  await mls.persist();
-  await d.addGroupMember({
-    idpUrl,
-    groupId: created.id,
-    inviteeDid: operatorDid,
-    mlsWelcomeB64: add.welcome_b64,
-    mlsCommitB64: add.commit_b64,
-    agentDid,
-    vcCompact,
-    signingKey,
-  });
+  // 4. Invite EVERY operator device — one KeyPackage per device (the IdP
+  //    deduped/sorted them via per_device=true). Each addMember advances
+  //    the epoch and emits a commit + a welcome: the welcome goes to that
+  //    device, and the IdP fans the commit out to members already added.
+  //    Add them one at a time so a mid-loop failure leaves a smaller-but-
+  //    consistent group (the message still rides it) rather than nothing.
+  for (const kp of keyPackages) {
+    const add = mls.addMember(groupIdB64, kp.keyPackageB64);
+    await mls.persist();
+    await d.addGroupMember({
+      idpUrl,
+      groupId: created.id,
+      inviteeDid: operatorDid,
+      mlsWelcomeB64: add.welcome_b64,
+      mlsCommitB64: add.commit_b64,
+      agentDid,
+      vcCompact,
+      signingKey,
+    });
+  }
 
   // 5. Record so this + future sends resolve the group.
   await d.recordGroup({ scope, idpGroupId: created.id, groupIdB64, operatorDid });
   logLine(
     `[lastid-agent] established a conversation with the operator → group ${created.id} ` +
-      `(invited 1 device; ${keyPackages.length} known)`,
+      `(invited ${keyPackages.length} device${keyPackages.length === 1 ? '' : 's'})`,
   );
   return { idpGroupId: created.id, groupIdB64, operatorDid };
 }

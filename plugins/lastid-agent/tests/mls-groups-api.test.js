@@ -82,7 +82,11 @@ test('fetchPeerKeyPackages: claims + maps the peer KeyPackages and remaining cou
     }),
   );
   const out = await fetchPeerKeyPackages({ ...AUTH, targetDid: 'did:lastid:zOperator', fetchImpl });
-  assert.equal(fetchImpl.calls[0].url, 'https://idp.test/v1/mls/keypackages/did%3Alastid%3AzOperator');
+  // per_device=true by default → one KeyPackage per device, in one fetch.
+  assert.equal(
+    fetchImpl.calls[0].url,
+    'https://idp.test/v1/mls/keypackages/did%3Alastid%3AzOperator?per_device=true',
+  );
   assert.deepEqual(out.keyPackages, [
     { keyPackageB64: 'kp1', ref: 'r1', deviceId: 'devA' },
     { keyPackageB64: 'kp2', ref: 'r2', deviceId: 'devB' },
@@ -95,6 +99,12 @@ test('fetchPeerKeyPackages: empty list → empty result (no throw)', async () =>
   const out = await fetchPeerKeyPackages({ ...AUTH, targetDid: 'did:lastid:zX', fetchImpl });
   assert.deepEqual(out.keyPackages, []);
   assert.equal(out.remainingCount, 0);
+});
+
+test('fetchPeerKeyPackages: perDevice:false omits the query string', async () => {
+  const fetchImpl = recordingFetch(res({ key_packages: [] }));
+  await fetchPeerKeyPackages({ ...AUTH, targetDid: 'did:lastid:zX', perDevice: false, fetchImpl });
+  assert.equal(fetchImpl.calls[0].url, 'https://idp.test/v1/mls/keypackages/did%3Alastid%3AzX');
 });
 
 test('createGroupOnIdp: posts name + mls_group_init + group_type, returns descriptor', async () => {
