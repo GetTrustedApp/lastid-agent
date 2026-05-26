@@ -1280,12 +1280,14 @@ async function cmdListen(flags) {
       { startVaultServer },
       { resolveVaultShare, resolveVaultSecret },
       { fetchVaultSecretEnc },
+      { publishCredentialedUse },
       { VaultHandleStore },
       { OperatorStore },
     ] = await Promise.all([
       import('./vault-ipc.js'),
       import('./vault-cache.js'),
       import('./vault-secret-fetch.js'),
+      import('./vault-use-metrics.js'),
       import('./vault-handle-store.js'),
       import('./operator-store.js'),
     ]);
@@ -1324,14 +1326,25 @@ async function cmdListen(flags) {
           }),
         fetchImpl: globalThis.fetch,
         now: () => Date.now(),
-        recordUse: (kind, h, m) =>
+        recordUse: (kind, h, m) => {
           process.stderr.write(
             `[lastid-agent] vault ${kind}: item=${h.itemId} approved=${h.wasApproved}` +
               (m
                 ? ` permissioned=${m.permissioned_ms}ms credentialed=${m.credentialed_ms}ms status=${m.status ?? '-'} outcome=${m.outcome}`
                 : '') +
               '\n',
-          ),
+          );
+          // Ship the timing to the operator's guardrail metrics (best-effort).
+          void publishCredentialedUse({
+            idpUrl,
+            agentDid: loaded.agentDid,
+            vcCompact: loaded.vcCompact,
+            signingSeed,
+            kind,
+            handle: h,
+            metrics: m,
+          });
+        },
       },
     });
     vaultServer = r.server ?? null;
