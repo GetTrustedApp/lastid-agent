@@ -908,10 +908,15 @@ async function cmdPolicyCheck(flags) {
   // only before the first sync (cold start / transition). See
   // saas-migration.md §2.3.
   try {
-    const { OperatorStore } = await import('./operator-store.js');
+    const { OperatorStore, deriveOperatorStateMacKey } = await import('./operator-store.js');
     // Pass this agent's own DID so per-agent rule EXEMPTIONS are honored — a
-    // global rule the operator opted THIS agent out of won't fire here.
-    const local = new OperatorStore(resolveScope(flags)).policyDecision(tool, input, {
+    // global rule the operator opted THIS agent out of won't fire here. Key the
+    // store so a tampered operator-state.json (deleted deny rule, flipped
+    // exemption) fails the integrity check and we fall back to safe defaults +
+    // the desktop, rather than enforcing the agent's own edit.
+    const local = new OperatorStore(resolveScope(flags), undefined, {
+      macKey: deriveOperatorStateMacKey(loaded.slotSeed),
+    }).policyDecision(tool, input, {
       selfDid: loaded.agentDid,
     });
     if (local) {
@@ -959,7 +964,7 @@ async function cmdPolicyCheck(flags) {
 async function runAgentStateSync(loaded, scope) {
   const [
     { deriveAgentEd25519Keypair },
-    { OperatorStore },
+    { OperatorStore, deriveOperatorStateMacKey },
     { syncAgentState },
     { MemoryStore },
     { decodeVcClaims },
@@ -972,7 +977,11 @@ async function runAgentStateSync(loaded, scope) {
   ]);
   const idpUrl = loaded.idpUrl ?? env.LASTID_IDP_URL ?? 'https://human.lastid.co';
   const { signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed);
-  const store = new OperatorStore(scope);
+  // The listener is the SINGLE writer of operator-state — key it so every save
+  // stamps the anti-tamper MAC (off the slot_seed, which isn't in the file).
+  const store = new OperatorStore(scope, undefined, {
+    macKey: deriveOperatorStateMacKey(loaded.slotSeed),
+  });
   // Memory store for cross-session/host reconcile: agent-authored memories
   // (and memory revokes) from the IdP land here, so a memory written on
   // another host/session shows up locally.

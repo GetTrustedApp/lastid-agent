@@ -27,52 +27,139 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { createHmac, hkdfSync, timingSafeEqual } from 'node:crypto';
 import { canonicalTool } from './tool-taxonomy.js';
 import { selfProtectionRecords, selfProtectionDisabledByEnv } from './self-protection.js';
 
 // Most-restrictive-wins precedence when several rules match one call.
 const SEVERITY_RANK = { deny: 3, rewrite: 2, warn: 1 };
 
+// ── operator-state integrity (anti-tamper) ───────────────────────────
+//
+// operator-state.json holds the operator's SIGNED settings (rules, audit
+// policy, …) after the sync verified each record's delegation signature. But
+// the file itself is plaintext on disk — the agent's own Write tool, or an fs
+// attacker, could edit it to delete a deny rule, flip exempt_agents, or disable
+// audit, silently overriding what the operator signed. So the SINGLE WRITER
+// (the listener) stamps a MAC over the state, keyed off a secret the file
+// doesn't contain — the agent's slot_seed (in the keychain, which agent
+// self-protection guards from being read into context). A reader holding the
+// key (the rule-enforcing policy-check) re-verifies on load; a tampered or
+// un-MACed file is rejected → SAFE DEFAULTS (no spoofed rules; self-protection
+// is built-in, so it stays on regardless). A keyless reader loads best-effort.
+
+/** Deterministic JSON (recursively sorted keys) — mirrors memory-audit.js's
+ *  canonicalJson; the MAC must be reproducible across write/read. */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+/** The state fields the MAC covers (NOT version, NOT the integrity tag itself). */
+function macPayload(state) {
+  const p = { cursor: Number(state.cursor) || 0, records: state.records ?? {} };
+  if (state.delegation_jwk) p.delegation_jwk = state.delegation_jwk;
+  return p;
+}
+
+function computeStateMac(macKey, state) {
+  return createHmac('sha256', macKey).update(canonicalJson(macPayload(state)), 'utf8').digest('hex');
+}
+
+function hexEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Derive the operator-state MAC key from the agent's slot_seed (HKDF-SHA256,
+ * domain-separated). The slot_seed lives in the keychain — NOT in
+ * operator-state.json — so an attacker who can edit the file but not read the
+ * keychain (the agent itself, with self-protection on) cannot forge the MAC.
+ * Returns null for a missing/empty seed (→ keyless, unverified).
+ */
+export function deriveOperatorStateMacKey(slotSeed) {
+  if (!Buffer.isBuffer(slotSeed) || slotSeed.length === 0) return null;
+  return Buffer.from(
+    hkdfSync('sha256', slotSeed, Buffer.alloc(0), Buffer.from('lastid-operator-state-mac-v1'), 32),
+  );
+}
+
 export function operatorStatePath(scope = 'main') {
   return join(homedir(), '.lastid-agent', scope ?? 'main', 'operator-state.json');
 }
 
 export class OperatorStore {
-  constructor(scope = 'main', path = operatorStatePath(scope)) {
+  constructor(scope = 'main', path = operatorStatePath(scope), opts = {}) {
     this.scope = scope ?? 'main';
     this.path = path;
+    // Anti-tamper MAC key (from the agent's slot_seed). When set, save() stamps
+    // a MAC and #load() rejects a tampered/un-MACed file (→ safe defaults). The
+    // listener (writer) + the policy-check (rule enforcer) pass it; keyless
+    // readers load best-effort. Must be set BEFORE #load().
+    this.macKey = opts.macKey ?? null;
     this.state = { version: 1, cursor: 0, records: {} };
     this.#load();
   }
 
   #load() {
+    let parsed;
     try {
-      const parsed = JSON.parse(readFileSync(this.path, 'utf8'));
-      if (parsed && typeof parsed === 'object') {
-        this.state = {
-          version: 1,
-          cursor: Number(parsed.cursor) || 0,
-          records:
-            parsed.records && typeof parsed.records === 'object'
-              ? parsed.records
-              : {},
-          // Trust-on-first-use pin of the operator's delegation_authority key
-          // (see pinnedDelegationJwk). Persisted so a later sync can't swap it.
-          ...(parsed.delegation_jwk && typeof parsed.delegation_jwk === 'object'
-            ? { delegation_jwk: parsed.delegation_jwk }
-            : {}),
-        };
-      }
+      parsed = JSON.parse(readFileSync(this.path, 'utf8'));
     } catch {
       // Missing or corrupt file → start empty. A corrupt cache is not
       // fatal; the next sync re-pulls from cursor 0.
+      return;
     }
+    if (!parsed || typeof parsed !== 'object') return;
+
+    const next = {
+      version: 1,
+      cursor: Number(parsed.cursor) || 0,
+      records:
+        parsed.records && typeof parsed.records === 'object' ? parsed.records : {},
+      // Trust-on-first-use pin of the operator's delegation_authority key
+      // (see pinnedDelegationJwk). Persisted so a later sync can't swap it.
+      ...(parsed.delegation_jwk && typeof parsed.delegation_jwk === 'object'
+        ? { delegation_jwk: parsed.delegation_jwk }
+        : {}),
+    };
+
+    // INTEGRITY: when we hold the key, the file MUST carry a valid MAC over its
+    // records. A tampered file (the agent's own Write, or an fs attacker editing
+    // rules / disabling audit / stripping the MAC) fails here → we keep the
+    // EMPTY state (no spoofed rules; the next sync re-pulls the authoritative
+    // state + re-MACs; self-protection stays on, it's built-in). A keyless
+    // reader loads unverified (best-effort / legacy).
+    if (this.macKey) {
+      const tag = parsed.integrity && typeof parsed.integrity === 'object' ? parsed.integrity : null;
+      const expected = computeStateMac(this.macKey, next);
+      if (!tag || !hexEqual(String(tag.mac ?? ''), expected)) {
+        process.stderr.write(
+          '[lastid-agent] operator-state integrity check FAILED — ignoring on-disk state ' +
+            '(tampered or un-MACed); using safe defaults until the next sync re-pulls\n',
+        );
+        return; // keep the empty default state
+      }
+    }
+    this.state = next;
   }
 
   save() {
     mkdirSync(dirname(this.path), { recursive: true });
+    const out = { ...this.state };
+    // Stamp the anti-tamper MAC when keyed (the listener, the single writer).
+    if (this.macKey) out.integrity = { v: 1, mac: computeStateMac(this.macKey, this.state) };
     const tmp = `${this.path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.state), { mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify(out), { mode: 0o600 });
     renameSync(tmp, this.path);
   }
 
