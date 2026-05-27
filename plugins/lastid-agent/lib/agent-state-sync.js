@@ -17,7 +17,7 @@
  */
 import { mintDpopJwt } from './dpop.js';
 import { decryptContent } from './agent-content-crypto.js';
-import { applyVaultRecords } from './vault-cache.js';
+import { applyVaultRecords, refreshCliBindings } from './vault-cache.js';
 import {
   decryptProjectContent,
   deriveProjectRoutingId,
@@ -174,6 +174,10 @@ export async function syncAgentState({
   // (listener) verifies the operator signature before use. Best-effort.
   try {
     applyVaultRecords(scope, vault.records);
+    // Refresh the non-secret CLI binding index so the PreToolUse hook can
+    // transparently rewrite a bound binary (`aws …` → `lastid-agent run …`)
+    // without a per-call keychain read. Derived only from env-injection shares.
+    refreshCliBindings(scope, slotSeed);
   } catch (err) {
     safely(onReject, { id: 'vault-cache', kind: 'vault' }, `vault cache: ${err?.message ?? err}`);
   }

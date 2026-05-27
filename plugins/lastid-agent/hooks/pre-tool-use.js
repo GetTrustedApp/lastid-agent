@@ -40,6 +40,8 @@ import { enqueueAuditEvent } from '../lib/audit-spool.js';
 import { isAuditEnabled, loadAuditPolicy } from '../lib/audit-policy.js';
 import { redactSecrets } from '../lib/bug-report.js';
 import { selfProtectionAuditEvent } from '../lib/self-protection.js';
+import { readCliBindings } from '../lib/vault-cache.js';
+import { planCliRewrite } from '../lib/cli-rewrite.js';
 
 // This session's agent scope (LASTID_AGENT_SCOPE → 'main'). The policy-check /
 // memory-search CLI children inherit the env and resolve it themselves; this
@@ -194,6 +196,48 @@ if (toolName) {
       // recorded the hit, and ambient retrieval may still surface
       // useful context below.
     }
+  }
+}
+
+// ─── 1·5. Transparent CLI credential proxy rewrite ─────────────────
+//
+// If a Bash command's leading binary is bound to a shared env-injection vault
+// credential, rewrite it to run under `lastid-agent run` — the secret is
+// injected into the child process's env (never shown to the agent), exactly
+// like the socket-firewall rewrite but for credentials. Reads the non-secret
+// binding index (no keychain / no decrypt here). planCliRewrite only rewrites a
+// SIMPLE command (refuses pipes / compound / env-prefixed); an ambiguous
+// binary→item match warns instead of guessing.
+if (toolName === 'Bash') {
+  try {
+    const bindings = readCliBindings(activeScope);
+    if (bindings.length > 0) {
+      const plan = planCliRewrite(toolInput?.command, bindings, { cliPath });
+      if (plan?.rewritten) {
+        console.log(
+          JSON.stringify({
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              permissionDecision: 'allow',
+              permissionDecisionReason:
+                `LastID: injecting the '${plan.binary}' credential from the vault (item ${plan.item_id}) ` +
+                'as env vars for this command. The secret is added to the child process only — you never see it.' +
+                (contextParts.length ? `\n\n${contextParts.join('\n\n')}` : ''),
+              updatedInput: { ...toolInput, command: plan.command },
+            },
+          }),
+        );
+        process.exit(0);
+      }
+      if (plan?.ambiguous) {
+        contextParts.push(
+          `⚠ Multiple shared credentials bind '${plan.binary}' (${plan.items.join(', ')}). ` +
+            `Run it explicitly and pick one: \`lastid-agent run --item <id> -- ${plan.binary} …\`.`,
+        );
+      }
+    }
+  } catch {
+    /* best-effort — never block a tool call on the credential rewrite */
   }
 }
 

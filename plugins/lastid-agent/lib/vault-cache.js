@@ -81,6 +81,52 @@ export function listVaultCache(scope = 'main') {
   return Object.values(readAll(scope));
 }
 
+/** Path to the NON-SECRET CLI binding index (item ids + binary names only). */
+export function cliBindingsPath(scope = 'main') {
+  return join(homedir(), '.lastid-agent', scope ?? 'main', 'cli-bindings.json');
+}
+
+/**
+ * Recompute the CLI binding index from the cached vault shares and write it to
+ * cli-bindings.json: { bindings: [{ item_id, binaries }] } for every
+ * env-injection share. Read by the PreToolUse hook (cheap — no keychain, no
+ * decrypt) to transparently rewrite `aws …` → `lastid-agent run --item <id> --
+ * aws …`. Carries NO secret: only item ids + binary names (both already in the
+ * operator-signed share). Best-effort; returns the bindings it wrote.
+ */
+export function refreshCliBindings(scope = 'main', slotSeed, deps = {}) {
+  const bindings = [];
+  try {
+    for (const v of decryptedVaultViews(scope, slotSeed, deps)) {
+      if (v?.injection?.type !== 'env') continue;
+      const binaries = Array.isArray(v.binaries)
+        ? v.binaries.filter((b) => typeof b === 'string' && b.length > 0)
+        : [];
+      if (binaries.length > 0 && typeof v.id === 'string') {
+        bindings.push({ item_id: v.id, binaries });
+      }
+    }
+    const p = cliBindingsPath(scope);
+    mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
+    const tmp = `${p}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ bindings, updated_at: new Date().toISOString() }), { mode: 0o600 });
+    renameSync(tmp, p);
+  } catch {
+    /* best-effort — the hook treats a missing/empty index as "no bindings" */
+  }
+  return bindings;
+}
+
+/** Read the CLI binding index (or [] when absent). NO secret — safe in a hook. */
+export function readCliBindings(scope = 'main') {
+  try {
+    const obj = JSON.parse(readFileSync(cliBindingsPath(scope), 'utf8'));
+    return Array.isArray(obj?.bindings) ? obj.bindings : [];
+  } catch {
+    return [];
+  }
+}
+
 /** One cached sealed share by id, or null. */
 export function getVaultShare(scope, id) {
   return readAll(scope)[id] ?? null;
