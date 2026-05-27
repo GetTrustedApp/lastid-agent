@@ -450,6 +450,15 @@ async function tryConnectDesktop({ loadedAgent }) {
   return { client: ok ? client : null, signingSeed };
 }
 
+// True when the on-disk credential differs from the one this server cached.
+// Lets a long-lived server pick up a `provision --reissue` (new slot/DID/VC)
+// without a full restart. Null fresh => nothing valid on disk, keep what we have.
+export function agentCredentialChanged(cached, fresh) {
+  if (!fresh) return false;
+  if (!cached) return true;
+  return fresh.agentDid !== cached.agentDid || fresh.vcCompact !== cached.vcCompact;
+}
+
 async function buildServer({ scope }) {
   const server = new Server(SERVER_INFO, {
     capabilities: {
@@ -485,22 +494,41 @@ async function buildServer({ scope }) {
   let desktopConn = await tryConnectDesktop({ loadedAgent });
   let desktopClient = desktopConn.client;
   let signingSeed = desktopConn.signingSeed;
+  // When we last re-read the credential from disk (gates the reissue TTL below).
+  let lastAgentReadAt = Date.now();
+  // Re-read the credential at most this often (ms) to catch a reissue.
+  const AGENT_REFRESH_TTL_MS = 5_000;
 
   const reloadAgentIfStale = async () => {
-    // Re-read the keychain when we have no agent yet — AND when the cached
-    // bundle is missing its project_root_seed. The old assumption ("once
-    // provisioned the bundle never changes in-process") was wrong: a
-    // RE-PROVISION (or a later seal/migration) adds the project_root_seed to
-    // the keychain AFTER this long-lived server first loaded. A stale bundle
-    // with projectRootSeed=null silently fails every project-tier and
-    // global-shared memory/rule write (publishAgentMemory's seed guard) until
-    // a restart — which is exactly the "server write failed" we chased. Once
-    // the reload picks the seed up, the bundle has it and this no-ops; only a
-    // genuinely seedless (pre-project) agent re-reads, which is a cheap, rare,
-    // non-prompting keychain read for a trusted app.
+    // Re-read the keychain when we have no agent yet, OR when the cached bundle
+    // is missing its project_root_seed. The old assumption ("once provisioned
+    // the bundle never changes in-process") was wrong: a RE-PROVISION (or a
+    // later seal/migration) adds the project_root_seed AFTER this long-lived
+    // server first loaded. A stale bundle with projectRootSeed=null silently
+    // fails every project-tier and global-shared memory/rule write
+    // (publishAgentMemory's seed guard) until a restart. Once the reload picks
+    // the seed up, the bundle has it and this no-ops.
     if (!loadedAgent || !loadedAgent.projectRootSeed) {
       const fresh = await loadAgentVc(scope);
       if (fresh) loadedAgent = fresh;
+      lastAgentReadAt = Date.now();
+      return;
+    }
+    // A RE-ISSUE mints a NEW VC (new slot/DID) on disk while this long-lived
+    // server still holds the old bundle in memory, so without this the tools
+    // keep answering + signing as the OLD (now-revoked) identity until a full
+    // session restart. Re-read on a short TTL and swap when the on-disk identity
+    // changed; the TTL keeps the common no-change path a single in-process check
+    // rather than a credential read per tool call. Drop the desktop connection
+    // so signingSeed re-derives from the new slot seed.
+    if (Date.now() - lastAgentReadAt >= AGENT_REFRESH_TTL_MS) {
+      lastAgentReadAt = Date.now();
+      const fresh = await loadAgentVc(scope);
+      if (agentCredentialChanged(loadedAgent, fresh)) {
+        loadedAgent = fresh;
+        desktopClient = null;
+        signingSeed = null;
+      }
     }
   };
 
