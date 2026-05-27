@@ -45,7 +45,11 @@ const REDACTORS = [
   { re: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, sub: () => '[REDACTED JWT]' }, // JWT / SD-JWT
   { re: /\bAKIA[0-9A-Z]{16}\b/g, sub: () => '[REDACTED]' }, // AWS access key id
   { re: /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g, sub: () => '[REDACTED]' }, // GitHub token
-  { re: /\bsk-[A-Za-z0-9]{20,}\b/g, sub: () => '[REDACTED]' }, // sk- style api key
+  // sk-/pk-/rk- style API keys, INCLUDING hyphen/underscore-segmented variants:
+  // OpenAI sk-… and sk-proj-…/sk-test-…, Stripe sk_live_…/sk_test_…/pk_live_…/rk_live_….
+  // The old /sk-[A-Za-z0-9]{20,}/ missed these — the separator after the prefix
+  // (sk-proj-, sk_live_) broke the alphanumeric run.
+  { re: /\b(?:sk|pk|rk)[-_][A-Za-z0-9][A-Za-z0-9_-]{18,}\b/gi, sub: () => '[REDACTED]' },
   { re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, sub: () => '[REDACTED]' }, // Slack token
   // Labeled secret=value — keep the label, redact the value.
   {

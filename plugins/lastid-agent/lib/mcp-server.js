@@ -294,6 +294,14 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
     if (!text) {
       throw new Error('lastid_send_message requires text');
     }
+    // Redact secret-shaped content before the message leaves the agent. The
+    // operator's chat is end-to-end synced to all their devices, so a raw API
+    // key / token the agent emitted must never ride along. This runs
+    // server-side in the send handler (not a skippable hook), so it always
+    // applies; it reuses the shared redactSecrets scrubber — the same patterns
+    // as the audit + bug-report redaction.
+    const { redactSecrets } = await import('./bug-report.js');
+    const { text: safeText, count: redactedCount } = redactSecrets(text);
     // Resolve the operator (the agent's parent human) from the VC.
     // The LLM never sees a DID or a group id — it just says text.
     // (loadedAgent + message:send already verified by the gate above.)
@@ -309,7 +317,7 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
     // delivers this message. Enqueue keyed by operator DID so the drain
     // resolves the live group at send time.
     const group = await resolveActiveGroupForOperator({ scope, operatorDid });
-    const id = await enqueueSend({ scope, operatorDid, text });
+    const id = await enqueueSend({ scope, operatorDid, text: safeText });
     const note = group
       ? 'Encrypted + delivered by your listener within a couple seconds. The operator sees it in their console chat and on their phone.'
       : "No conversation exists yet — your listener will establish one with the operator's devices, then deliver this. (If the listener isn't running, the message waits in the outbox until it is.)";
@@ -322,6 +330,7 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
               queued: true,
               request_id: id,
               establishing_conversation: !group,
+              redacted_count: redactedCount,
               note,
             },
             null,

@@ -98,6 +98,29 @@ test('redactSecrets: scrubs known secret shapes, counts them, leaves clean text 
   assert.equal(pem.text.includes('MHcCAQE'), false);
 });
 
+test('redactSecrets: scrubs hyphen/underscore-segmented API keys (sk-proj-, sk-test-, sk_live_, pk_live_)', () => {
+  // These slipped the old /sk-[A-Za-z0-9]{20,}/ — the separator after the prefix
+  // broke the alphanumeric run. A live chat-redaction test surfaced it: an
+  // sk-test- key delivered to the operator raw.
+  for (const key of [
+    'sk-proj-fAk3T0k3nZxYw8Vu7Ts6Rq5Po4Nm3Lk2Jh1Gf0Dc9Bb8Aa',
+    'sk-test-9aBcDeF0gHiJkLmNoPqRsTuVwXyZ123456',
+    'sk_live_FAKE_51HxYzAbCdEfGhIjKlMnOpQrStUvWx',
+    'pk_live_aB3dEfGhIjKlMnOpQrStUvWx',
+  ]) {
+    const r = redactSecrets(`key is ${key} ok`);
+    assert.equal(r.text.includes(key), false, `must redact ${key}`);
+    assert.match(r.text, /\[REDACTED\]/);
+    assert.ok(r.count >= 1);
+  }
+  // Original bare sk-<alnum> still scrubbed (regression).
+  const bare = redactSecrets('sk-abcd1234efgh5678ijklmnop');
+  assert.equal(bare.text.includes('sk-abcd1234efgh5678ijklmnop'), false);
+  // NEGATIVE: short prefixed tokens (sk-8, pk-2) are NOT over-redacted.
+  const clean = redactSecrets('the sk-8 ticket and pk-2 review');
+  assert.deepEqual(clean, { text: 'the sk-8 ticket and pk-2 review', count: 0 });
+});
+
 test('REGRESSION: a secret pasted into the report is scrubbed before it can be sent', () => {
   const payload = buildBugReportPayload(
     { summary: 'claim failed', details: 'curl -H "Authorization: Bearer sk-abcd1234efgh5678ijkl" failed' },
