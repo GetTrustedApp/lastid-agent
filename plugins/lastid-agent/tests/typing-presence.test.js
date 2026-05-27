@@ -1,115 +1,127 @@
 /**
- * The presence state machine decides when the listener emits `received` +
- * `typing` for a channel conversation. These tests pin the behaviors that
- * matter: typing shows while the agent works, clears on a reply, RESUMES on
- * fresh activity (not on a bare tick — no flicker after the final reply),
- * fades on idle, is capped, and — critically — never opens for command-line
- * work (no operator_message → no window → no typing).
+ * Pure presence state machine: working (processing the turn) + typing (sending a
+ * message) as INDEPENDENT signals. Deterministic with an injected clock.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   reducePresence,
   initialPresence,
-  DEFAULT_PRESENCE_CONFIG as CFG,
+  DEFAULT_PRESENCE_CONFIG,
 } from '../lib/typing-presence.js';
 
-test('operator_message opens the window: emits received + typing_on', () => {
-  const { state, actions } = reducePresence(initialPresence(), { type: 'operator_message' }, 1000);
-  assert.deepEqual(actions, ['received', 'typing_on']);
-  assert.equal(state.openedAt, 1000);
-  assert.equal(state.typingOn, true);
-});
+const CFG = { idleMs: 10_000, maxMs: 60_000 };
 
-test('tick keep-alives typing while live + on', () => {
-  let s = reducePresence(initialPresence(), { type: 'operator_message' }, 0).state;
-  const { actions } = reducePresence(s, { type: 'tick' }, 4000); // within idle
-  assert.deepEqual(actions, ['typing_on']); // heartbeat re-emit
-});
+// Apply a sequence of [type, now] events from a fresh window; return the final
+// state + the flat list of actions emitted along the way.
+function run(events) {
+  let state = initialPresence();
+  const actions = [];
+  for (const [type, now] of events) {
+    const r = reducePresence(state, { type }, now, CFG);
+    state = r.state;
+    actions.push(...r.actions);
+  }
+  return { state, actions };
+}
 
-test('agent_reply clears typing but keeps the window open', () => {
-  let s = reducePresence(initialPresence(), { type: 'operator_message' }, 0).state;
-  const r = reducePresence(s, { type: 'agent_reply' }, 2000);
-  assert.deepEqual(r.actions, ['typing_off']);
-  assert.equal(r.state.typingOn, false);
-  assert.notEqual(r.state.openedAt, null); // still open
-});
-
-test('a bare tick after a reply does NOT re-show typing (no flicker)', () => {
-  let s = reducePresence(initialPresence(), { type: 'operator_message' }, 0).state;
-  s = reducePresence(s, { type: 'agent_reply' }, 2000).state; // typing off, window open
-  const { actions } = reducePresence(s, { type: 'tick' }, 4000); // still within idle
-  assert.deepEqual(actions, []); // ticks never turn typing back on
-});
-
-test('fresh activity after a reply RESUMES typing (agent kept working)', () => {
-  let s = reducePresence(initialPresence(), { type: 'operator_message' }, 0).state;
-  s = reducePresence(s, { type: 'agent_reply' }, 2000).state;
-  const r = reducePresence(s, { type: 'activity' }, 3000);
-  assert.deepEqual(r.actions, ['typing_on']);
-  assert.equal(r.state.typingOn, true);
-});
-
-test('tick after idleMs of no activity fades typing + closes the window', () => {
-  let s = reducePresence(initialPresence(), { type: 'operator_message' }, 0).state;
-  const r = reducePresence(s, { type: 'tick' }, CFG.idleMs + 1);
-  assert.deepEqual(r.actions, ['typing_off']);
-  assert.equal(r.state.openedAt, null);
-});
-
-test('tick past maxMs closes even with continuous activity', () => {
-  let s = reducePresence(initialPresence(), { type: 'operator_message' }, 0).state;
-  // Activity right up to the cap keeps idle fresh, but the hard cap still wins.
-  s = reducePresence(s, { type: 'activity' }, CFG.maxMs - 10).state;
-  const r = reducePresence(s, { type: 'tick' }, CFG.maxMs + 1);
-  assert.deepEqual(r.actions, ['typing_off']);
-  assert.equal(r.state.openedAt, null);
-});
-
-test('activity with NO open window is ignored — CLI work never emits typing', () => {
-  const r = reducePresence(initialPresence(), { type: 'activity' }, 5000);
-  assert.deepEqual(r.actions, []);
-  assert.equal(r.state.openedAt, null);
+test('operator_message: read receipt + WORKING on (not typing)', () => {
+  const r = reducePresence(initialPresence(), { type: 'operator_message' }, 1000, CFG);
+  assert.deepEqual(r.actions, ['received', 'working_on']);
+  assert.equal(r.state.workingOn, true);
   assert.equal(r.state.typingOn, false);
 });
 
-test('tick with no open window does nothing', () => {
-  const r = reducePresence(initialPresence(), { type: 'tick' }, 5000);
+test('sending → typing_on; agent_reply → typing_off; WORKING stays on the whole time (no flicker)', () => {
+  const { state, actions } = run([
+    ['operator_message', 1000],
+    ['sending', 1100], // about to send a message
+    ['agent_reply', 1200], // it landed
+    ['sending', 1300], // sending another
+    ['agent_reply', 1400],
+  ]);
+  // Working never went off across the intermediate replies — the regression.
+  assert.equal(state.workingOn, true);
+  assert.equal(state.typingOn, false);
+  assert.deepEqual(actions, [
+    'received',
+    'working_on',
+    'typing_on',
+    'typing_off',
+    'typing_on',
+    'typing_off',
+  ]);
+});
+
+test('REGRESSION: an agent_reply does NOT clear working (the old flicker-off-on-reply bug)', () => {
+  const { state } = run([['operator_message', 1000]]);
+  // A reply with no prior typing is a no-op on typing and MUST NOT touch working.
+  const r = reducePresence(state, { type: 'agent_reply' }, 1100, CFG);
   assert.deepEqual(r.actions, []);
-  assert.equal(r.state.openedAt, null);
+  assert.equal(r.state.workingOn, true, 'working still on after a reply');
 });
 
-test('agent_reply with typing already off is a no-op', () => {
-  const r = reducePresence(initialPresence(), { type: 'agent_reply' }, 1000);
+test('activity keeps working alive (refreshes lastActivityAt, no dup working_on)', () => {
+  let state = initialPresence();
+  state = reducePresence(state, { type: 'operator_message' }, 1000, CFG).state;
+  const r = reducePresence(state, { type: 'activity' }, 2000, CFG);
+  assert.deepEqual(r.actions, []); // already working
+  assert.equal(r.state.lastActivityAt, 2000);
+  assert.equal(r.state.workingOn, true);
+});
+
+test('turn_end clears working + typing and closes the window (the precise end)', () => {
+  let state = initialPresence();
+  state = reducePresence(state, { type: 'operator_message' }, 1000, CFG).state;
+  state = reducePresence(state, { type: 'sending' }, 1100, CFG).state;
+  const r = reducePresence(state, { type: 'turn_end' }, 1200, CFG);
+  assert.deepEqual(r.actions, ['typing_off', 'working_off']);
+  assert.deepEqual(r.state, initialPresence());
+});
+
+test('tick re-emits working_on as a keep-alive while open and under the cap', () => {
+  let state = initialPresence();
+  state = reducePresence(state, { type: 'operator_message' }, 1000, CFG).state;
+  const r = reducePresence(state, { type: 'tick' }, 5000, CFG);
+  assert.deepEqual(r.actions, ['working_on']);
+});
+
+test('tick past maxMs closes the window as a backstop (missed turn_end)', () => {
+  let state = initialPresence();
+  state = reducePresence(state, { type: 'operator_message' }, 1000, CFG).state;
+  const r = reducePresence(state, { type: 'tick' }, 1000 + CFG.maxMs + 1, CFG);
+  assert.deepEqual(r.actions, ['working_off']);
+  assert.deepEqual(r.state, initialPresence());
+});
+
+test('NEGATIVE: sending / activity / turn_end / tick with NO open window emit nothing (CLI work)', () => {
+  for (const type of ['sending', 'activity', 'turn_end', 'tick']) {
+    const r = reducePresence(initialPresence(), { type }, 1000, CFG);
+    assert.deepEqual(r.actions, [], `${type} with no window`);
+    assert.equal(r.state.openedAt, null);
+  }
+});
+
+test('NEGATIVE: a second `sending` while already typing does not re-emit', () => {
+  let state = initialPresence();
+  state = reducePresence(state, { type: 'operator_message' }, 1000, CFG).state;
+  state = reducePresence(state, { type: 'sending' }, 1100, CFG).state;
+  const r = reducePresence(state, { type: 'sending' }, 1150, CFG);
   assert.deepEqual(r.actions, []);
 });
 
-test('idle window: a tick when typing already faded just closes it (no dup typing_off)', () => {
-  let s = reducePresence(initialPresence(), { type: 'operator_message' }, 0).state;
-  s = reducePresence(s, { type: 'agent_reply' }, 1000).state; // typing off, window open
-  const r = reducePresence(s, { type: 'tick' }, CFG.idleMs + 1); // idle now
-  assert.deepEqual(r.actions, []); // typing already off → nothing to emit
-  assert.equal(r.state.openedAt, null); // window closed
+test('a full turn: message → work → send → reply → more work → turn_end', () => {
+  const { actions } = run([
+    ['operator_message', 1000],
+    ['activity', 1500], // already working → no action
+    ['sending', 2000],
+    ['agent_reply', 2100],
+    ['activity', 3000], // already working → no action
+    ['turn_end', 4000],
+  ]);
+  assert.deepEqual(actions, ['received', 'working_on', 'typing_on', 'typing_off', 'working_off']);
 });
 
-test('a full working turn: message → work → reply → idle', () => {
-  const seq = [];
-  let s = initialPresence();
-  const step = (type, now) => {
-    const r = reducePresence(s, { type }, now);
-    s = r.state;
-    seq.push([now, type, r.actions]);
-  };
-  step('operator_message', 0); // received + typing_on
-  step('tick', 4000); // keep-alive typing_on
-  step('activity', 5000); // working (no change, already on)
-  step('tick', 8000); // keep-alive
-  step('agent_reply', 9000); // typing_off
-  step('tick', 12000); // no flicker → []
-  step('tick', 9000 + CFG.idleMs + 1); // idle → close, already off → []
-  assert.deepEqual(seq[0][2], ['received', 'typing_on']);
-  assert.deepEqual(seq[1][2], ['typing_on']);
-  assert.deepEqual(seq[4][2], ['typing_off']);
-  assert.deepEqual(seq[5][2], []);
-  assert.equal(s.openedAt, null);
+test('DEFAULT_PRESENCE_CONFIG exposes maxMs (the backstop cap)', () => {
+  assert.equal(typeof DEFAULT_PRESENCE_CONFIG.maxMs, 'number');
 });

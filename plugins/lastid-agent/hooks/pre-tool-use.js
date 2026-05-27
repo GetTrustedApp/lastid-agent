@@ -43,6 +43,7 @@ import { selfProtectionAuditEvent } from '../lib/self-protection.js';
 import { readCliBindings } from '../lib/vault-cache.js';
 import { planCliRewrite } from '../lib/cli-rewrite.js';
 import { isOwnPluginTool } from '../lib/own-tools.js';
+import { touchSignal } from '../lib/presence-activity.js';
 
 // This session's agent scope (LASTID_AGENT_SCOPE → 'main'). The policy-check /
 // memory-search CLI children inherit the env and resolve it themselves; this
@@ -62,6 +63,19 @@ try {
 
 const toolName = event?.tool_name ?? event?.toolName ?? '';
 const toolInput = event?.tool_input ?? event?.toolInput ?? {};
+
+// Presence: the agent is about to SEND a message to the operator → signal
+// "typing" (the dots show until the message lands). The listener reads this
+// marker on its presence tick. ONLY the send-message tool counts — general
+// tool work drives "working" via the PostToolUse activity heartbeat.
+// Best-effort; never blocks the tool.
+if (toolName.endsWith('__lastid_send_message')) {
+  try {
+    touchSignal(activeScope, 'sending');
+  } catch {
+    /* best-effort — the typing indicator just won't refresh */
+  }
+}
 
 // ─── 0. Audit: record the tool CALL ────────────────────────────────
 //

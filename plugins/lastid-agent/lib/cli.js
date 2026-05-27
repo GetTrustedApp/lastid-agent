@@ -1092,7 +1092,7 @@ async function cmdListen(flags) {
     { acquireListenerLock, releaseListenerLock },
     { reconcileConversationDevices },
     { PresenceEmitter },
-    { readActivityTs },
+    { readActivityTs, readSignalTs },
   ] = await Promise.all([
     import('./agent-provisioning.js'),
     import('./mls-client.js'),
@@ -1347,14 +1347,31 @@ async function cmdListen(flags) {
     userDid: loaded.agentDid,
   });
   let lastActivitySeen = 0;
-  const PRESENCE_TICK_MS = 4_000;
+  let lastSendingSeen = 0;
+  let lastTurnEndSeen = 0;
+  // 2s (was 4s): catches the brief send-tool "sending" signal promptly enough
+  // for the typing dots, and keeps "working" alive within the client's
+  // few-second indicator TTL.
+  const PRESENCE_TICK_MS = 2_000;
   const presenceTimer = setInterval(() => {
-    if (!wsOpen) return; // don't emit into a down socket; client TTL clears typing
+    if (!wsOpen) return; // don't emit into a down socket; client TTL clears it
     try {
-      const ts = readActivityTs(scope);
-      if (ts > lastActivitySeen) {
-        lastActivitySeen = ts;
-        presence.noteActivity();
+      const a = readActivityTs(scope);
+      if (a > lastActivitySeen) {
+        lastActivitySeen = a;
+        presence.noteActivity(); // any tool ran → keep "working" alive
+      }
+      // Send-message tool fired (pre-tool-use) → show typing until it lands.
+      const s = readSignalTs(scope, 'sending');
+      if (s > lastSendingSeen) {
+        lastSendingSeen = s;
+        presence.onSending();
+      }
+      // The agent's turn ended (before-stop) → clear working/typing precisely.
+      const e = readSignalTs(scope, 'turn_end');
+      if (e > lastTurnEndSeen) {
+        lastTurnEndSeen = e;
+        presence.onTurnEnd();
       }
       presence.tick();
     } catch {

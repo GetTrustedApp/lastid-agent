@@ -1,7 +1,8 @@
 /**
- * PresenceEmitter turns state-machine actions into `group_chat.typing` frames
- * on the listener's WS. These tests assert the actual frames emitted across a
- * conversation, with an injected clock + a capturing `send`.
+ * PresenceEmitter turns state-machine actions into wire frames on the listener's
+ * WS: group_chat.typing carrying BOTH `is_typing` (sending a message) and
+ * `working` (processing the turn), plus a group_chat.read receipt. These tests
+ * assert the actual frames, with an injected clock + a capturing `send`.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -9,6 +10,7 @@ import { PresenceEmitter } from '../lib/presence-emitter.js';
 
 const GROUP = 'idp-group-uuid-1';
 const AGENT = 'did:lastid:agent:z6MkAgent';
+const OPERATOR = 'did:lastid:z5cZOperatorHuman';
 
 function harness() {
   const sent = [];
@@ -22,124 +24,103 @@ function harness() {
   return { sent, emitter, setNow: (t) => (now = t), advance: (d) => (now += d) };
 }
 
-const typing = (is_typing) => ({
-  type: 'group_chat.typing',
-  payload: { group_id: GROUP, user_did: AGENT, is_typing },
-});
-
-function lastTyping(sent) {
+/** Latest group_chat.typing frame's presence flags, or null. */
+function lastPresence(sent) {
   const f = [...sent].reverse().find((x) => x.type === 'group_chat.typing');
-  return f ? { type: f.type, payload: f.payload } : null;
+  return f ? { is_typing: f.payload.is_typing, working: f.payload.working } : null;
 }
+function lastRead(sent) {
+  return [...sent].reverse().find((x) => x.type === 'group_chat.read') ?? null;
+}
+const openTurn = (h) =>
+  h.emitter.onOperatorMessage(GROUP, { messageId: 'm1', senderDid: OPERATOR });
 
-test('operator message emits typing(true) for that group', () => {
+test('operator message → read receipt + working:true (NOT typing)', () => {
   const h = harness();
-  h.emitter.onOperatorMessage(GROUP);
-  assert.deepEqual(lastTyping(h.sent), typing(true));
-  // user_did is the agent (the typer); group is the IdP group id.
-  assert.equal(h.sent[0].payload.user_did, AGENT);
+  openTurn(h);
+  assert.deepEqual(lastPresence(h.sent), { is_typing: false, working: true });
+  const read = lastRead(h.sent);
+  assert.ok(read, 'read receipt emitted');
+  assert.equal(read.payload.message_id, 'm1');
+  assert.equal(read.payload.sender_did, AGENT);
+  assert.equal(read.payload.recipient_did, OPERATOR);
 });
 
-test('tick within idle re-emits typing(true) as a keep-alive', () => {
+test('sending → typing:true (working stays true); reply → typing:false (working STILL true)', () => {
   const h = harness();
-  h.emitter.onOperatorMessage(GROUP);
+  openTurn(h);
+  h.emitter.onSending();
+  assert.deepEqual(lastPresence(h.sent), { is_typing: true, working: true });
+  h.emitter.onAgentReply(GROUP);
+  // The dots clear but WORKING persists — the whole point of B.
+  assert.deepEqual(lastPresence(h.sent), { is_typing: false, working: true });
+});
+
+test('REGRESSION: working does not flip off on an intermediate reply', () => {
+  const h = harness();
+  openTurn(h);
+  h.emitter.onSending();
+  h.emitter.onAgentReply(GROUP);
+  h.emitter.onSending();
+  h.emitter.onAgentReply(GROUP);
+  assert.deepEqual(lastPresence(h.sent), { is_typing: false, working: true });
+});
+
+test('tick re-emits working:true as a keep-alive while the turn is open', () => {
+  const h = harness();
+  openTurn(h);
   h.sent.length = 0;
   h.advance(4000);
   h.emitter.tick();
-  assert.deepEqual(lastTyping(h.sent), typing(true));
+  assert.deepEqual(lastPresence(h.sent), { is_typing: false, working: true });
 });
 
-test('agent reply emits typing(false)', () => {
+test('turn_end clears working + typing and prunes the window', () => {
   const h = harness();
-  h.emitter.onOperatorMessage(GROUP);
+  openTurn(h);
+  h.emitter.onSending();
   h.sent.length = 0;
-  h.emitter.onAgentReply(GROUP);
-  assert.deepEqual(lastTyping(h.sent), typing(false));
-});
-
-test('a tick right after a reply emits nothing (no flicker)', () => {
-  const h = harness();
-  h.emitter.onOperatorMessage(GROUP);
-  h.emitter.onAgentReply(GROUP);
+  h.emitter.onTurnEnd();
+  assert.deepEqual(lastPresence(h.sent), { is_typing: false, working: false });
+  // Pruned: a later tick emits nothing.
   h.sent.length = 0;
   h.advance(3000);
   h.emitter.tick();
   assert.deepEqual(h.sent, []);
 });
 
-test('activity after a reply resumes typing(true)', () => {
+test('tick past maxMs closes the window as a backstop', () => {
   const h = harness();
-  h.emitter.onOperatorMessage(GROUP);
-  h.emitter.onAgentReply(GROUP);
+  openTurn(h);
   h.sent.length = 0;
-  h.advance(2000);
-  h.emitter.noteActivity();
-  assert.deepEqual(lastTyping(h.sent), typing(true));
+  h.advance(60_001); // past maxMs
+  h.emitter.tick();
+  assert.deepEqual(lastPresence(h.sent), { is_typing: false, working: false });
 });
 
-test('idle timeout emits typing(false) and prunes the window', () => {
+test('NEGATIVE: sending / turn_end with NO open window (CLI work) emit nothing', () => {
   const h = harness();
-  h.emitter.onOperatorMessage(GROUP);
-  h.sent.length = 0;
-  h.advance(10_001); // past idleMs
-  h.emitter.tick();
-  assert.deepEqual(lastTyping(h.sent), typing(false));
-  // Pruned: a further tick does nothing.
-  h.sent.length = 0;
-  h.advance(4000);
+  h.emitter.onSending();
+  h.emitter.onTurnEnd();
   h.emitter.tick();
   assert.deepEqual(h.sent, []);
 });
 
-test('activity with no open window (CLI work) emits nothing', () => {
-  const h = harness();
-  h.emitter.noteActivity();
-  h.emitter.tick();
-  assert.deepEqual(h.sent, []);
+test('NEGATIVE: read receipt is skipped without message_id or sender_did', () => {
+  const h1 = harness();
+  h1.emitter.onOperatorMessage(GROUP, { messageId: null, senderDid: OPERATOR });
+  assert.equal(lastRead(h1.sent), null);
+  assert.deepEqual(lastPresence(h1.sent), { is_typing: false, working: true }); // working still starts
+
+  const h2 = harness();
+  h2.emitter.onOperatorMessage(GROUP, { messageId: 'm1', senderDid: null });
+  assert.equal(lastRead(h2.sent), null);
+
+  const h3 = harness();
+  h3.emitter.onOperatorMessage(GROUP); // bare call (back-compat)
+  assert.equal(lastRead(h3.sent), null);
 });
 
 test('constructor requires a send function', () => {
   assert.throws(() => new PresenceEmitter({ userDid: AGENT }), /send required/);
-});
-
-// ── read receipts (the `received` action → group_chat.read) ───────────────
-
-const OPERATOR = 'did:lastid:z5cZOperatorHuman';
-function lastRead(sent) {
-  return [...sent].reverse().find((x) => x.type === 'group_chat.read') ?? null;
-}
-
-test('POSITIVE: operator message with {messageId, senderDid} emits a group_chat.read receipt in the IdP shape', () => {
-  const h = harness();
-  h.emitter.onOperatorMessage(GROUP, { messageId: 'msg-42', senderDid: OPERATOR });
-  // Still starts typing.
-  assert.deepEqual(lastTyping(h.sent), typing(true));
-  // And emits a read receipt the IdP's handleStatusEvent can proxy to the operator.
-  const read = lastRead(h.sent);
-  assert.ok(read, 'a group_chat.read frame was emitted');
-  assert.equal(read.correlation_id, 'msg-42');
-  assert.equal(read.payload.group_id, GROUP);
-  assert.equal(read.payload.message_id, 'msg-42');
-  assert.equal(read.payload.sender_did, AGENT); // the reader (this agent) reports the status
-  assert.equal(read.payload.recipient_did, OPERATOR); // the operator who sent it receives the receipt
-  assert.equal(typeof read.payload.read_at, 'string');
-});
-
-test('NEGATIVE: operator message missing message_id or sender_did emits typing but NO read receipt', () => {
-  // Missing message_id → no receipt (a receipt without message_id would error
-  // the IdP relay, which does message_id.substring()).
-  const h = harness();
-  h.emitter.onOperatorMessage(GROUP, { messageId: null, senderDid: OPERATOR });
-  assert.deepEqual(lastTyping(h.sent), typing(true));
-  assert.equal(lastRead(h.sent), null);
-
-  // Missing sender_did → no recipient to proxy to → no receipt.
-  const h2 = harness();
-  h2.emitter.onOperatorMessage(GROUP, { messageId: 'msg-1', senderDid: null });
-  assert.equal(lastRead(h2.sent), null);
-
-  // Bare call (back-compat) → no receipt.
-  const h3 = harness();
-  h3.emitter.onOperatorMessage(GROUP);
-  assert.equal(lastRead(h3.sent), null);
 });
