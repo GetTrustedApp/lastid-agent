@@ -101,3 +101,45 @@ test('activity with no open window (CLI work) emits nothing', () => {
 test('constructor requires a send function', () => {
   assert.throws(() => new PresenceEmitter({ userDid: AGENT }), /send required/);
 });
+
+// ── read receipts (the `received` action → group_chat.read) ───────────────
+
+const OPERATOR = 'did:lastid:z5cZOperatorHuman';
+function lastRead(sent) {
+  return [...sent].reverse().find((x) => x.type === 'group_chat.read') ?? null;
+}
+
+test('POSITIVE: operator message with {messageId, senderDid} emits a group_chat.read receipt in the IdP shape', () => {
+  const h = harness();
+  h.emitter.onOperatorMessage(GROUP, { messageId: 'msg-42', senderDid: OPERATOR });
+  // Still starts typing.
+  assert.deepEqual(lastTyping(h.sent), typing(true));
+  // And emits a read receipt the IdP's handleStatusEvent can proxy to the operator.
+  const read = lastRead(h.sent);
+  assert.ok(read, 'a group_chat.read frame was emitted');
+  assert.equal(read.correlation_id, 'msg-42');
+  assert.equal(read.payload.group_id, GROUP);
+  assert.equal(read.payload.message_id, 'msg-42');
+  assert.equal(read.payload.sender_did, AGENT); // the reader (this agent) reports the status
+  assert.equal(read.payload.recipient_did, OPERATOR); // the operator who sent it receives the receipt
+  assert.equal(typeof read.payload.read_at, 'string');
+});
+
+test('NEGATIVE: operator message missing message_id or sender_did emits typing but NO read receipt', () => {
+  // Missing message_id → no receipt (a receipt without message_id would error
+  // the IdP relay, which does message_id.substring()).
+  const h = harness();
+  h.emitter.onOperatorMessage(GROUP, { messageId: null, senderDid: OPERATOR });
+  assert.deepEqual(lastTyping(h.sent), typing(true));
+  assert.equal(lastRead(h.sent), null);
+
+  // Missing sender_did → no recipient to proxy to → no receipt.
+  const h2 = harness();
+  h2.emitter.onOperatorMessage(GROUP, { messageId: 'msg-1', senderDid: null });
+  assert.equal(lastRead(h2.sent), null);
+
+  // Bare call (back-compat) → no receipt.
+  const h3 = harness();
+  h3.emitter.onOperatorMessage(GROUP);
+  assert.equal(lastRead(h3.sent), null);
+});

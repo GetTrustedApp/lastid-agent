@@ -1253,9 +1253,9 @@ async function cmdListen(flags) {
   const dispatcher = new MlsDispatcher({
     mls,
     scope,
-    onOperatorMessage: (groupId) => {
+    onOperatorMessage: (groupId, messageId) => {
       try {
-        presence?.onOperatorMessage(groupId);
+        presence?.onOperatorMessage(groupId, messageId);
       } catch {
         /* best-effort — presence never affects messaging */
       }

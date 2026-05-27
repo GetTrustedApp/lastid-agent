@@ -423,9 +423,19 @@ export class MlsDispatcher {
     if (type === 'operator.message.text' && this.#onOperatorMessage) {
       const idpGroupId =
         typeof event?.payload?.group_id === 'string' ? event.payload.group_id : null;
+      // For the read receipt: the operator message's id (which message was
+      // read) and its sender_did (the operator — the receipt's recipient, i.e.
+      // the original sender the IdP proxies the status back to). message_id
+      // mirrors what the console set on send; correlation_id is the fallback.
+      const messageId =
+        (typeof event?.payload?.message_id === 'string' && event.payload.message_id) ||
+        (typeof event?.payload?.correlation_id === 'string' && event.payload.correlation_id) ||
+        null;
+      const senderDid =
+        typeof event?.payload?.sender_did === 'string' ? event.payload.sender_did : null;
       if (idpGroupId) {
         try {
-          this.#onOperatorMessage(idpGroupId);
+          this.#onOperatorMessage(idpGroupId, { messageId, senderDid });
         } catch (err) {
           this.#log(`[lastid-agent] presence onOperatorMessage failed: ${errText(err)}`);
         }

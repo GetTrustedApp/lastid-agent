@@ -21,6 +21,10 @@ export class PresenceEmitter {
   #now;
   #config;
   #byGroup = new Map();
+  // Per group: the last operator message's { messageId, senderDid }, so the
+  // `received` action can emit a read receipt the IdP can proxy back to the
+  // operator (it needs both the message_id and the recipient/operator DID).
+  #lastMessageByGroup = new Map();
 
   /**
    * @param {object} opts
@@ -45,8 +49,19 @@ export class PresenceEmitter {
     for (const action of actions) this.#emit(groupId, action);
   }
 
-  /** Inbound operator chat message decrypted → confirm receipt + start typing. */
-  onOperatorMessage(groupId) {
+  /**
+   * Inbound operator chat message decrypted → confirm receipt (read) + start
+   * typing. `info` carries the operator message's `{ messageId, senderDid }` so
+   * the read receipt can name the message and route back to the operator. Both
+   * are required to emit a receipt (the IdP relay needs message_id +
+   * recipient_did); absent → typing only, no receipt.
+   */
+  onOperatorMessage(groupId, info = {}) {
+    const messageId = typeof info?.messageId === 'string' ? info.messageId : null;
+    const senderDid = typeof info?.senderDid === 'string' ? info.senderDid : null;
+    if (groupId && messageId && senderDid) {
+      this.#lastMessageByGroup.set(groupId, { messageId, senderDid });
+    }
     this.#apply(groupId, { type: 'operator_message' });
   }
 
@@ -80,9 +95,28 @@ export class PresenceEmitter {
           is_typing: action === 'typing_on',
         },
       });
+      return;
     }
-    // 'received' → a `group_chat.read`-style receipt. Deferred to Phase 1b: it
-    // needs the operator message_id + the IdP status-event payload shape. The
-    // state machine already produces the action, so 1b is pure wiring here.
+    if (action === 'received') {
+      // Read receipt: the agent received + read the operator's message. Shape
+      // matches the IdP's handleStatusEvent, which proxies the status back to
+      // recipient_did (the operator who sent it). Both message_id and
+      // recipient_did are required there — skip if we lack either (a malformed
+      // receipt would error the relay).
+      const info = this.#lastMessageByGroup.get(groupId);
+      if (!info || !info.messageId || !info.senderDid) return;
+      this.#send({
+        type: 'group_chat.read',
+        correlation_id: info.messageId,
+        timestamp: new Date().toISOString(),
+        payload: {
+          group_id: groupId,
+          message_id: info.messageId,
+          sender_did: this.#userDid, // the reader (this agent) reporting the status
+          recipient_did: info.senderDid, // the operator who sent it → receives the receipt
+          read_at: new Date().toISOString(),
+        },
+      });
+    }
   }
 }
