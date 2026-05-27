@@ -151,13 +151,19 @@ export class MlsDispatcher {
   #scope;
   #log;
   #requestSend;
+  #onOperatorMessage;
 
   /** @param {DispatcherOptions} opts */
-  constructor({ mls, scope = 'main', log, requestSend }) {
+  constructor({ mls, scope = 'main', log, requestSend, onOperatorMessage }) {
     this.#mls = mls;
     this.#scope = scope;
     this.#log = log ?? ((line) => process.stderr.write(`${line}\n`));
     this.#requestSend = requestSend;
+    // Optional: called with the IdP group id when an inbound OPERATOR CHAT
+    // message (operator.message.text) is decrypted, so the listener can drive
+    // the received + typing presence. Only chat messages fire it — other
+    // operator.* envelopes (memory write, rule publish) are not "a chat turn".
+    this.#onOperatorMessage = typeof onOperatorMessage === 'function' ? onOperatorMessage : null;
   }
 
   /**
@@ -409,6 +415,22 @@ export class MlsDispatcher {
       envelope,
     });
     this.#log(`[lastid-agent] inbox: ${type} (group=${groupId})`);
+
+    // Presence: a decrypted OPERATOR CHAT message opens a received + typing
+    // window for the operator. Use the IdP group id (the UUID the typing event
+    // fans out on), not the openmls group_id_b64. Only chat messages count —
+    // a memory/rule envelope isn't the operator chatting. Best-effort.
+    if (type === 'operator.message.text' && this.#onOperatorMessage) {
+      const idpGroupId =
+        typeof event?.payload?.group_id === 'string' ? event.payload.group_id : null;
+      if (idpGroupId) {
+        try {
+          this.#onOperatorMessage(idpGroupId);
+        } catch (err) {
+          this.#log(`[lastid-agent] presence onOperatorMessage failed: ${errText(err)}`);
+        }
+      }
+    }
   }
 
   // --- Commit -------------------------------------------------------------

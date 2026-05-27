@@ -23,6 +23,7 @@ import { enqueueAuditEvent } from '../lib/audit-spool.js';
 import { redactSecrets } from '../lib/bug-report.js';
 import { redactSelfProtected, selfProtectionAuditEvent } from '../lib/self-protection.js';
 import { resolveScope } from '../lib/scope.js';
+import { touchActivity } from '../lib/presence-activity.js';
 
 const RESULT_CAP = 2000;
 
@@ -61,6 +62,18 @@ const toolName = event?.tool_name ?? event?.toolName ?? '';
 const toolUseId = event?.tool_use_id ?? event?.toolUseId ?? null;
 const eventName = event?.hook_event_name ?? event?.hookEventName ?? '';
 const failed = eventName === 'PostToolUseFailure' || event?.error != null;
+
+// Presence heartbeat: any tool call means the agent is actively working. The
+// listener reads this timestamp to keep the operator's "working…" typing
+// indicator alive — but only while a channel conversation window is open, so a
+// CLI-only tool call here never surfaces as typing. Cheap, best-effort.
+if (toolName) {
+  try {
+    touchActivity(resolveScope());
+  } catch {
+    /* best-effort */
+  }
+}
 
 let flaggedKeyMaterial = false;
 

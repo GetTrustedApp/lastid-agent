@@ -1091,6 +1091,8 @@ async function cmdListen(flags) {
     { makeDoorbellHandler },
     { acquireListenerLock, releaseListenerLock },
     { reconcileConversationDevices },
+    { PresenceEmitter },
+    { readActivityTs },
   ] = await Promise.all([
     import('./agent-provisioning.js'),
     import('./mls-client.js'),
@@ -1100,6 +1102,8 @@ async function cmdListen(flags) {
     import('./agent-state-sync.js'),
     import('./listener-daemon.js'),
     import('./reconcile-conversation.js'),
+    import('./presence-emitter.js'),
+    import('./presence-activity.js'),
   ]);
 
   // The agent's operator (parent human) — the only peer it reconciles against.
@@ -1242,9 +1246,20 @@ async function cmdListen(flags) {
   // The cycle (dispatcher → ws.send → ws → dispatcher.onEvent) is
   // broken because each leg is async; no recursion concerns.
   let wsRef;
+  // Presence (received + typing) emitter — assigned once the WS exists below.
+  // The dispatcher fires onOperatorMessage when it decrypts an inbound operator
+  // chat message; presence is set by then (inbound only arrives post-connect).
+  let presence;
   const dispatcher = new MlsDispatcher({
     mls,
     scope,
+    onOperatorMessage: (groupId) => {
+      try {
+        presence?.onOperatorMessage(groupId);
+      } catch {
+        /* best-effort — presence never affects messaging */
+      }
+    },
     requestSend: (frame) => {
       if (!wsRef) return;
       // The WS handler normalizes top-level envelope vs payload, so
@@ -1313,6 +1328,40 @@ async function cmdListen(flags) {
 
   process.stderr.write(`[lastid-agent] listening as ${loaded.agentDid} on ${idpUrl}\n`);
   ws.start();
+
+  // Presence: the operator-facing "received + typing" indicator. The listener
+  // is the sole WS writer, so it owns this. A window opens only when the
+  // dispatcher decrypts an inbound operator chat message (onOperatorMessage
+  // above) — CLI work never opens one, so it can't leak typing. The tick reads
+  // the activity heartbeat (PostToolUse → presence-activity file): a fresh
+  // timestamp means the agent is working, which keeps the typing indicator
+  // alive; idle/cap timeouts fade it. Best-effort — never touches messaging.
+  presence = new PresenceEmitter({
+    send: (frame) => {
+      try {
+        ws.send(frame);
+      } catch {
+        /* a typing frame that fails to send is harmless — clients auto-clear */
+      }
+    },
+    userDid: loaded.agentDid,
+  });
+  let lastActivitySeen = 0;
+  const PRESENCE_TICK_MS = 4_000;
+  const presenceTimer = setInterval(() => {
+    if (!wsOpen) return; // don't emit into a down socket; client TTL clears typing
+    try {
+      const ts = readActivityTs(scope);
+      if (ts > lastActivitySeen) {
+        lastActivitySeen = ts;
+        presence.noteActivity();
+      }
+      presence.tick();
+    } catch {
+      /* best-effort */
+    }
+  }, PRESENCE_TICK_MS);
+  if (typeof presenceTimer.unref === 'function') presenceTimer.unref();
 
   // Event-loop liveness monitor. A blocked event loop is exactly what kills
   // this listener: a synchronous CPU burst (MLS wasm, embedding model) delays
@@ -1482,6 +1531,16 @@ async function cmdListen(flags) {
         if (!ok) {
           wsOpen = false;
           throw new Error('ws not open');
+        }
+        // Presence: a reply just went to the operator → clear that group's
+        // typing indicator (the message itself is the signal). Continued tool
+        // activity re-shows it; if the agent's done, idle fades it. Best-effort.
+        if (frame?.type === 'group_chat.message' && frame?.payload?.group_id) {
+          try {
+            presence?.onAgentReply(frame.payload.group_id);
+          } catch {
+            /* best-effort */
+          }
         }
       },
       // Self-heal auth: lets the drain create a conversation (invite the
