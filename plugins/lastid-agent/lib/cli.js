@@ -1253,9 +1253,23 @@ async function cmdListen(flags) {
   const dispatcher = new MlsDispatcher({
     mls,
     scope,
-    onOperatorMessage: (groupId, messageId) => {
+    onOperatorMessage: (groupId, info) => {
+      // Diagnostic (listener.log): the read receipt fires ONLY when the inbound
+      // carried BOTH a message_id and the operator's sender_did — log which we
+      // got so a missing field is visible instead of a silent read SKIP.
       try {
-        presence?.onOperatorMessage(groupId, messageId);
+        const mid = info && typeof info.messageId === 'string' ? info.messageId : null;
+        const sdid = info && typeof info.senderDid === 'string' ? info.senderDid : null;
+        process.stderr.write(
+          `[lastid-agent] presence onOperatorMessage group=${groupId} ` +
+            `msgId=${mid ?? 'MISSING'} sender=${sdid ? sdid.slice(0, 24) + '…' : 'MISSING'} ` +
+            `→ read ${mid && sdid ? 'EMIT' : 'SKIP'}\n`,
+        );
+      } catch {
+        /* diagnostic only — never affects messaging */
+      }
+      try {
+        presence?.onOperatorMessage(groupId, info);
       } catch {
         /* best-effort — presence never affects messaging */
       }
