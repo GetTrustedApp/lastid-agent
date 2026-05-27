@@ -18,6 +18,7 @@
 import { readFileSync } from 'node:fs';
 import { enqueueAuditEvent } from '../lib/audit-spool.js';
 import { redactSecrets } from '../lib/bug-report.js';
+import { redactSelfProtected } from '../lib/self-protection.js';
 import { resolveScope } from '../lib/scope.js';
 
 const RESULT_CAP = 2000;
@@ -34,13 +35,21 @@ const toolUseId = event?.tool_use_id ?? event?.toolUseId ?? null;
 const eventName = event?.hook_event_name ?? event?.hookEventName ?? '';
 const failed = eventName === 'PostToolUseFailure' || event?.error != null;
 
+let withholdFromModel = false;
+
 if (toolName || toolUseId) {
   try {
     const rawResult = failed
       ? (event?.error ?? event?.stderr ?? '')
       : (event?.tool_result ?? event?.tool_response ?? '');
     const asText = typeof rawResult === 'string' ? rawResult : safeStringify(rawResult);
-    const { text, count } = redactSecrets(asText);
+    // Mask LastID's OWN material (key-material service tokens + guard source
+    // filenames) on top of the generic secret redaction, so the audit chain
+    // never stores it. If a key-material identifier shows up in the raw output,
+    // also withhold the whole result from the model (see the block below).
+    const sp = redactSelfProtected(asText);
+    if (sp.keyMaterial > 0) withholdFromModel = true;
+    const { text, count } = redactSecrets(sp.text);
     enqueueAuditEvent({
       scope: resolveScope(),
       eventType: failed ? 'AgentToolFailed' : 'AgentToolSucceeded',
@@ -49,6 +58,7 @@ if (toolName || toolUseId) {
         status: failed ? 'error' : 'success',
         result: text.length > RESULT_CAP ? text.slice(0, RESULT_CAP) : text,
         result_redactions: count,
+        self_protection_redactions: sp.count,
         result_truncated: text.length > RESULT_CAP,
       },
       toolUseId,
@@ -71,6 +81,18 @@ if (toolName || toolUseId) {
       /* best-effort */
     }
   }
+}
+// PostToolUse cannot rewrite output bytes, only block the whole result. If the
+// raw output carried a LastID key-material identifier, withhold it from the
+// model entirely (the audit copy above is already redacted).
+if (withholdFromModel) {
+  process.stdout.write(
+    JSON.stringify({
+      decision: 'block',
+      reason:
+        "LastID self-protection: this tool's output contained LastID's own key-material identifiers, so it was withheld from your context. Do not attempt to read this material, and tell your operator if you were asked to.",
+    }),
+  );
 }
 process.exit(0);
 

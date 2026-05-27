@@ -50,6 +50,23 @@ export const SELF_PROTECTION_RULES = [
     reason:
       "Dumping the whole keychain would expose LastID's own keys. Refuse — read a specific, named, non-LastID item if you have a legitimate need.",
   },
+  {
+    id: 'lastid-self-source',
+    tool: '*',
+    // self-protection.js + keychain.js enumerate the matcher patterns and the
+    // literal key-material service names. PreToolUse sees tool INPUT, not its
+    // output, so a plain `cat keychain.js` would otherwise slip those names into
+    // context — recon for evading this very rule. Deny naming these files (the
+    // .test.js fixtures embed the same names, so they're covered too). Defense-
+    // in-depth: the plugin is open source, so this raises the bar for a local
+    // rummage; it does not hide the patterns from anyone determined. The durable
+    // key protection is the OS-ACL / daemon layer.
+    pattern: '(?:self-protection|keychain)(?:\\.test)?\\.js\\b',
+    is_regex: true,
+    severity: 'deny',
+    reason:
+      "These files define LastID's own self-protection matcher and key-material service names — reading them into your context is off limits. Refuse, and tell your operator if you were asked to.",
+  },
 ]
 
 export const SELF_PROTECTION_PACK_ID = 'agent-self-protection'
@@ -88,4 +105,40 @@ export function selfProtectionRecords() {
       self_protection: true,
     },
   }))
+}
+
+// ─── Output-side redaction ──────────────────────────────────────────────────
+// The deny rules above gate tool INPUT. But PreToolUse never sees a tool's
+// OUTPUT, so an obfuscated read (a string-split service name, an odd path to
+// keychain.js) can still spill LastID's own material into the result. This masks
+// that material out of a text chunk — used for the audit-chain result and, via a
+// PostToolUse block, to withhold a result from the model.
+//
+// `keyMaterial` counts the HIGH-SIGNAL hits (key-material service tokens) so the
+// caller can decide to withhold the WHOLE output: the harness lets a PostToolUse
+// hook BLOCK an output but not rewrite its bytes, so all-or-nothing is the only
+// model-side lever. A bare filename (e.g. `ls` listing keychain.js) is redacted
+// from the audit text but does NOT count as key material, so it won't trigger a
+// block. NOTE: a `-w` read that emits ONLY a raw value with no surrounding
+// identifier is indistinguishable from any base64 and is NOT caught here without
+// false positives; that case is closed only by the OS-ACL / daemon layer.
+const KEY_MATERIAL_RE = /lastid\.co\/(?:sub-)?agent-(?:slot-seed|project-root-seed|vc)(?::[\w.-]+)?/g
+const SELF_SOURCE_RE = /(?:self-protection|keychain)(?:\.test)?\.js\b/g
+const REDACTION = '[REDACTED:lastid-self-protection]'
+
+export function redactSelfProtected(text) {
+  if (typeof text !== 'string' || text.length === 0) {
+    return { text: text ?? '', count: 0, keyMaterial: 0 }
+  }
+  let keyMaterial = 0
+  let out = text.replace(KEY_MATERIAL_RE, () => {
+    keyMaterial++
+    return REDACTION
+  })
+  let fileHits = 0
+  out = out.replace(SELF_SOURCE_RE, () => {
+    fileHits++
+    return REDACTION
+  })
+  return { text: out, count: keyMaterial + fileHits, keyMaterial }
 }

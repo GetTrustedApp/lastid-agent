@@ -18,6 +18,7 @@ import {
   SELF_PROTECTION_RULES,
   selfProtectionRecords,
   selfProtectionDisabledByEnv,
+  redactSelfProtected,
 } from '../lib/self-protection.js';
 
 function freshStore() {
@@ -211,4 +212,68 @@ test('self-protection DENY wins over a synced operator warn (most-restrictive)',
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// The guard's OWN source is off limits. Reading lib/self-protection.js or
+// lib/keychain.js dumps the matcher patterns + the literal key-material service
+// names into context — recon for evading this very guard. PreToolUse sees the
+// tool INPUT, not the output, so a plain `cat keychain.js` would otherwise slip
+// the names out. Tool-agnostic, so Read AND a Bash cat/sed both match; covers
+// the .test.js fixtures, which embed the same names.
+test('DENIES reading the self-protection / keychain source (recon for evading the guard)', () => {
+  const { store, dir } = freshStore();
+  try {
+    withEnv(undefined, () => {
+      const attempts = [
+        ['Read', { file_path: '/x/plugins/lastid-agent/lib/self-protection.js' }],
+        ['Read', { file_path: '/x/plugins/lastid-agent/lib/keychain.js' }],
+        ['Bash', { command: 'cat lib/keychain.js' }],
+        ['Bash', { command: 'sed -n 1,80p lib/self-protection.js' }],
+        ['Read', { file_path: '/x/plugins/lastid-agent/tests/self-protection.test.js' }],
+      ];
+      for (const [tool, input] of attempts) {
+        const d = store.matchRules(tool, input);
+        assert.equal(d.allow, false, JSON.stringify([tool, input]));
+        assert.equal(d.matched.severity, 'deny');
+        assert.equal(d.matched.memory_id, 'selfprot:lastid-self-source');
+      }
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ALLOWS reading other plugin source (only the guard + keychain are off limits)', () => {
+  const { store, dir } = freshStore();
+  try {
+    withEnv(undefined, () => {
+      assert.equal(store.matchRules('Read', { file_path: '/x/plugins/lastid-agent/lib/rule-packs.js' }).allow, true);
+      assert.equal(store.matchRules('Bash', { command: 'cat lib/operator-store.js' }).allow, true);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// OUTPUT-side net: PreToolUse blocks the obvious reads, but an obfuscated read
+// can still emit protected material into a tool's OUTPUT. redactSelfProtected
+// masks the key-material service-name tokens + the guard/keychain source
+// filenames out of any text (tool output before it reaches the audit chain, and
+// where the runtime allows, the model). The service literal here is built by
+// concatenation so this source file never embeds it (which would itself be
+// off limits).
+test('redactSelfProtected: masks key-material service names + the guard source filenames', () => {
+  const svc = 'lastid.co/agent-' + 'slot-seed:main';
+  const r = redactSelfProtected(`found ${svc} and see lib/keychain.js for the rest`);
+  assert.ok(!r.text.includes(svc), 'service token masked');
+  assert.ok(!r.text.includes('keychain.js'), 'source filename masked');
+  assert.equal(r.count, 2);
+  assert.match(r.text, /REDACTED/);
+});
+
+test('redactSelfProtected: leaves unrelated output untouched (no false positives)', () => {
+  const t = 'ordinary command output, nothing sensitive in here';
+  const r = redactSelfProtected(t);
+  assert.equal(r.text, t);
+  assert.equal(r.count, 0);
 });
