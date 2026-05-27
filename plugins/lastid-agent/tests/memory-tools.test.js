@@ -83,6 +83,53 @@ test('a project-tier write WITH a project_root_seed passes the seed guard and pr
   }
 });
 
+// source_kind is implied by the tool, so the agent never has to supply it (and a
+// missing/dropped value can't fail a save). The tool name is the source of truth:
+// write = operator-instructed (user_explicit), draft = agent-inferred (inferred).
+test('lastid_memory_draft defaults source_kind to inferred when omitted', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const res = await call('lastid_memory_draft', { kind: 'fact', subject: ['x'], claim: 'inferred default' }, scope);
+    assert.equal(res.isError ?? false, false);
+    assert.equal(body(res).memory.source.kind, 'inferred');
+  } finally {
+    cleanup();
+  }
+});
+
+test('lastid_memory_write defaults source_kind to user_explicit when omitted', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const res = await call('lastid_memory_write', { kind: 'fact', subject: ['x'], claim: 'explicit default' }, scope);
+    assert.equal(res.isError ?? false, false);
+    assert.equal(body(res).memory.source.kind, 'user_explicit');
+  } finally {
+    cleanup();
+  }
+});
+
+test('an explicit source_kind still wins over the tool default', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const res = await call('lastid_memory_draft', { kind: 'fact', subject: ['x'], claim: 'override', source_kind: 'tool_observation' }, scope);
+    assert.equal(res.isError ?? false, false);
+    assert.equal(body(res).memory.source.kind, 'tool_observation');
+  } finally {
+    cleanup();
+  }
+});
+
+test('NEGATIVE: an invalid source_kind is still rejected (the default only fills a missing value)', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const res = await call('lastid_memory_draft', { kind: 'fact', subject: ['x'], claim: 'bad', source_kind: 'made_up' }, scope);
+    assert.equal(res.isError, true);
+    assert.match(body(res).error, /source_kind must be one of/);
+  } finally {
+    cleanup();
+  }
+});
+
 // REGRESSION (project forget dropped project_key): the forget case published the
 // tombstone as { id, tier, version } with NO project_key, so a project-tier
 // tombstone couldn't derive its routing id → publishAgentMemory failed → every

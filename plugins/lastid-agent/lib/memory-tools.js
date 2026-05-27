@@ -50,14 +50,22 @@ const writeInputSchema = {
     },
     claim: { type: 'string', description: 'The memory itself (≤4000 chars).' },
     summary: { type: 'string', description: 'Optional short summary. Kept to 600 chars — longer is truncated, never rejected, so a memory write is never blocked by summary length.' },
-    source_kind: { type: 'string', enum: SOURCE_ENUM, description: 'Where this came from.' },
+    source_kind: {
+      type: 'string',
+      enum: SOURCE_ENUM,
+      description:
+        'Where this came from. Optional — defaults to user_explicit for lastid_memory_write and inferred for lastid_memory_draft (the tool already implies it). Only set it to override (e.g. tool_observation / imported).',
+    },
     source_quote: { type: 'string', description: 'Verbatim user text (for user_explicit).' },
     source_ref: { type: 'string', description: 'Session/file/conversation reference.' },
     sensitivity: { type: 'string', enum: SENS_ENUM, description: 'Auto-escalated if content looks secret.' },
     bedrock: { type: 'boolean', description: 'Always-inject on every turn if true.' },
     expires_at: { type: 'string', description: 'RFC3339 hard expiry (optional).' },
   },
-  required: ['kind', 'subject', 'claim', 'source_kind'],
+  // source_kind intentionally NOT required: it's defaulted from the tool name
+  // in handleMemoryTool (write→user_explicit, draft→inferred), so a missing or
+  // dropped value can never fail a save.
+  required: ['kind', 'subject', 'claim'],
   additionalProperties: false,
 };
 
@@ -315,6 +323,17 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
   // host/owner/repo. Any agent-supplied project_key is dropped.
   if (name === 'lastid_memory_write' || name === 'lastid_memory_draft') {
     if ('project_key' in args) delete args.project_key;
+    // source_kind is implied by the tool, so the agent never needs to pass it
+    // (and a missing/dropped arg can't fail the save): an explicit write is
+    // operator-instructed (user_explicit); a draft is agent-inferred
+    // (inferred). An explicit value still wins; an invalid one is still
+    // rejected downstream by validateWriteInput.
+    if (!args.source_kind) {
+      args = {
+        ...args,
+        source_kind: name === 'lastid_memory_write' ? 'user_explicit' : 'inferred',
+      };
+    }
     // Filesystem-derived (injectable for tests). Sticky = the operative path's
     // git remote PreToolUse recorded; cwd is the fallback. Never the agent.
     const repo =
