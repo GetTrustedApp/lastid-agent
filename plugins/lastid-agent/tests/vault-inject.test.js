@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { applyInjection, injectionSummary } from "../lib/vault-inject.js";
+import { applyInjection, injectionSummary, buildEnvInjection } from "../lib/vault-inject.js";
 
 test("header: fills {value} into the named header, leaves url + other headers alone", () => {
   const headers = { Accept: "application/json" };
@@ -83,4 +83,51 @@ test("injectionSummary carries shape, never a secret slot", () => {
     format: "Bearer {value}",
   });
   assert.equal(injectionSummary(null), null);
+});
+
+// ── env injection (the CLI credential proxy) ─────────────────────────────────
+test("buildEnvInjection maps fields → env vars", () => {
+  const out = buildEnvInjection({
+    injection: {
+      type: "env",
+      env_map: [
+        { name: "AWS_ACCESS_KEY_ID", field: "secret" },
+        { name: "AWS_SECRET_ACCESS_KEY", field: "secret_secondary" },
+      ],
+    },
+    secret: "AKIA123",
+    secret_secondary: "shh-secret",
+  });
+  assert.deepEqual(out.env, { AWS_ACCESS_KEY_ID: "AKIA123", AWS_SECRET_ACCESS_KEY: "shh-secret" });
+});
+
+test("buildEnvInjection applies a format template", () => {
+  const out = buildEnvInjection({
+    injection: { type: "env", env_map: [{ name: "TOKEN", field: "secret", format: "Bearer {value}" }] },
+    secret: "tok",
+  });
+  assert.equal(out.env.TOKEN, "Bearer tok");
+});
+
+test("buildEnvInjection throws on an unusable spec (loud, not silently un-credentialed)", () => {
+  assert.throws(() => buildEnvInjection({ injection: { type: "header" }, secret: "s" }), /not an env injection/);
+  assert.throws(() => buildEnvInjection({ injection: { type: "env", env_map: [] }, secret: "s" }), /no env_map/);
+  assert.throws(() => buildEnvInjection({ injection: { type: "env", env_map: [{ field: "secret" }] }, secret: "s" }), /needs a name/);
+  assert.throws(
+    () => buildEnvInjection({ injection: { type: "env", env_map: [{ name: "X", field: "secret_secondary" }] }, secret: "s" }),
+    /empty/,
+  );
+});
+
+test("injectionSummary for env lists var NAMES only, never the field mapping or values", () => {
+  const s = injectionSummary({
+    type: "env",
+    env_map: [
+      { name: "AWS_ACCESS_KEY_ID", field: "secret" },
+      { name: "AWS_SECRET_ACCESS_KEY", field: "secret_secondary" },
+    ],
+  });
+  assert.equal(s.type, "env");
+  assert.deepEqual(s.env_vars, ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]);
+  assert.equal("env_map" in s, false, "summary does not echo the field mapping");
 });

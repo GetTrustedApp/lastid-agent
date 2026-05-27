@@ -1386,6 +1386,7 @@ async function cmdListen(flags) {
       import('./audit-spool.js'),
     ]);
     const vaultHandles = new VaultHandleStore();
+    const { spawn: childSpawn } = await import('node:child_process');
     const r = await startVaultServer({
       scope,
       deps: {
@@ -1427,6 +1428,10 @@ async function cmdListen(flags) {
           }),
         fetchImpl: globalThis.fetch,
         now: () => Date.now(),
+        // The `exec` op (CLI credential proxy) spawns the child HERE in the
+        // listener with the injected env, so the secret stays in this process +
+        // the child, never the agent's tool process.
+        spawnImpl: childSpawn,
         recordUse: (kind, h, m) => {
           process.stderr.write(
             `[lastid-agent] vault ${kind}: item=${h.itemId} approved=${h.wasApproved}` +
@@ -1581,9 +1586,81 @@ async function cmdListen(flags) {
   await new Promise(() => {});
 }
 
+/**
+ * `lastid-agent run --item <id> -- <command> [args]` — the CLI credential proxy.
+ * Mints a single-use vault handle (via the listener's policy-gated vault_use),
+ * then asks the listener to spawn the command with the credential injected as
+ * env vars and STREAM its (scrubbed) output back. The secret never enters this
+ * process or the agent's context — only the listener + the child see it.
+ */
+async function cmdRun(flags, cmdArgv) {
+  const scope = resolveScope(flags);
+  const itemId = typeof flags.item === 'string' ? flags.item : null;
+  if (!itemId) {
+    process.stderr.write('run: --item <id> required\n');
+    exit(2);
+  }
+  if (!Array.isArray(cmdArgv) || cmdArgv.length === 0) {
+    process.stderr.write('run: command required after `--`  (e.g. lastid-agent run --item <id> -- aws s3 ls)\n');
+    exit(2);
+  }
+  const { loadAgentVc } = await import('./keychain.js');
+  const loaded = await loadAgentVc(scope);
+  if (!loaded) {
+    process.stderr.write('run: not provisioned — run `lastid-agent provision` first\n');
+    exit(2);
+  }
+  const { vaultRequest, vaultExecStream } = await import('./vault-ipc.js');
+
+  // Mint a single-use handle (runs the full policy / approval / rate gate in the
+  // listener). The secret is NOT released by this step.
+  let used;
+  try {
+    used = await vaultRequest(scope, { op: 'vault_use', item_id: itemId, ctx: { now_ms: Date.now() } });
+  } catch (e) {
+    process.stderr.write(`run: vault listener unreachable (${e?.message ?? e}). Is the agent listener running?\n`);
+    exit(1);
+  }
+  if (used?.policy_approval_required) {
+    process.stderr.write('run: this credential needs operator approval per use. Approve it in your LastID, then retry.\n');
+    exit(1);
+  }
+  if (!used?.ok || !used.vault_handle) {
+    process.stderr.write(`run: ${used?.error ?? 'vault_use_failed'}: ${used?.reason_detail ?? used?.detail ?? ''}\n`);
+    exit(1);
+  }
+
+  // Stream the child's output live; the secret is injected + scrubbed entirely
+  // in the listener, so only already-clean bytes reach us.
+  let terminal;
+  try {
+    terminal = await vaultExecStream(
+      scope,
+      { vault_handle: used.vault_handle, argv: cmdArgv, cwd: process.cwd() },
+      { onStdout: (b) => process.stdout.write(b), onStderr: (b) => process.stderr.write(b) },
+    );
+  } catch (e) {
+    process.stderr.write(`run: exec failed (${e?.message ?? e})\n`);
+    exit(1);
+  }
+  if (terminal?.error) {
+    process.stderr.write(`run: ${terminal.error}${terminal.detail ? ': ' + terminal.detail : ''}\n`);
+    exit(1);
+  }
+  if (terminal?.timed_out) process.stderr.write('run: command timed out and was killed\n');
+  if (terminal?.truncated) process.stderr.write('run: output truncated (output cap reached)\n');
+  exit(typeof terminal?.exit_code === 'number' ? terminal.exit_code : 0);
+}
+
 async function main() {
   const [, , cmd, ...rest] = argv;
-  const flags = parseFlags(rest);
+  // `run` passes the child command after a `--` terminator; keep those tokens
+  // out of parseFlags so the child's OWN flags (e.g. `aws s3 ls --recursive`)
+  // aren't swallowed as ours.
+  const ddIdx = rest.indexOf('--');
+  const flagArgs = ddIdx === -1 ? rest : rest.slice(0, ddIdx);
+  const cmdArgv = ddIdx === -1 ? [] : rest.slice(ddIdx + 1);
+  const flags = parseFlags(flagArgs);
   switch (cmd) {
     case 'provision':
       await cmdProvision(flags);
@@ -1624,6 +1701,9 @@ async function main() {
     case 'self-protection-status':
       await cmdSelfProtectionStatus(flags);
       break;
+    case 'run':
+      await cmdRun(flags, cmdArgv);
+      break;
     case 'help':
     case '--help':
     case undefined:
@@ -1639,6 +1719,9 @@ async function main() {
       console.log('  listen     Open the WS to the IdP, publish an MLS KeyPackage,');
       console.log('             and receive operator messages into the local inbox.');
       console.log('             --no-publish-keypackage to skip the publish step.');
+      console.log('  run        Run a CLI with a vault credential injected as env vars,');
+      console.log('             without ever exposing the secret to the agent:');
+      console.log('             lastid-agent run --item <id> -- <command> [args]');
       console.log('');
       console.log('provision flags:');
       console.log(

@@ -26,8 +26,9 @@ import { homedir } from 'node:os';
 import { evalShareForUse, OUTCOME } from './vault-policy.js';
 import { defaultRateTracker } from './vault-rate.js';
 import { exchangeClientCredentials } from './oauth-exchange.js';
-import { applyInjection, injectionSummary } from './vault-inject.js';
+import { applyInjection, injectionSummary, buildEnvInjection } from './vault-inject.js';
 import { usageContext, summarizeConstraints } from './vault-cache.js';
+import { buildChildEnv, runChildStreaming, commandBinary } from './vault-exec.js';
 
 const BODY_CAP = 256 * 1024; // 256 KiB, matches the desktop http_fetch cap
 
@@ -269,6 +270,148 @@ export async function handleVaultRequest(req, deps) {
   return { error: 'unknown_op', detail: `unknown op '${op}'` };
 }
 
+/**
+ * Handle a STREAMING `exec` op (the CLI credential proxy): inject a vault secret
+ * as env vars into a child process, stream its scrubbed stdout/stderr back as
+ * frames via `sink`, and emit a terminal frame. Mirrors http_fetch's lifecycle
+ * (resolve → inject → run → finally{ zeroize, revoke, metrics, audit }) but the
+ * "work" is spawning a child and the injection is an env map. The secret lives
+ * only in the listener + the child's env, never in the agent.
+ *
+ *   {op:'exec', vault_handle, argv:string[], cwd?}
+ *     → frames: {stream:'stdout'|'stderr', b64}  (0+, as output arrives)
+ *     → terminal: {ok, exit_code, signal, timed_out, truncated, permissioned_ms, credentialed_ms}
+ *               | {error:'handle_invalid'|'binary_not_permitted'|'inject_failed'|...}
+ *
+ * @param {object} req
+ * @param {object} deps  same as handleVaultRequest + spawnImpl
+ * @param {(frame:object)=>void} sink  emits a frame to the client
+ */
+export async function handleVaultExec(req, deps, sink) {
+  const { agentDid, resolveShare, resolveSecret, handles, recordUse, audit, now, spawnImpl } = deps;
+  const clock = typeof now === 'function' ? now : () => Date.now();
+  const emit = (f) => { try { sink(f); } catch { /* client gone */ } };
+
+  const token = typeof req.vault_handle === 'string' ? req.vault_handle : '';
+  const h = handles.lookup(token, { agentDid });
+  if (!h) { emit({ error: 'handle_invalid', detail: 'handle missing, expired, or not yours' }); return; }
+
+  // argv must be a clean non-empty string[]; anything else is a malformed request.
+  const argv = Array.isArray(req.argv) ? req.argv : null;
+  if (!argv || argv.length === 0 || !argv.every((a) => typeof a === 'string')) {
+    handles.revoke(token);
+    emit({ error: 'bad_request', detail: 'argv must be a non-empty string[]' });
+    return;
+  }
+  const bin = commandBinary(argv);
+
+  const content = await resolveShare(h.itemId);
+  if (!content) {
+    handles.revoke(token);
+    emit({ error: 'share_not_found', detail: 'share gone since the handle was minted' });
+    return;
+  }
+
+  // Binary binding + injectability checked BEFORE any secret resolution: a
+  // mismatch (e.g. trying to wrap `printenv`/`env`/`sh`) never decrypts the
+  // secret, and still consumes the single-use handle. Audited so the operator
+  // sees the denied attempt in the same credentialed-access surface.
+  if (content.injection?.type !== 'env') {
+    handles.revoke(token);
+    audit?.('AgentCredentialInjected', { item_id: h.itemId, host: null, binary: bin, injection: content.injection?.type ?? null, status: null, outcome: 'inject_failed', credentialed_ms: 0 });
+    emit({ error: 'inject_failed', detail: 'not an env-injectable credential' });
+    return;
+  }
+  const binaries = Array.isArray(content.binaries) ? content.binaries : [];
+  if (!binaries.includes(bin)) {
+    handles.revoke(token);
+    audit?.('AgentCredentialInjected', { item_id: h.itemId, host: null, binary: bin, injection: 'env', status: null, outcome: 'binary_not_permitted', credentialed_ms: 0 });
+    emit({ error: 'binary_not_permitted', detail: bin });
+    return;
+  }
+
+  let secretObj = null;
+  let injectedEnv = null;
+  let terminal = null;
+  try {
+    try {
+      secretObj = await resolveSecret(h.itemId, h);
+    } catch (e) {
+      terminal = { error: 'secret_unavailable', detail: e?.message ?? String(e) };
+      return;
+    }
+    if (!secretObj || typeof secretObj.secret !== 'string') {
+      terminal = { error: 'secret_unavailable', detail: 'no credential released for this handle' };
+      return;
+    }
+    try {
+      injectedEnv = buildEnvInjection({
+        injection: content.injection,
+        secret: secretObj.secret,
+        secret_secondary: secretObj.secret_secondary,
+      }).env;
+    } catch (e) {
+      terminal = { error: 'inject_failed', detail: e?.message ?? String(e) };
+      return;
+    }
+
+    const childEnv = buildChildEnv(process.env, injectedEnv, { allowlist: content.env_allowlist });
+    // Scrub BOTH secret values from the child's output, longest-first.
+    const secrets = [secretObj.secret_secondary, secretObj.secret].filter(
+      (s) => typeof s === 'string' && s.length > 0,
+    );
+    const result = await runChildStreaming({
+      argv,
+      cwd: typeof req.cwd === 'string' ? req.cwd : undefined,
+      env: childEnv,
+      secrets,
+      ...(typeof content.exec_timeout_ms === 'number' ? { timeoutMs: content.exec_timeout_ms } : {}),
+      spawnImpl,
+      onStdout: (b) => emit({ stream: 'stdout', b64: b.toString('base64') }),
+      onStderr: (b) => emit({ stream: 'stderr', b64: b.toString('base64') }),
+    });
+    terminal = result.spawn_error
+      ? { error: 'spawn_failed', detail: result.spawn_error, binary: bin }
+      : { ok: true, exit_code: result.exit_code, signal: result.signal, timed_out: result.timed_out, truncated: result.truncated };
+    return;
+  } finally {
+    // Identical lifecycle to http_fetch: zeroize the secret, consume the handle,
+    // record the two timings (permissioned_ms = handle lifetime; credentialed_ms
+    // = decrypt → child-exit/scrub = the true credential-hold window), and audit
+    // the credentialed use in the SAME 'AgentCredentialInjected' surface as the
+    // network path — so all credentialed access is captured, CLI included.
+    const consumeMs = clock();
+    try { secretObj?.zeroize?.(); } catch { /* best-effort */ }
+    injectedEnv = null;
+    handles.revoke(token);
+    const metrics = {
+      permissioned_ms: Math.max(0, consumeMs - (h.mintedAtMs ?? consumeMs)),
+      credentialed_ms: secretObj?.decryptedAtMs ? Math.max(0, consumeMs - secretObj.decryptedAtMs) : 0,
+    };
+    if (terminal && typeof terminal === 'object') {
+      terminal.permissioned_ms = metrics.permissioned_ms;
+      terminal.credentialed_ms = metrics.credentialed_ms;
+    }
+    recordUse?.('consume', h, {
+      ...metrics,
+      status: terminal?.exit_code ?? null,
+      outcome: terminal?.ok ? 'ok' : (terminal?.error ?? 'error'),
+    });
+    try {
+      audit?.('AgentCredentialInjected', {
+        item_id: h.itemId,
+        host: null,
+        binary: bin,
+        injection: 'env',
+        status: terminal?.exit_code ?? null,
+        outcome: terminal?.ok ? 'ok' : (terminal?.error ?? 'error'),
+        credentialed_ms: metrics.credentialed_ms,
+      });
+    } catch { /* audit is best-effort */ }
+    emit(terminal ?? { error: 'exec_failed', detail: 'no result' });
+  }
+}
+
 function headersToObject(h) {
   const out = {};
   try {
@@ -313,6 +456,19 @@ export async function startVaultServer({ scope = 'main', deps }) {
           req = JSON.parse(line);
         } catch {
           conn.write(`${JSON.stringify({ error: 'bad_json' })}\n`);
+          continue;
+        }
+        // `exec` streams MULTIPLE frames (output chunks + a terminal); route it
+        // to the streaming handler which writes frames directly. All other ops
+        // are single request → single reply.
+        if (req && req.op === 'exec') {
+          void handleVaultExec(req, deps, (frame) => {
+            if (!conn.destroyed) conn.write(`${JSON.stringify(frame)}\n`);
+          }).catch((err) => {
+            if (!conn.destroyed) {
+              conn.write(`${JSON.stringify({ error: 'server_error', detail: err?.message ?? String(err) })}\n`);
+            }
+          });
           continue;
         }
         void handleVaultRequest(req, deps)
@@ -366,5 +522,63 @@ export function vaultRequest(scope, req, { timeoutMs = 30_000 } = {}) {
       }
     });
     conn.write(`${JSON.stringify(req)}\n`);
+  });
+}
+
+/** Streaming client for the `exec` op (used by `lastid-agent run`): send the
+ *  request, then read frames until the terminal one — calling onStdout/onStderr
+ *  with the (already-scrubbed) raw output bytes as they arrive. Resolves with
+ *  the terminal frame ({ok, exit_code, ...} or {error}). The secret never
+ *  enters this process: the listener only ever sends scrubbed output. */
+export function vaultExecStream(scope, req, { onStdout, onStderr, timeoutMs = 600_000 } = {}) {
+  const sockPath = vaultSocketPath(scope);
+  return new Promise((resolve, reject) => {
+    const conn = createConnection(sockPath);
+    let buf = '';
+    let done = false;
+    const timer = setTimeout(() => {
+      conn.destroy();
+      reject(new Error('vault exec IPC timeout'));
+    }, timeoutMs);
+    conn.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    conn.on('data', (chunk) => {
+      buf += chunk.toString('utf-8');
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        let frame;
+        try {
+          frame = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (frame.stream === 'stdout' && typeof frame.b64 === 'string') {
+          onStdout?.(Buffer.from(frame.b64, 'base64'));
+          continue;
+        }
+        if (frame.stream === 'stderr' && typeof frame.b64 === 'string') {
+          onStderr?.(Buffer.from(frame.b64, 'base64'));
+          continue;
+        }
+        // Anything else is the terminal frame.
+        done = true;
+        clearTimeout(timer);
+        resolve(frame);
+        conn.end();
+        return;
+      }
+    });
+    conn.on('close', () => {
+      if (!done) {
+        clearTimeout(timer);
+        reject(new Error('vault exec connection closed before terminal frame'));
+      }
+    });
+    conn.write(`${JSON.stringify({ ...req, op: 'exec' })}\n`);
   });
 }

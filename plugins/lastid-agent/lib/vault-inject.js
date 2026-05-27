@@ -76,6 +76,43 @@ export function applyInjection({ injection, secret, url, headers = {}, item = {}
 }
 
 /**
+ * Build the ENV-VAR injection for a CLI run (vault injection kind 'env'). Returns
+ * { env: { NAME: value } } — a process-env map, NOT the { url, headers } shape
+ * applyInjection returns, because this attaches at a different boundary: a child
+ * process, not an outbound request. Reads `injection.env_map`, an array of
+ * { name, field: 'secret' | 'secret_secondary', format? }. PURE: the listener
+ * has already unfurled secret/secret_secondary; this only maps fields → var
+ * names. Throws on an unusable spec so a misconfigured share fails loud, not
+ * silently un-credentialed. (Array, not a map object, so it round-trips through
+ * the operator-signed canonical ACL byte-for-byte — key order isn't stable.)
+ *
+ * @param {object} a
+ * @param {object} a.injection         { type:'env', env_map: [{name, field, format?}] }
+ * @param {string} a.secret            primary unfurled credential
+ * @param {string} [a.secret_secondary] companion (e.g. AWS secret access key)
+ * @returns {{ env: Record<string,string> }}
+ */
+export function buildEnvInjection({ injection, secret, secret_secondary }) {
+  if (!injection || injection.type !== "env") {
+    throw new Error("not an env injection");
+  }
+  const map = Array.isArray(injection.env_map) ? injection.env_map : [];
+  if (map.length === 0) throw new Error("env injection has no env_map");
+  const env = {};
+  for (const entry of map) {
+    const name = typeof entry?.name === "string" ? entry.name.trim() : "";
+    if (!name) throw new Error("env injection entry needs a name");
+    const field = entry.field === "secret_secondary" ? "secret_secondary" : "secret";
+    const value = field === "secret_secondary" ? secret_secondary : secret;
+    if (typeof value !== "string" || value.length === 0) {
+      throw new Error(`env injection field '${field}' is empty on the item`);
+    }
+    env[name] = fillTemplate(entry.format, value);
+  }
+  return { env };
+}
+
+/**
  * The injection SUMMARY returned to the agent (no secret) — so the model knows
  * HOW the credential will attach (to avoid setting a conflicting header) but
  * never sees the value. Mirrors the desktop's `summariseInjection`.
@@ -86,5 +123,10 @@ export function injectionSummary(injection) {
   if (injection.name) s.name = injection.name;
   if (injection.format) s.format = injection.format;
   if (injection.username_field) s.username_field = injection.username_field;
+  // For env (the CLI proxy): tell the agent WHICH env vars get set, names only —
+  // never the field mapping or the values.
+  if (injection.type === "env" && Array.isArray(injection.env_map)) {
+    s.env_vars = injection.env_map.map((e) => e?.name).filter(Boolean);
+  }
   return s;
 }

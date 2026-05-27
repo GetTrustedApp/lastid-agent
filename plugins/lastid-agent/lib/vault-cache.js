@@ -302,6 +302,18 @@ export function usageContext(meta) {
   else if (inj === 'header') parts.push(`attached as the ${meta.injection?.name ?? 'Authorization'} header`);
   else if (inj === 'query_param') parts.push(`attached as the ${meta.injection?.name ?? 'api_key'} query param`);
   else if (inj === 'basic_auth') parts.push('attached as HTTP basic auth');
+  else if (inj === 'env') {
+    const vars = Array.isArray(meta.injection?.env_map)
+      ? meta.injection.env_map.map((e) => e?.name).filter(Boolean)
+      : [];
+    const bins = Array.isArray(meta.binaries) ? meta.binaries : [];
+    // Tell the agent this credential is for a CLI, not http_fetch: run it via
+    // `lastid-agent run` so the secret is injected as env into the child.
+    parts.push(
+      `injected as env (${vars.join(', ') || 'see env_map'}) for CLI use — run it with ` +
+        `\`lastid-agent run --item ${meta.item_id ?? '<id>'} -- ${bins[0] ?? '<command>'} …\``,
+    );
+  }
   if (meta.docs_url) parts.push(`docs: ${meta.docs_url}`);
   return parts.join(' · ') || undefined;
 }

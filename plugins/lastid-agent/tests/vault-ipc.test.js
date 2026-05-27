@@ -12,7 +12,8 @@ import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';
 
-import { handleVaultRequest, startVaultServer, vaultRequest, vaultSocketPath } from '../lib/vault-ipc.js';
+import { EventEmitter } from 'node:events';
+import { handleVaultRequest, handleVaultExec, startVaultServer, vaultRequest, vaultExecStream, vaultSocketPath } from '../lib/vault-ipc.js';
 import { VaultHandleStore } from '../lib/vault-handle-store.js';
 import { VaultRateTracker } from '../lib/vault-rate.js';
 
@@ -282,6 +283,171 @@ test('round-trips over the real unix socket', async () => {
     assert.equal(fetched.status, 200);
   } finally {
     server.close();
+    try { rmSync(vaultSocketPath(scope), { force: true }); } catch { /* ignore */ }
+    rmSync(dir, { recursive: true, force: true });
+  }
+})
+
+// ── exec op (CLI credential proxy) ────────────────────────────────────────────
+
+const ENV_SHARE = {
+  item_id: 'vault_env',
+  title: 'GH token',
+  injection: { type: 'env', env_map: [{ name: 'GH_TOKEN', field: 'secret' }] },
+  binaries: ['gh'],
+  constraints: [],
+  on_violation: { type: 'deny' },
+  granted_actions: ['use'],
+};
+const ENV_SECRET = 'ghp_TOPSECRET_TOKEN_value';
+
+// A spawn fake: emits `stdout` then closes; captures the env it was handed.
+function fakeSpawn({ stdout = '', exitCode = 0, onEnv, onSpawn } = {}) {
+  return (_cmd, _args, opts) => {
+    onSpawn?.();
+    onEnv?.(opts?.env);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => {};
+    setImmediate(() => {
+      if (stdout) child.stdout.emit('data', Buffer.from(stdout));
+      child.emit('close', exitCode, null);
+    });
+    return child;
+  };
+}
+
+function execDeps(over = {}) {
+  return {
+    agentDid: AGENT,
+    handles: new VaultHandleStore(),
+    resolveShare: async (id) => (id === 'vault_env' ? { ...ENV_SHARE } : null),
+    resolveSecret: async (id) => (id === 'vault_env' ? { secret: ENV_SECRET, decryptedAtMs: Date.now(), zeroize: () => {} } : null),
+    genHandleKeypair: async () => ({ public_sec1_b64: 'P', secret_sec1_b64: 'S' }),
+    now: () => Date.now(),
+    spawnImpl: fakeSpawn({}),
+    ...over,
+  };
+}
+
+function collectSink() {
+  const frames = [];
+  return { frames, sink: (f) => frames.push(f), terminal: () => frames[frames.length - 1] };
+}
+
+async function mintHandle(d, itemId = 'vault_env') {
+  const r = await handleVaultRequest({ op: 'vault_use', item_id: itemId }, d);
+  return r.vault_handle;
+}
+
+test('exec: injects env into the child, streams SCRUBBED output, audits credentialed use', async () => {
+  const audited = [];
+  let zeroized = false;
+  let seenEnv = null;
+  const d = execDeps({
+    spawnImpl: fakeSpawn({ stdout: `hello ${ENV_SECRET} bye`, onEnv: (e) => { seenEnv = e; } }),
+    resolveSecret: async (id) => (id === 'vault_env' ? { secret: ENV_SECRET, decryptedAtMs: Date.now(), zeroize: () => { zeroized = true; } } : null),
+    audit: (type, meta) => audited.push({ type, meta }),
+  });
+  const handle = await mintHandle(d);
+  const c = collectSink();
+  await handleVaultExec({ vault_handle: handle, argv: ['gh', 'api', 'user'] }, d, c.sink);
+
+  assert.equal(seenEnv.GH_TOKEN, ENV_SECRET, 'credential reached the child env');
+  const streamed = c.frames.filter((f) => f.stream).map((f) => Buffer.from(f.b64, 'base64').toString('utf8')).join('');
+  assert.equal(streamed.includes(ENV_SECRET), false, 'secret scrubbed from streamed output');
+  assert.ok(streamed.includes('[redacted]'));
+  const term = c.terminal();
+  assert.equal(term.ok, true);
+  assert.equal(term.exit_code, 0);
+  assert.equal(typeof term.credentialed_ms, 'number');
+  assert.equal(JSON.stringify(c.frames).includes(ENV_SECRET), false, 'secret never in any frame');
+  assert.ok(zeroized, 'secret zeroized');
+  const ev = audited.find((a) => a.type === 'AgentCredentialInjected');
+  assert.ok(ev, 'credentialed-access audit emitted');
+  assert.equal(ev.meta.binary, 'gh');
+  assert.equal(ev.meta.injection, 'env');
+  assert.equal(typeof ev.meta.credentialed_ms, 'number');
+  assert.equal(JSON.stringify(ev.meta).includes(ENV_SECRET), false, 'audit holds no secret');
+})
+
+test('exec: handle is single-use — replay refused, no second spawn', async () => {
+  let spawnCount = 0;
+  const d = execDeps({ spawnImpl: fakeSpawn({ stdout: 'ok', onSpawn: () => { spawnCount++; } }) });
+  const handle = await mintHandle(d);
+  await handleVaultExec({ vault_handle: handle, argv: ['gh', 'x'] }, d, collectSink().sink);
+  const c = collectSink();
+  await handleVaultExec({ vault_handle: handle, argv: ['gh', 'x'] }, d, c.sink);
+  assert.equal(c.terminal().error, 'handle_invalid');
+  assert.equal(spawnCount, 1, 'replay did not spawn');
+})
+
+test('exec: binary not in the share binding is denied BEFORE the secret is resolved', async () => {
+  let resolved = false;
+  let spawned = false;
+  const d = execDeps({
+    resolveSecret: async () => { resolved = true; return { secret: ENV_SECRET, decryptedAtMs: Date.now(), zeroize() {} }; },
+    spawnImpl: fakeSpawn({ onSpawn: () => { spawned = true; } }),
+  });
+  const handle = await mintHandle(d);
+  const c = collectSink();
+  await handleVaultExec({ vault_handle: handle, argv: ['printenv', 'GH_TOKEN'] }, d, c.sink);
+  assert.equal(c.terminal().error, 'binary_not_permitted');
+  assert.equal(resolved, false, 'secret never resolved on a binary mismatch');
+  assert.equal(spawned, false, 'child never spawned on a binary mismatch');
+})
+
+test('exec: a non-env (network) credential cannot be used as a CLI', async () => {
+  const d = execDeps({ resolveShare: async () => ({ ...ENV_SHARE, injection: { type: 'header', name: 'Authorization' } }) });
+  const handle = await mintHandle(d);
+  const c = collectSink();
+  await handleVaultExec({ vault_handle: handle, argv: ['gh', 'x'] }, d, c.sink);
+  assert.equal(c.terminal().error, 'inject_failed');
+})
+
+test('exec: rejects an empty argv', async () => {
+  const d = execDeps();
+  const handle = await mintHandle(d);
+  const c = collectSink();
+  await handleVaultExec({ vault_handle: handle, argv: [] }, d, c.sink);
+  assert.equal(c.terminal().error, 'bad_request');
+})
+
+test('exec: real unix-socket round-trip streams scrubbed output from a real child', async () => {
+  const scope = `test-${randomUUID()}`;
+  const dir = join(homedir(), '.lastid-agent', scope);
+  const TOKEN = 'ghp_REALSOCKET_SECRET_xyz';
+  const { spawn } = await import('node:child_process');
+  let server;
+  try {
+    ({ server } = await startVaultServer({
+      scope,
+      deps: {
+        agentDid: AGENT,
+        handles: new VaultHandleStore(),
+        resolveShare: async (id) => (id === 'vault_env'
+          ? { item_id: 'vault_env', injection: { type: 'env', env_map: [{ name: 'GH_TOKEN', field: 'secret' }] }, binaries: ['node'], constraints: [], on_violation: { type: 'deny' }, granted_actions: ['use'] }
+          : null),
+        resolveSecret: async () => ({ secret: TOKEN, decryptedAtMs: Date.now(), zeroize() {} }),
+        genHandleKeypair: async () => ({ public_sec1_b64: 'P', secret_sec1_b64: 'S' }),
+        now: () => Date.now(),
+        spawnImpl: spawn,
+      },
+    }));
+    const used = await vaultRequest(scope, { op: 'vault_use', item_id: 'vault_env' });
+    let out = '';
+    const term = await vaultExecStream(
+      scope,
+      { vault_handle: used.vault_handle, argv: ['node', '-e', 'process.stdout.write("tok="+process.env.GH_TOKEN)'] },
+      { onStdout: (b) => { out += b.toString('utf8'); }, onStderr: () => {} },
+    );
+    assert.equal(term.ok, true);
+    assert.equal(term.exit_code, 0);
+    assert.equal(out.includes(TOKEN), false, 'real child echoed the token but it returned scrubbed');
+    assert.ok(out.includes('[redacted]'));
+  } finally {
+    try { server?.close(); } catch { /* ignore */ }
     try { rmSync(vaultSocketPath(scope), { force: true }); } catch { /* ignore */ }
     rmSync(dir, { recursive: true, force: true });
   }
