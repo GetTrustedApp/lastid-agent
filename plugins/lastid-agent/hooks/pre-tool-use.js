@@ -39,6 +39,7 @@ import { resolveScope } from '../lib/scope.js';
 import { enqueueAuditEvent } from '../lib/audit-spool.js';
 import { isAuditEnabled, loadAuditPolicy } from '../lib/audit-policy.js';
 import { redactSecrets } from '../lib/bug-report.js';
+import { selfProtectionAuditEvent } from '../lib/self-protection.js';
 
 // This session's agent scope (LASTID_AGENT_SCOPE → 'main'). The policy-check /
 // memory-search CLI children inherit the env and resolve it themselves; this
@@ -127,6 +128,22 @@ if (toolName) {
       /* metrics are best-effort — never block a tool call */
     }
     if (m.severity === 'deny') {
+      // Security event: when a SELF-PROTECTION rule blocks a call, record it in
+      // the audit chain UNGATED so the operator always sees the agent reached
+      // for LastID's own key material / guard source (distinct from the
+      // toggle-able rule_fires metric above).
+      try {
+        const ev = selfProtectionAuditEvent({ matched: m, tool: toolName, phase: 'input' });
+        if (ev) {
+          enqueueAuditEvent({
+            scope: activeScope,
+            ...ev,
+            toolUseId: event?.tool_use_id ?? event?.toolUseId ?? null,
+          });
+        }
+      } catch {
+        /* audit is best-effort — never block the deny */
+      }
       // Hard deny — refuse the tool call. The agent sees the reason
       // and the memory id; can surface to the operator.
       console.log(

@@ -19,6 +19,7 @@ import {
   selfProtectionRecords,
   selfProtectionDisabledByEnv,
   redactSelfProtected,
+  selfProtectionAuditEvent,
 } from '../lib/self-protection.js';
 
 function freshStore() {
@@ -276,4 +277,34 @@ test('redactSelfProtected: leaves unrelated output untouched (no false positives
   const r = redactSelfProtected(t);
   assert.equal(r.text, t);
   assert.equal(r.count, 0);
+});
+
+// When self-protection FIRES the operator must see it in the audit chain.
+// selfProtectionAuditEvent builds that event (ungated, a security signal).
+test('selfProtectionAuditEvent: a self-protection input DENY becomes an audit event', () => {
+  const ev = selfProtectionAuditEvent({
+    matched: { self_protection: true, severity: 'deny', memory_id: 'selfprot:lastid-self-source', pack: 'agent-self-protection' },
+    tool: 'Read',
+    phase: 'input',
+  });
+  assert.equal(ev.eventType, 'AgentSelfProtectionTriggered');
+  assert.equal(ev.metadata.phase, 'input');
+  assert.equal(ev.metadata.rule, 'selfprot:lastid-self-source');
+  assert.equal(ev.metadata.tool, 'Read');
+});
+
+test('selfProtectionAuditEvent: a NON-self-protection deny is not a self-protection event', () => {
+  const ev = selfProtectionAuditEvent({
+    matched: { self_protection: false, severity: 'deny', memory_id: 'rule_123' },
+    tool: 'Bash',
+    phase: 'input',
+  });
+  assert.equal(ev, null);
+});
+
+test('selfProtectionAuditEvent: key material flagged in OUTPUT becomes an audit event', () => {
+  const ev = selfProtectionAuditEvent({ tool: 'Bash', phase: 'output' });
+  assert.equal(ev.eventType, 'AgentSelfProtectionTriggered');
+  assert.equal(ev.metadata.phase, 'output');
+  assert.equal(ev.metadata.kind, 'key_material_in_output');
 });

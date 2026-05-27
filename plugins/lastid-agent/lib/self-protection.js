@@ -142,3 +142,37 @@ export function redactSelfProtected(text) {
   })
   return { text: out, count: keyMaterial + fileHits, keyMaterial }
 }
+
+// ─── Audit event for a self-protection FIRE ──────────────────────────────────
+// The operator must always SEE when self-protection tripped — the agent reached
+// for LastID's own key material or guard source. This builds the audit-chain
+// event for a fire (or null when it's not one); callers enqueue it UNGATED (a
+// security signal, distinct from the toggle-able rule_fires metric). 'input' = a
+// PreToolUse deny on a self-protection rule; 'output' = key material flagged in a
+// tool's result by redactSelfProtected.
+export const SELF_PROTECTION_EVENT = 'AgentSelfProtectionTriggered'
+
+export function selfProtectionAuditEvent({ matched, tool, phase, kind } = {}) {
+  if (phase === 'output') {
+    return {
+      eventType: SELF_PROTECTION_EVENT,
+      metadata: { phase: 'output', tool: tool ?? null, kind: kind ?? 'key_material_in_output' },
+    }
+  }
+  // 'input': only a self-protection DENY counts. The matcher tags these with
+  // self_protection:true and a 'selfprot:'-prefixed id; key off either.
+  const isSelfProt =
+    !!matched &&
+    (matched.self_protection === true || String(matched.memory_id || '').startsWith('selfprot:'))
+  if (!isSelfProt || matched.severity !== 'deny') return null
+  return {
+    eventType: SELF_PROTECTION_EVENT,
+    metadata: {
+      phase: 'input',
+      tool: tool ?? null,
+      rule: matched.memory_id ?? null,
+      severity: matched.severity,
+      pack: matched.pack ?? null,
+    },
+  }
+}

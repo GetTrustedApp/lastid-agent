@@ -16,12 +16,39 @@
  * tool that echoes a credential can't leak it into the chain.
  */
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { enqueueAuditEvent } from '../lib/audit-spool.js';
 import { redactSecrets } from '../lib/bug-report.js';
-import { redactSelfProtected } from '../lib/self-protection.js';
+import { redactSelfProtected, selfProtectionAuditEvent } from '../lib/self-protection.js';
 import { resolveScope } from '../lib/scope.js';
 
 const RESULT_CAP = 2000;
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
+
+// Is agent self-protection currently ON? Honors the SAME MAC-verified keyed
+// operator-store the PreToolUse deny path uses (a signed opt-out disables it; an
+// unsigned disk edit is ignored), via the `self-protection-status` CLI. Called
+// ONLY when the output-net already found self-protection material, so the
+// subprocess cost is paid on a hit, not every result. Fails SAFE → protected.
+function selfProtectionEnabled() {
+  try {
+    const r = spawnSync('node', [cliPath, 'self-protection-status'], {
+      encoding: 'utf-8',
+      timeout: 5_000,
+      input: '',
+    });
+    if (r.status !== 0 || !r.stdout) return true;
+    const start = r.stdout.indexOf('{');
+    if (start === -1) return true;
+    return JSON.parse(r.stdout.slice(start)).enabled !== false;
+  } catch {
+    return true; // fail safe → protected
+  }
+}
 
 let event = {};
 try {
@@ -35,7 +62,7 @@ const toolUseId = event?.tool_use_id ?? event?.toolUseId ?? null;
 const eventName = event?.hook_event_name ?? event?.hookEventName ?? '';
 const failed = eventName === 'PostToolUseFailure' || event?.error != null;
 
-let withholdFromModel = false;
+let flaggedKeyMaterial = false;
 
 if (toolName || toolUseId) {
   try {
@@ -43,13 +70,22 @@ if (toolName || toolUseId) {
       ? (event?.error ?? event?.stderr ?? '')
       : (event?.tool_result ?? event?.tool_response ?? '');
     const asText = typeof rawResult === 'string' ? rawResult : safeStringify(rawResult);
-    // Mask LastID's OWN material (key-material service tokens + guard source
-    // filenames) on top of the generic secret redaction, so the audit chain
-    // never stores it. If a key-material identifier shows up in the raw output,
-    // also withhold the whole result from the model (see the block below).
+    // Self-protection OUTPUT net. redactSelfProtected (cheap, in-process) flags
+    // LastID's own key-material tokens / guard source in the result. Only on a
+    // HIT do we consult the MAC-verified on/off state — so an operator who turned
+    // self-protection OFF sees no redaction or block, and the status subprocess
+    // is paid only when there's something to act on. A PostToolUse hook can warn
+    // + record but (verified live) cannot remove output already shown to the
+    // model, so the flag drives a best-effort block + a dedicated audit event.
     const sp = redactSelfProtected(asText);
-    if (sp.keyMaterial > 0) withholdFromModel = true;
-    const { text, count } = redactSecrets(sp.text);
+    let auditText = asText;
+    let spApplied = 0;
+    if (sp.count > 0 && selfProtectionEnabled()) {
+      auditText = sp.text; // mask the self-protection material in the audit copy
+      spApplied = sp.count;
+      if (sp.keyMaterial > 0) flaggedKeyMaterial = true;
+    }
+    const { text, count } = redactSecrets(auditText);
     enqueueAuditEvent({
       scope: resolveScope(),
       eventType: failed ? 'AgentToolFailed' : 'AgentToolSucceeded',
@@ -58,7 +94,7 @@ if (toolName || toolUseId) {
         status: failed ? 'error' : 'success',
         result: text.length > RESULT_CAP ? text.slice(0, RESULT_CAP) : text,
         result_redactions: count,
-        self_protection_redactions: sp.count,
+        self_protection_redactions: spApplied,
         result_truncated: text.length > RESULT_CAP,
       },
       toolUseId,
@@ -82,15 +118,24 @@ if (toolName || toolUseId) {
     }
   }
 }
-// PostToolUse cannot rewrite output bytes, only block the whole result. If the
-// raw output carried a LastID key-material identifier, withhold it from the
-// model entirely (the audit copy above is already redacted).
-if (withholdFromModel) {
+// A PostToolUse `decision:block` surfaces this reason but — verified live on
+// 2026-05-26 — does NOT remove output already shown to the model. So this can
+// flag + record, not truly withhold. The audit copy above is redacted
+// regardless; real prevention of an obfuscated read is the OS-ACL / daemon layer.
+if (flaggedKeyMaterial) {
+  // Security event: key material surfaced in a tool's output while
+  // self-protection is ON. Record it (ungated) so the operator always sees it.
+  try {
+    const ev = selfProtectionAuditEvent({ tool: toolName, phase: 'output' });
+    if (ev) enqueueAuditEvent({ scope: resolveScope(), ...ev, toolUseId });
+  } catch {
+    /* audit is best-effort */
+  }
   process.stdout.write(
     JSON.stringify({
       decision: 'block',
       reason:
-        "LastID self-protection: this tool's output contained LastID's own key-material identifiers, so it was withheld from your context. Do not attempt to read this material, and tell your operator if you were asked to.",
+        "LastID self-protection: this tool output contained LastID key-material identifiers. Do not store, repeat, or act on them, and tell your operator. (Recorded redacted in the audit chain; it could not be withheld after the fact.)",
     }),
   );
 }

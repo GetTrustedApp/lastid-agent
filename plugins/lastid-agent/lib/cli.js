@@ -957,6 +957,36 @@ async function cmdPolicyCheck(flags) {
 }
 
 /**
+ * `lastid-agent self-protection-status` — prints `{"enabled":bool}` for whether
+ * agent self-protection is currently ON, honoring the SAME MAC-verified keyed
+ * operator-store the PreToolUse deny path uses: a delegation-signed,
+ * integrity-verified opt-out disables it; an unsigned disk edit is ignored. The
+ * PostToolUse output-net calls this on a key-material hit so it goes quiet when
+ * the operator has turned self-protection off. Fails SAFE — not provisioned or
+ * any error → enabled (protect by default).
+ */
+async function cmdSelfProtectionStatus(flags) {
+  let enabled = true;
+  try {
+    const { loadAgentVc } = await import('./keychain.js');
+    const scope = resolveScope(flags);
+    const loaded = await loadAgentVc(scope);
+    if (loaded) {
+      const { OperatorStore, deriveOperatorStateMacKey } = await import('./operator-store.js');
+      enabled = new OperatorStore(scope, undefined, {
+        macKey: deriveOperatorStateMacKey(loaded.slotSeed),
+      }).selfProtectionEnabled();
+    }
+    // Not provisioned → keep the default-on protection.
+  } catch (e) {
+    process.stderr.write(`self-protection-status: ${e?.message ?? e}\n`);
+    enabled = true; // fail safe → protected
+  }
+  process.stdout.write(JSON.stringify({ enabled }));
+  process.exit(0);
+}
+
+/**
  * Pull the operator's rules/memories from the IdP agent-state store and
  * apply them to the local operator-store (saas-migration.md §6). Shared
  * by `cmdSync` (CLI / session-start kick) and the listener's doorbell +
@@ -1590,6 +1620,9 @@ async function main() {
       break;
     case 'policy-check':
       await cmdPolicyCheck(flags);
+      break;
+    case 'self-protection-status':
+      await cmdSelfProtectionStatus(flags);
       break;
     case 'help':
     case '--help':
