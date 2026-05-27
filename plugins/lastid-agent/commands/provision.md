@@ -13,6 +13,10 @@ The CLI will:
 
 Future Claude Code sessions on this host run authenticated — no re-provisioning.
 
+After provisioning succeeds, offer the operator semantic memory search — run
+`/lastid-agent:memory-setup` (a one-time, on-device embedding-model install).
+It's optional; memory works without it (keyword scoring) until they enable it.
+
 ## How to run this (agent: do this yourself — do NOT tell the operator to run it)
 
 The QR renders fine as text in your tool output, so run provisioning FOR the
