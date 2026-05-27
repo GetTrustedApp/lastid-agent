@@ -63,7 +63,25 @@ function canonicalJson(value) {
 function macPayload(state) {
   const p = { cursor: Number(state.cursor) || 0, records: state.records ?? {} };
   if (state.delegation_jwk) p.delegation_jwk = state.delegation_jwk;
+  // Per-kind sync cursors (see cursorFor). Covered by the MAC only when
+  // NON-EMPTY, so a legacy file that predates per-kind cursors still verifies
+  // (its payload carried no `cursors`), while any populated map is tamper-
+  // protected — a forged `cursors` to skip records changes the payload and
+  // fails the MAC.
+  if (state.cursors && Object.keys(state.cursors).length > 0) p.cursors = state.cursors;
   return p;
+}
+
+/** Coerce a parsed `cursors` blob to a clean { kind: number } map; drops
+ *  non-string keys and non-finite/negative values. Absent/malformed → {}. */
+function sanitizeCursors(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const n = Number(v);
+    if (typeof k === 'string' && k && Number.isFinite(n) && n >= 0) out[k] = n;
+  }
+  return out;
 }
 
 function computeStateMac(macKey, state) {
@@ -106,7 +124,12 @@ export class OperatorStore {
     // listener (writer) + the policy-check (rule enforcer) pass it; keyless
     // readers load best-effort. Must be set BEFORE #load().
     this.macKey = opts.macKey ?? null;
-    this.state = { version: 1, cursor: 0, records: {} };
+    // `cursor` is the global high-water (ever-synced marker + the policyDecision
+    // cold-start gate). `cursors` are PER-KIND incremental cursors that actually
+    // drive each kind's `?since=` — independent so a fast kind can't strand a
+    // slower kind's records (the vault-share stranding bug). Set by setCursorFor.
+    this.state = { version: 1, cursor: 0, cursors: {}, records: {} };
+    this._cursorsDirty = false;
     this.#load();
   }
 
@@ -124,6 +147,10 @@ export class OperatorStore {
     const next = {
       version: 1,
       cursor: Number(parsed.cursor) || 0,
+      // Per-kind cursors. Absent on a legacy file → {} → every kind re-pulls
+      // from 0 once (self-healing migration: any record stranded by the old
+      // single-cursor sync gets re-fetched), then per-kind tracking thereafter.
+      cursors: sanitizeCursors(parsed.cursors),
       records:
         parsed.records && typeof parsed.records === 'object' ? parsed.records : {},
       // Trust-on-first-use pin of the operator's delegation_authority key
@@ -161,6 +188,7 @@ export class OperatorStore {
     const tmp = `${this.path}.tmp`;
     writeFileSync(tmp, JSON.stringify(out), { mode: 0o600 });
     renameSync(tmp, this.path);
+    this._cursorsDirty = false;
   }
 
   get cursor() {
@@ -170,6 +198,38 @@ export class OperatorStore {
   setCursor(c) {
     const n = Number(c);
     if (Number.isFinite(n) && n > this.state.cursor) this.state.cursor = n;
+  }
+
+  /**
+   * Per-kind incremental cursor (e.g. 'rule' | 'memory' | 'vault' |
+   * 'audit_policy' | 'self_protection'). Each kind advances INDEPENDENTLY so a
+   * fast-moving kind (memories) can't push a shared high-water past a slower
+   * kind's pending record (a vault share) and strand it from `?since=` forever
+   * — the sync bug this replaces. 0 when never synced for that kind, including a
+   * legacy store with no per-kind map → re-pull that kind from 0 once.
+   */
+  cursorFor(kind) {
+    if (!this.state.cursors) return 0;
+    const n = Number(this.state.cursors[kind]);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  /**
+   * Advance ONE kind's cursor (monotonic — never moves backward). Mutates in
+   * memory and marks the store dirty; the next save() (applyRecords, or an
+   * explicit save) persists it. Returns true if it actually moved.
+   */
+  setCursorFor(kind, n) {
+    if (typeof kind !== 'string' || !kind) return false;
+    const v = Number(n);
+    if (!Number.isFinite(v)) return false;
+    if (!this.state.cursors) this.state.cursors = {};
+    if (v > (Number(this.state.cursors[kind]) || 0)) {
+      this.state.cursors[kind] = v;
+      this._cursorsDirty = true;
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -235,7 +295,10 @@ export class OperatorStore {
     for (const r of records) if (this.upsert(r)) changed += 1;
     const cursorMoved = cursor != null && Number(cursor) > this.state.cursor;
     if (cursor != null) this.setCursor(cursor);
-    if (changed > 0 || cursorMoved) this.save();
+    // Also persist when per-kind cursors advanced (setCursorFor) even if no
+    // record changed and the global high-water held — otherwise an
+    // independently-advanced vault cursor would be lost on the next load.
+    if (changed > 0 || cursorMoved || this._cursorsDirty) this.save();
     return changed;
   }
 

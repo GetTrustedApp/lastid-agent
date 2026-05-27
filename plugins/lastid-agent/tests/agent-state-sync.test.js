@@ -10,8 +10,9 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
+import { readFileSync, writeFileSync, rmSync } from 'node:fs';
 import crypto, { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -64,13 +65,25 @@ function activeRecord(kind, id, content, cursor, version = 1) {
 const rule = (id, content, cursor, v) => activeRecord('rule', id, content, cursor, v);
 const memory = (id, content, cursor, v) => activeRecord('memory', id, content, cursor, v);
 const revoked = (kind, id, cursor, version) => ({ id, kind, status: 'revoked', version, cursor });
+// A sealed vault share as the IdP serves it: enc_b64 is opaque to the sync
+// (applyVaultRecords stores it without decrypting; the listener unfurls only at
+// inject time), keyed by id in the local vault cache.
+const vaultShare = (id, cursor, version = 1) => ({
+  id,
+  kind: 'vault',
+  target: 'global',
+  status: 'active',
+  version,
+  cursor,
+  enc_b64: Buffer.from(`sealed-${id}`).toString('base64'),
+});
 
 function jsonResp(obj) {
   return { ok: true, status: 200, json: async () => obj, text: async () => '' };
 }
 
 /** Fake IdP: serves records with cursor > ?since per kind, plus the kind's high-water cursor. */
-function makeFakeIdp({ rules = [], memories = [], failStatus = null }) {
+function makeFakeIdp({ rules = [], memories = [], vault = [], failStatus = null, failVault = false }) {
   const seen = [];
   const fetchImpl = async (url, opts) => {
     seen.push({ url, headers: opts.headers });
@@ -78,8 +91,19 @@ function makeFakeIdp({ rules = [], memories = [], failStatus = null }) {
       return { ok: false, status: failStatus, json: async () => ({}), text: async () => 'server error' };
     }
     const u = new URL(url);
+    // Vault-ONLY transport failure (exercises the fail-soft path): rules /
+    // memories still succeed while vault 503s.
+    if (failVault && u.pathname.endsWith('/vault')) {
+      return { ok: false, status: 503, json: async () => ({}), text: async () => 'vault down' };
+    }
     const since = Number(u.searchParams.get('since')) || 0;
-    const all = u.pathname.endsWith('/rules') ? rules : u.pathname.endsWith('/memories') ? memories : [];
+    const all = u.pathname.endsWith('/rules')
+      ? rules
+      : u.pathname.endsWith('/memories')
+        ? memories
+        : u.pathname.endsWith('/vault')
+          ? vault
+          : [];
     const records = all.filter((r) => r.cursor > since);
     const cursor = all.reduce((m, r) => Math.max(m, r.cursor), since);
     return jsonResp({ records, cursor });
@@ -132,10 +156,13 @@ test('incremental sync sends ?since=<cursor> and applies only newer records', as
   assert.equal(res.applied, 1); // only the new one
   assert.equal(store.cursor, 6);
   assert.equal(store.listRules().length, 2);
-  // The second round of requests carried ?since=5.
-  for (const { url } of idp.seen) {
-    assert.equal(new URL(url).searchParams.get('since'), '5');
-  }
+  // The second round's RULES request carried ?since=5 — its OWN per-kind
+  // cursor. Other kinds carry their own cursor independently (0 here: they had
+  // no records, so they never advanced) — that independence is the fix.
+  const ruleReq = idp.seen.find(({ url }) => new URL(url).pathname.endsWith('/rules'));
+  assert.equal(new URL(ruleReq.url).searchParams.get('since'), '5');
+  const memReq = idp.seen.find(({ url }) => new URL(url).pathname.endsWith('/memories'));
+  assert.equal(new URL(memReq.url).searchParams.get('since'), '0');
 });
 
 test('a revoked record removes the rule from the store', async () => {
@@ -306,4 +333,100 @@ test('operator-store: pinDelegationJwk pins once and persists', () => {
   assert.deepEqual(s1.pinnedDelegationJwk, jwkOf(K1));
   const s2 = new OperatorStore('test', path);
   assert.deepEqual(s2.pinnedDelegationJwk, jwkOf(K1));
+});
+
+// ── per-kind cursors: the vault-share stranding fix ───────────────────────
+//
+// The sync used to drive EVERY kind's `?since=` off one global cursor, so a
+// fast kind (memories) advancing the high-water would skip a slower kind's
+// (vault) record whose cursor sat below it — a credential silently never
+// reached the agent. Each kind now tracks its own cursor.
+
+test('POSITIVE: per-kind cursors advance independently; each kind fetches from its own ?since', async () => {
+  const store = freshStore();
+  const idp = makeFakeIdp({
+    rules: [rule('r1', { tool: 'Bash', pattern: 'a', severity: 'warn' }, 3)],
+    memories: [memory('m1', { claim: 'x' }, 7)],
+  });
+  await syncAgentState({ ...auth, store, fetchImpl: idp.fetchImpl });
+  // Each kind tracked its OWN high-water; the global cursor is the max (only the
+  // ever-synced gate), never reused as a per-kind since.
+  assert.equal(store.cursorFor('rule'), 3);
+  assert.equal(store.cursorFor('memory'), 7);
+  assert.equal(store.cursor, 7);
+
+  // Next sync: rules re-request from 3, memories from 7 — INDEPENDENTLY.
+  idp.seen.length = 0;
+  await syncAgentState({ ...auth, store, fetchImpl: idp.fetchImpl });
+  const sinceFor = (seg) => {
+    const req = idp.seen.find(({ url }) => new URL(url).pathname.endsWith(`/${seg}`));
+    return new URL(req.url).searchParams.get('since');
+  };
+  assert.equal(sinceFor('rules'), '3');
+  assert.equal(sinceFor('memories'), '7');
+});
+
+test('NEGATIVE: a failed vault fetch does NOT advance the vault cursor while other kinds do', async () => {
+  const store = freshStore();
+  const scope = `vault-fail-${randomUUID()}`;
+  const vaultDir = join(homedir(), '.lastid-agent', scope);
+  const idp = makeFakeIdp({
+    memories: [memory('m1', { claim: 'x' }, 9)],
+    vault: [vaultShare('v1', 4)],
+    failVault: true, // vault 503s (fail-soft); rules/memories succeed
+  });
+  try {
+    await syncAgentState({ ...auth, store, scope, fetchImpl: idp.fetchImpl });
+    // Memory advanced to 9; vault stayed at 0 — NOT leapfrogged to the global
+    // high-water — so the share is RE-FETCHABLE next sync, not stranded.
+    assert.equal(store.cursorFor('memory'), 9);
+    assert.equal(store.cursorFor('vault'), 0);
+  } finally {
+    rmSync(vaultDir, { recursive: true, force: true });
+  }
+});
+
+test('REGRESSION: a vault share below the rules/memories high-water is still delivered (not stranded)', async () => {
+  const store = freshStore();
+  const scope = `vault-strand-${randomUUID()}`;
+  const vaultDir = join(homedir(), '.lastid-agent', scope);
+  const dataset = { memories: [memory('m1', { bedrock: true, claim: 'x' }, 10)], vault: [] };
+  const idp = makeFakeIdp(dataset);
+  try {
+    // Sync 1: memories push the GLOBAL high-water to 10; vault is empty (cursor 0).
+    await syncAgentState({ ...auth, store, scope, fetchImpl: idp.fetchImpl });
+    assert.equal(store.cursor, 10);
+    assert.equal(store.cursorFor('vault'), 0);
+
+    // A vault share lands at cursor 5 — BELOW the global high-water of 10. Under
+    // the OLD single-cursor sync the next pull used ?since=10 and skipped it
+    // forever (the bug). Per-kind, the vault fetch uses its OWN since=0.
+    dataset.vault.push(vaultShare('v1', 5));
+    idp.seen.length = 0;
+    await syncAgentState({ ...auth, store, scope, fetchImpl: idp.fetchImpl });
+
+    const vaultReq = idp.seen.find(({ url }) => new URL(url).pathname.endsWith('/vault'));
+    assert.equal(new URL(vaultReq.url).searchParams.get('since'), '0');
+    // Vault cursor advanced INDEPENDENTLY to the delivered share's cursor.
+    assert.equal(store.cursorFor('vault'), 5);
+    // And the share actually reached the local vault cache — true delivery.
+    const cached = JSON.parse(readFileSync(join(vaultDir, 'vault-shares.json'), 'utf8'));
+    assert.ok(cached['v1'], 'vault share v1 reached the local vault cache (not stranded)');
+  } finally {
+    rmSync(vaultDir, { recursive: true, force: true });
+  }
+});
+
+test('REGRESSION: a legacy single-cursor store re-pulls every kind from 0 (self-heal)', () => {
+  // A store written by the OLD code: a global `cursor`, NO per-kind `cursors`.
+  // It must report cursorFor(kind)=0 for every kind so the next sync re-pulls
+  // from scratch and recovers anything the single cursor had stranded — while
+  // still reading as "ever synced" (cursor>0) so the policy gate isn't reset.
+  const path = join(tmpdir(), `legacy-${randomUUID()}.json`);
+  writeFileSync(path, JSON.stringify({ version: 1, cursor: 233, records: {} }));
+  const store = new OperatorStore('test', path);
+  assert.equal(store.cursor, 233, 'legacy global cursor preserved (ever-synced)');
+  assert.equal(store.cursorFor('vault'), 0, 'per-kind vault cursor heals to 0');
+  assert.equal(store.cursorFor('memory'), 0);
+  assert.equal(store.cursorFor('rule'), 0);
 });

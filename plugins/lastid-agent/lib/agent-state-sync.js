@@ -143,29 +143,40 @@ export async function syncAgentState({
   if (typeof fetchImpl !== 'function') {
     throw new Error('syncAgentState: no fetch implementation available');
   }
-  const since = store.cursor;
+  // PER-KIND incremental cursors. Each kind fetches from ITS OWN high-water, so
+  // a fast-moving kind (memories) can never advance a SHARED cursor past a
+  // slower kind's pending record (a vault share) and strand it from future
+  // `?since=` pulls — the cross-kind stranding bug this replaces. A legacy store
+  // with no per-kind map returns 0 for every kind → one self-healing full
+  // re-pull that recovers anything the old single cursor had skipped.
+  const sinceRule = store.cursorFor('rule');
+  const sinceMemory = store.cursorFor('memory');
+  const sinceVault = store.cursorFor('vault');
+  const sinceAudit = store.cursorFor('audit_policy');
+  const sinceSelfProt = store.cursorFor('self_protection');
   const [rules, memories, vault, auditPolicy, selfProtection] = await Promise.all([
-    fetchKind({ idpUrl, path: RULES_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }),
-    fetchKind({ idpUrl, path: MEMORIES_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }),
-    // Vault shares ride the same per-operator cursor. We store them SEALED
-    // (no decrypt here) — the listener verifies + unfurls only at inject time.
-    // A failed vault fetch must not break rules/memories, so fail soft to empty.
-    fetchKind({ idpUrl, path: VAULT_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }).catch(
-      () => ({ records: [], cursor: since, operatorJwk: null }),
+    fetchKind({ idpUrl, path: RULES_PATH, since: sinceRule, agentDid, vcCompact, signingKey, fetchImpl }),
+    fetchKind({ idpUrl, path: MEMORIES_PATH, since: sinceMemory, agentDid, vcCompact, signingKey, fetchImpl }),
+    // Vault shares. We store them SEALED (no decrypt here) — the listener
+    // verifies + unfurls only at inject time. A failed vault fetch must not
+    // break rules/memories, so fail soft to empty AND return the unchanged
+    // vault cursor so it isn't advanced past records we never received.
+    fetchKind({ idpUrl, path: VAULT_PATH, since: sinceVault, agentDid, vcCompact, signingKey, fetchImpl }).catch(
+      () => ({ records: [], cursor: sinceVault, operatorJwk: null }),
     ),
     // Audit policy (kind 'audit_policy') — the operator's signed control over
     // which classes the agent audits. Sealed per-agent + ES256-signed like a
     // global rule; decoded + verified (fail-closed) + applied below, then
     // honored at the source by audit-policy.js. Fail soft to empty.
-    fetchKind({ idpUrl, path: AUDIT_POLICY_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }).catch(
-      () => ({ records: [], cursor: since, operatorJwk: null }),
+    fetchKind({ idpUrl, path: AUDIT_POLICY_PATH, since: sinceAudit, agentDid, vcCompact, signingKey, fetchImpl }).catch(
+      () => ({ records: [], cursor: sinceAudit, operatorJwk: null }),
     ),
     // Self-protection opt-out (kind 'self_protection') — the operator's signed
     // toggle to turn OFF the agent-key guard. Verified fail-closed here; only
     // HONORED in the integrity-verified store (operator-store macKey), so a
     // forged on-disk record can't disable the guard. Fail soft to empty.
-    fetchKind({ idpUrl, path: SELF_PROTECTION_PATH, since, agentDid, vcCompact, signingKey, fetchImpl }).catch(
-      () => ({ records: [], cursor: since, operatorJwk: null }),
+    fetchKind({ idpUrl, path: SELF_PROTECTION_PATH, since: sinceSelfProt, agentDid, vcCompact, signingKey, fetchImpl }).catch(
+      () => ({ records: [], cursor: sinceSelfProt, operatorJwk: null }),
     ),
   ]);
 
@@ -204,7 +215,18 @@ export async function syncAgentState({
     ((rec, contentBytes) => verifyRecordSignature(rec, contentBytes, opJwk, { agentDid }));
 
   const all = [...rules.records, ...memories.records, ...auditPolicy.records, ...selfProtection.records];
-  let maxCursor = Math.max(since, rules.cursor, memories.cursor, vault.cursor ?? since, auditPolicy.cursor ?? since, selfProtection.cursor ?? since);
+  // Global high-water = max across every kind. It is NOT used as anyone's
+  // `?since=` anymore (that's per-kind now); it only marks "have we ever synced"
+  // for the policy cold-start gate (OperatorStore.policyDecision) + the CLI
+  // status line.
+  let maxCursor = Math.max(
+    store.cursor,
+    rules.cursor ?? 0,
+    memories.cursor ?? 0,
+    vault.cursor ?? 0,
+    auditPolicy.cursor ?? 0,
+    selfProtection.cursor ?? 0,
+  );
   const decoded = [];
   let reconciled = 0;
   for (const rec of all) {
@@ -256,6 +278,17 @@ export async function syncAgentState({
 
     decoded.push(storeRecord);
   }
+  // Advance each kind's cursor INDEPENDENTLY to its own returned high-water.
+  // A fail-soft kind returned cursor=<its own since>, so a failed/empty fetch
+  // leaves that kind's cursor put (re-fetched next sync) and is never leapfrogged
+  // by a faster kind — the fix for the cross-kind stranding bug. applyRecords
+  // (below) persists these together with the global cursor in one save.
+  store.setCursorFor('rule', rules.cursor);
+  store.setCursorFor('memory', memories.cursor);
+  store.setCursorFor('vault', vault.cursor);
+  store.setCursorFor('audit_policy', auditPolicy.cursor);
+  store.setCursorFor('self_protection', selfProtection.cursor);
+
   const applied = store.applyRecords(decoded, maxCursor);
   return {
     applied,
