@@ -404,10 +404,40 @@ async function cmdProvision(flags) {
   console.log(`   idp_url:    ${idpUrl}`);
   console.log(`   vc length:  ${provisioned.vcCompact.length} chars`);
 
-  // Publish the agent's MLS KeyPackage so the operator's console
-  // can chat with it immediately. Non-fatal — if this fails the
-  // operator can still chat once the agent's runtime is up and
-  // retries the publish.
+  // Reissue reset — MUST run BEFORE publishing the KeyPackage. We just minted a
+  // NEW identity (the keychain now holds it). The running listener still has a
+  // WebSocket bound to the OLD agent DID, and the local store is full of records
+  // sealed to the old slot_seed / signed by the old key (a stale sync cursor +
+  // undecryptable MLS state). Stop the old listener and wipe that state FIRST.
+  //
+  // ORDER IS LOAD-BEARING: clearScopeState deletes mls-state.b64. If the publish
+  // ran first, the clear would throw away the private keys for the KeyPackages
+  // we just registered on the IdP, and every inbound welcome would fail
+  // `NoMatchingKeyPackage` (the operator's messages reach the agent but it can't
+  // open them). So: stop → clear → publish → start.
+  if (reissue && existing) {
+    const { stopListener, clearScopeState } = await import('./listener-daemon.js');
+    console.log('');
+    console.log('Reissue — resetting local state for the new identity…');
+    try {
+      const stopped = await stopListener({ scope });
+      console.log(`   listener:   ${stopped.status} (old WebSocket closed)`);
+      await clearScopeState(scope);
+      console.log('   state:      cleared (old rules, memories, MLS, inbox, cursor)');
+    } catch (err) {
+      console.error(
+        `   reset:      partial — ${err instanceof Error ? err.message : String(err)}`,
+      );
+      console.error(
+        `   If state looks stale, stop Claude Code and run: rm -rf ~/.lastid-agent/${scope}`,
+      );
+    }
+  }
+
+  // Publish the agent's MLS KeyPackage so the operator's console can chat with
+  // it immediately. Runs AFTER the reissue reset above so the persisted keystore
+  // (mls-state.b64, holding the KeyPackage private keys) survives. Non-fatal —
+  // if this fails the operator can still chat once the runtime is up and retries.
   try {
     await publishAgentKeyPackage({
       idpUrl,
@@ -428,53 +458,25 @@ async function cmdProvision(flags) {
     );
   }
 
-  // Reissue reset. We just minted a NEW identity (the keychain now holds it).
-  // The running listener still has a WebSocket bound to the OLD agent DID, and
-  // the local store is full of records sealed to the old slot_seed / signed by
-  // the old key (a stale sync cursor + undecryptable MLS state). Close the old
-  // connection, wipe that state, and bring the listener back up so it
-  // reconnects + syncs from scratch on the new identity.
-  if (reissue && existing) {
-    const { stopListener, clearScopeState, ensureListenerRunning } = await import(
-      './listener-daemon.js'
-    );
+  // Bring the listener up — it loads the keystore the publish just persisted and
+  // reconnects + syncs from scratch. Needed for BOTH a reissue (old listener was
+  // stopped above) and a fresh provision (the SessionStart hook skipped the
+  // listener because the scope wasn't provisioned at launch).
+  try {
+    const { ensureListenerRunning } = await import('./listener-daemon.js');
     const { fileURLToPath } = await import('node:url');
-    console.log('');
-    console.log('Reissue — resetting local state for the new identity…');
-    try {
-      const stopped = await stopListener({ scope });
-      console.log(`   listener:   ${stopped.status} (old WebSocket closed)`);
-      await clearScopeState(scope);
-      console.log('   state:      cleared (old rules, memories, MLS, inbox, cursor)');
-      const cliPath = fileURLToPath(new URL('../bin/lastid-agent.js', import.meta.url));
-      const started = await ensureListenerRunning({ scope, cliPath });
-      console.log(`   listener:   ${started.status} — reconnecting on the new identity`);
-    } catch (err) {
-      console.error(
-        `   reset:      partial — ${err instanceof Error ? err.message : String(err)}`,
-      );
-      console.error(
-        `   If state looks stale, stop Claude Code and run: rm -rf ~/.lastid-agent/${scope}`,
-      );
-    }
-  } else {
-    // Fresh provision (no prior identity for this scope). SessionStart skipped
-    // the listener because the scope wasn't provisioned at launch — so without
-    // this, the WebSocket + MLS channel + rule/memory sync don't come up until
-    // the operator restarts Claude. Start the listener NOW so the channel is
-    // active immediately (no restart needed).
-    try {
-      const { ensureListenerRunning } = await import('./listener-daemon.js');
-      const { fileURLToPath } = await import('node:url');
-      const cliPath = fileURLToPath(new URL('../bin/lastid-agent.js', import.meta.url));
-      const started = await ensureListenerRunning({ scope, cliPath });
-      console.log(`   listener:   ${started.status} — channel + sync now active (no restart needed)`);
-    } catch (err) {
-      console.error(
-        `   listener:   start failed (${err instanceof Error ? err.message : String(err)}) — ` +
-          'restart Claude to activate the channel.',
-      );
-    }
+    const cliPath = fileURLToPath(new URL('../bin/lastid-agent.js', import.meta.url));
+    const started = await ensureListenerRunning({ scope, cliPath });
+    console.log(
+      reissue && existing
+        ? `   listener:   ${started.status} — reconnecting on the new identity`
+        : `   listener:   ${started.status} — channel + sync now active (no restart needed)`,
+    );
+  } catch (err) {
+    console.error(
+      `   listener:   start failed (${err instanceof Error ? err.message : String(err)}) — ` +
+        'restart Claude to activate the channel.',
+    );
   }
 
   // Semantic memory onboarding. The embedding model (~137MB) + dep install ONCE
