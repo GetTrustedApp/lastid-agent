@@ -149,10 +149,13 @@ export class PresenceEmitter {
     const now = new Date().toISOString();
     this.#send({
       type,
-      // correlation_id mirrors the read receipt's convention (the targeted
-      // message id). Reaction TARGETING is via payload.message_id; the IdP only
-      // uses correlation_id for ACK matching.
-      correlation_id: info.messageId,
+      // Fresh UUID per outbound frame. Reusing the targeted message_id (the
+      // earlier shape) collides with the operator's original group_chat.message
+      // correlation_id and the IdP's replay detector rejects the frame with
+      // REPLAY_ATTACK_DETECTED — silently dropping fanout, so no badge ever
+      // lands on the recipient. Targeting is via payload.message_id; the
+      // correlation_id is a per-EVENT request id, must be unique.
+      correlation_id: freshCorrelationId(),
       timestamp: now,
       payload: {
         group_id: groupId,
@@ -174,7 +177,12 @@ export class PresenceEmitter {
     if (!info || !info.messageId || !info.senderDid) return;
     this.#send({
       type: 'group_chat.read',
-      correlation_id: info.messageId,
+      // Fresh UUID per outbound frame — reusing the targeted message_id (the
+      // earlier shape) collided with the operator's original
+      // group_chat.message correlation_id and tripped the IdP's replay
+      // detector, so the receipt never landed. Targeting is via
+      // payload.message_id; correlation_id is a per-EVENT request id.
+      correlation_id: freshCorrelationId(),
       timestamp: new Date().toISOString(),
       payload: {
         group_id: groupId,
@@ -185,4 +193,14 @@ export class PresenceEmitter {
       },
     });
   }
+}
+
+/** Per-frame unique id for the IdP's replay-detection window. UUIDv4 from the
+ *  platform crypto where available; small random fallback for older runtimes
+ *  (still enough entropy for the dedupe window). */
+function freshCorrelationId() {
+  if (typeof globalThis.crypto?.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }

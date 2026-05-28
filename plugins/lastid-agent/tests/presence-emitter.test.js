@@ -44,6 +44,12 @@ test('operator message → read receipt + working:true (NOT typing)', () => {
   assert.equal(read.payload.message_id, 'm1');
   assert.equal(read.payload.sender_did, AGENT);
   assert.equal(read.payload.recipient_did, OPERATOR);
+  // REGRESSION GUARD: same as the reaction — the read receipt's correlation_id
+  // must be a FRESH per-frame id, NOT the targeted message_id. The older shape
+  // collided with the operator's original group_chat.message correlation_id and
+  // the IdP's replay detector rejected it, silently dropping every read tick.
+  assert.ok(typeof read.correlation_id === 'string' && read.correlation_id.length > 0);
+  assert.notEqual(read.correlation_id, 'm1');
 });
 
 test('sending → typing:true (working stays true); reply → typing:false (working STILL true)', () => {
@@ -143,7 +149,12 @@ test('reacts to the operator’s last message with the wire name + agent as reac
   assert.equal(frame.payload.message_id, 'm1');
   assert.equal(frame.payload.reactor_did, AGENT);
   assert.equal(frame.payload.reaction, 'thumbs_up');
-  assert.equal(frame.correlation_id, 'm1');
+  // REGRESSION GUARD: correlation_id must be a FRESH per-frame id, NOT the
+  // targeted message_id. Reusing the message_id collides with the operator's
+  // original group_chat.message correlation_id and the IdP's replay detector
+  // rejects the frame (REPLAY_ATTACK_DETECTED), silently dropping the badge.
+  assert.ok(typeof frame.correlation_id === 'string' && frame.correlation_id.length > 0);
+  assert.notEqual(frame.correlation_id, 'm1');
 });
 
 test('action:remove emits group_chat.reaction_removed', () => {
