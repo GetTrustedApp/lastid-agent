@@ -539,6 +539,98 @@ if (Symbol.dispose) BotMlsClient.prototype[Symbol.dispose] = BotMlsClient.protot
 exports.BotMlsClient = BotMlsClient;
 
 /**
+ * JS-side handle around the IndexedDB-backed wasm orchestrator. Cheap to
+ * clone (each field is Arc-shared) — but `wasm-bindgen` exposes it as an
+ * opaque handle; JS sees `MlsOrchestrator` and uses its methods.
+ */
+class MlsOrchestrator {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(MlsOrchestrator.prototype);
+        obj.__wbg_ptr = ptr;
+        MlsOrchestratorFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        MlsOrchestratorFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_mlsorchestrator_free(ptr, 0);
+    }
+    /**
+     * Decide whether a direct group's backing session should be reconciled
+     * or rotated. Returns a Promise resolving to
+     *   `{ outcome: "noop" | "archive_and_rotate" }`.
+     *
+     * B5 design: core returns the decision; the JS host performs the
+     * archive + restart when `outcome === "archive_and_rotate"` (native
+     * equivalent: `archive_direct_group_session` + `mls_start_direct_chat`).
+     * Those steps touch native MLS LRU + the host's session/thread tables
+     * that have no equivalent in this crate, so they stay caller-side.
+     * @param {string} group_id
+     * @param {string} peer_did
+     * @returns {Promise<any>}
+     */
+    maybeRotateDirectGroup(group_id, peer_did) {
+        const ptr0 = passStringToWasm0(group_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(peer_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_maybeRotateDirectGroup(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * Run one pass of
+     * [`lastid_mls_core::reconcile::reconcile_group_device_membership_once`]
+     * for `group_id`. Returns a Promise resolving to
+     *   `{ changed: bool }`.
+     *
+     * Note: the core fn iterates ALL members of the group (not a single
+     * member — that's the native + core contract); the per-member granularity
+     * the planner operates on lives inside the loop, not in the entry
+     * signature.
+     * @param {string} group_id
+     * @returns {Promise<any>}
+     */
+    reconcileMemberDevices(group_id) {
+        const ptr0 = passStringToWasm0(group_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_reconcileMemberDevices(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Create + finalize a direct chat with `peer_did`. Runs:
+     *   1. [`lastid_mls_core::commit_ops::create_and_register_direct_group_shell`]
+     *      — mint local group + register with IdP via the transport port,
+     *   2. [`lastid_mls_core::commit_ops::add_first_member_to_direct_group`]
+     *      — fetch peer key packages, prepare add, submit, confirm + persist.
+     *
+     * Returns a Promise resolving to a plain JS object:
+     *   `{ idp_group_id: string, local_group_id: string,
+     *      member_count: number, epoch: number,
+     *      peer_device_ids: string[] }`.
+     *
+     * On failure rejects with an Error carrying the
+     * `GetTrustedError::MLSError` message string (so the rotation classifier
+     * `is_direct_session_stale_error_message` matches across native + wasm).
+     * @param {string} peer_did
+     * @returns {Promise<any>}
+     */
+    startDirectChat(peer_did) {
+        const ptr0 = passStringToWasm0(peer_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_startDirectChat(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+}
+if (Symbol.dispose) MlsOrchestrator.prototype[Symbol.dispose] = MlsOrchestrator.prototype.free;
+exports.MlsOrchestrator = MlsOrchestrator;
+
+/**
  * Durable MLS client. Constructed via the async
  * [`createPersistentBotClient`] free function below; this opaque
  * handle wraps the client + its backing `IndexedDbRawKv` so each
@@ -848,6 +940,39 @@ function computeMemberReconcilePlan(input_json) {
 exports.computeMemberReconcilePlan = computeMemberReconcilePlan;
 
 /**
+ * Construct an orchestrator. Opens/rehydrates the IDB-backed RawKv backend
+ * for `bot_did` (the same scope key existing `createPersistentBotClient`
+ * uses, so the openmls state + this orchestrator's group-store keys share
+ * one IDB database scoped per-bot — never cross-contaminates), builds a
+ * PersistentBotMlsClient on it, then wires the three JS callback bundles
+ * into the W1 port impls.
+ *
+ * `my_did` is the identity the orchestration reports via
+ * [`lastid_mls_core::ports::MlsClientPort::my_did`] — usually the same as
+ * `bot_did` for a bot, or the operator DID for a console/agent use.
+ *
+ * The three callback args (`directory` / `transport` / `host`) are plain JS
+ * objects with Function-typed fields. See the W1 callback bundle docs for
+ * the exact JSON arg/return shape of each Function — JS just supplies
+ * thunks returning Promises.
+ * @param {string} bot_did
+ * @param {string} my_did
+ * @param {any} directory
+ * @param {any} transport
+ * @param {any} host
+ * @returns {Promise<MlsOrchestrator>}
+ */
+function createMlsOrchestrator(bot_did, my_did, directory, transport, host) {
+    const ptr0 = passStringToWasm0(bot_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(my_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.createMlsOrchestrator(ptr0, len0, ptr1, len1, directory, transport, host);
+    return ret;
+}
+exports.createMlsOrchestrator = createMlsOrchestrator;
+
+/**
  * Open or rehydrate a persistent MLS client for `bot_did`. If
  * IndexedDB has prior `mls_kv` rows for this scope they are
  * loaded into the in-mem cache; if not, the client starts
@@ -916,6 +1041,14 @@ function __wbg_get_imports() {
         __wbg___wbindgen_is_undefined_c0cca72b82b86f4d: function(arg0) {
             const ret = arg0 === undefined;
             return ret;
+        },
+        __wbg___wbindgen_string_get_914df97fcfa788f2: function(arg0, arg1) {
+            const obj = arg1;
+            const ret = typeof(obj) === 'string' ? obj : undefined;
+            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            var len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
         },
         __wbg___wbindgen_throw_81fc77679af83bc6: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
@@ -997,6 +1130,16 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
+        __wbg_instanceof_Error_e3390d6805733dad: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof Error;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
         __wbg_instanceof_IdbCursorWithValue_5ece76174155fcb4: function(arg0) {
             let result;
             try {
@@ -1057,6 +1200,16 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
+        __wbg_instanceof_Promise_95d523058012a13d: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof Promise;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
         __wbg_instanceof_Uint8Array_4b8da683deb25d72: function(arg0) {
             let result;
             try {
@@ -1077,6 +1230,14 @@ function __wbg_get_imports() {
         },
         __wbg_length_3804262ff442a7a3: function(arg0) {
             const ret = arg0.length;
+            return ret;
+        },
+        __wbg_message_7367f8c7d0fa1589: function(arg0) {
+            const ret = arg0.message;
+            return ret;
+        },
+        __wbg_mlsorchestrator_new: function(arg0) {
+            const ret = MlsOrchestrator.__wrap(arg0);
             return ret;
         },
         __wbg_msCrypto_bd5a034af96bcba6: function(arg0) {
@@ -1217,6 +1378,10 @@ function __wbg_get_imports() {
             const ret = arg0.result;
             return ret;
         }, arguments); },
+        __wbg_set_8ee2d34facb8466e: function() { return handleError(function (arg0, arg1, arg2) {
+            const ret = Reflect.set(arg0, arg1, arg2);
+            return ret;
+        }, arguments); },
         __wbg_set_key_path_6edd6ee0e8d75af3: function(arg0, arg1) {
             arg0.keyPath = arg1;
         },
@@ -1269,6 +1434,10 @@ function __wbg_get_imports() {
             const ret = arg0.target;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
+        __wbg_then_00eed3ac0b8e82cb: function(arg0, arg1, arg2) {
+            const ret = arg0.then(arg1, arg2);
+            return ret;
+        },
         __wbg_then_a0c8db0381c8994c: function(arg0, arg1) {
             const ret = arg0.then(arg1);
             return ret;
@@ -1286,26 +1455,31 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 745, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 890, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 566, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 713, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 552, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 698, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb211d42f6d42ba37);
             return ret;
         },
-        __wbindgen_cast_0000000000000004: function(arg0, arg1) {
+        __wbindgen_cast_0000000000000004: function(arg0) {
+            // Cast intrinsic for `F64 -> Externref`.
+            const ret = arg0;
+            return ret;
+        },
+        __wbindgen_cast_0000000000000005: function(arg0, arg1) {
             // Cast intrinsic for `Ref(Slice(U8)) -> NamedExternref("Uint8Array")`.
             const ret = getArrayU8FromWasm0(arg0, arg1);
             return ret;
         },
-        __wbindgen_cast_0000000000000005: function(arg0, arg1) {
+        __wbindgen_cast_0000000000000006: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
             return ret;
@@ -1353,6 +1527,9 @@ const __wbindgen_enum_IdbTransactionMode = ["readonly", "readwrite", "versioncha
 const BotMlsClientFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_botmlsclient_free(ptr >>> 0, 1));
+const MlsOrchestratorFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_mlsorchestrator_free(ptr >>> 0, 1));
 const PersistentBotMlsClientFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_persistentbotmlsclient_free(ptr >>> 0, 1));

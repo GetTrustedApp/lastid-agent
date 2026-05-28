@@ -163,9 +163,11 @@ test('gateInjectedHits: an all-weak set (top below the floor) injects nothing', 
 
 test('gateInjectedHits: a hit exactly at the floor is kept', () => {
   assert.equal(gateInjectedHits([{ score: INJECT_FLOOR }]).length, 1);
-  // sanity: the constants are the documented values
-  assert.equal(INJECT_FLOOR, 0.28);
-  assert.equal(INJECT_GAP, 0.12);
+  // sanity: the constants are the documented values (tuned 2026-05-27 from
+  // live observation — bumped floor 0.28→0.30 and tightened gap 0.12→0.10
+  // to cut the thin 0.29-0.34 tail that still survived the original gate).
+  assert.equal(INJECT_FLOOR, 0.3);
+  assert.equal(INJECT_GAP, 0.1);
 });
 
 // ── Compact topical/ambient rendering ────────────────────────────────────────

@@ -87,8 +87,14 @@ function tierLabel(m) {
  * Returns the kept hits (already sorted desc by the caller). Empty when the top
  * hit itself is below the floor.
  */
-export const INJECT_FLOOR = 0.28;
-export const INJECT_GAP = 0.12;
+// Tuned 2026-05-27 from live observation post-bump: with floor 0.28 + gap
+// 0.12, a thin tail of 0.29–0.34 weakly-relevant rows still survived (the
+// top hit was usually 0.40–0.50 and the tail sat just inside the 0.12 gap).
+// Bumping floor to 0.30 cuts the lowest noise without losing real matches —
+// genuinely on-topic memories tend to score 0.35+ on this quantized MiniLM.
+// Narrowing the gap to 0.10 makes the relative cut more discriminating.
+export const INJECT_FLOOR = 0.3;
+export const INJECT_GAP = 0.1;
 
 export function gateInjectedHits(hits, { floor = INJECT_FLOOR, gap = INJECT_GAP } = {}) {
   const scored = (hits ?? []).filter((h) => typeof h.score === 'number');

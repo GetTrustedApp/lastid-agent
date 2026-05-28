@@ -4,142 +4,118 @@
  * MLS-state writer), invoked from the outbox drain when a queued reply
  * has no group to ride.
  *
- * Flow (mirror of the operator-side lastid.co AgentChatDock.createAndRegisterGroup,
- * inverted — the agent is the creator, the operator the invitee):
+ * Phase C2: this module is now a thin wrapper around the shared wasm
+ * `MlsOrchestrator` (lib/mls-orchestrator.js). The hand-rolled per-device
+ * "addMember per fetched key package" loop was a JS copy of the Rust
+ * `commit_ops::create_and_register_direct_group_shell` +
+ * `add_first_member_to_direct_group` flow — the same code lastid.co +
+ * native now run via the orchestrator. We delegate to keep them bit-
+ * identical across platforms (multi-device parity).
  *
- *   1. Already have a group with this operator? Use it. (A welcome that
- *      landed earlier recorded one — never create a second.)
- *   2. Fetch the operator's published KeyPackage(s).
- *   3. createGroup → exportGroupInfo → POST /v1/groups (register).
- *   4. addMember(operator device) → deliver the welcome via
- *      POST /v1/groups/:id/members; the IdP fans it to the operator's
- *      devices and they join.
- *   5. recordGroup so the send path (and future sends) resolve it.
+ * The orchestrator handles steps 2-4 of the original flow (fetch KPs,
+ * createGroup → register, addMember per device → deliver welcome).
+ * Step 1 ("never fork") and step 5 (record the mapping so future sends
+ * resolve the group) stay here — they touch the agent's local groups
+ * map, which the wasm doesn't (and shouldn't) know about.
  *
- * Phase 3 invites the operator's PRIMARY device (first KeyPackage). Full
- * multi-device + ongoing device-consistency reconciliation is phase 4 —
- * the loop seam is marked below.
- *
- * Everything external is injected via `deps` so this is unit-testable
- * without the network or the wasm client.
+ * Public signature is unchanged: callers (agent-send.js) don't move.
  */
 
-import { randomBytes } from 'node:crypto';
 import { resolveActiveGroupForOperator, recordGroup } from './agent-groups.js';
-import { fetchPeerKeyPackages, createGroupOnIdp, addGroupMember } from './mls-groups-api.js';
-
-/** A fresh, caller-reserved group id: 16 random bytes, base64. */
-export function randomGroupIdB64() {
-  return randomBytes(16).toString('base64');
-}
+import { getOrchestrator } from './mls-orchestrator.js';
 
 const DEFAULT_DEPS = {
   resolveActiveGroupForOperator,
   recordGroup,
-  fetchPeerKeyPackages,
-  createGroupOnIdp,
-  addGroupMember,
-  randomGroupIdB64,
+  getOrchestrator,
 };
 
 /**
  * @param {object} a
  * @param {string} a.scope
- * @param {import('./mls-client.js').MlsClient} a.mls  Live listener-owned client.
+ * @param {import('./mls-client.js').MlsClient} [a.mls]  Live listener-owned client (unused post-C2; kept for backward-compat with callers).
  * @param {string} a.agentDid
  * @param {string} a.operatorDid    - the agent's parent human (its only peer).
  * @param {string} a.idpUrl
  * @param {string} a.vcCompact      - agent VC SD-JWT (bearer).
  * @param {import('node:crypto').KeyObject} a.signingKey - agent Ed25519 (DPoP).
  * @param {(line: string) => void} [a.log]
- * @param {Partial<typeof DEFAULT_DEPS>} [a.deps]  - injected for tests.
+ * @param {object} [a.ctx]          - listener context for orchestrator caching;
+ *                                    when omitted we synthesize a local one (so
+ *                                    callers that haven't been migrated still work).
+ * @param {Partial<typeof DEFAULT_DEPS>} [a.deps]
  * @returns {Promise<{ idpGroupId: string, groupIdB64: string, operatorDid: string }>}
  */
 export async function ensureConversation({
   scope,
-  mls,
+  mls: _mls,
   agentDid,
   operatorDid,
   idpUrl,
   vcCompact,
   signingKey,
   log,
+  ctx,
   deps,
 }) {
   const d = { ...DEFAULT_DEPS, ...(deps ?? {}) };
   const logLine = log ?? (() => {});
   if (!operatorDid) throw new Error('ensureConversation: operatorDid required');
 
-  // 1. Never fork — reuse an existing group with this operator.
+  // 1. Never fork — reuse an existing group with this operator. The
+  //    orchestrator has its own "do we already have a session for this
+  //    peer?" check, but it answers from openmls state; the agent also
+  //    tracks the IdP group UUID ↔ openmls id mapping in groups.json,
+  //    which is what the send path resolves against. Honor that mapping
+  //    first so a known-good conversation is never silently re-created.
   const existing = await d.resolveActiveGroupForOperator({ scope, operatorDid });
   if (existing) return existing;
 
-  // 2. The operator must have a KeyPackage on file to be invited.
-  const { keyPackages } = await d.fetchPeerKeyPackages({
-    idpUrl,
-    targetDid: operatorDid,
+  // 2. Delegate to the shared wasm orchestrator. It runs:
+  //      lastid_mls_core::commit_ops::create_and_register_direct_group_shell
+  //      lastid_mls_core::commit_ops::add_first_member_to_direct_group
+  //    via the callback bundles we wired up in mls-orchestrator.js (which
+  //    route back through fetchPeerKeyPackages / createGroupOnIdp /
+  //    addGroupMember — the SAME IdP calls the old hand-rolled loop made).
+  const orchestratorCtx = ctx ?? {
+    scope,
     agentDid,
+    operatorDid,
+    idpUrl,
     vcCompact,
     signingKey,
+    log,
+  };
+  const orchestrator = await d.getOrchestrator(orchestratorCtx);
+  const result = await orchestrator.startDirectChat(operatorDid);
+
+  // The orchestrator's JS-facing return shape (see lastid_mls_wasm.d.ts):
+  //   { idp_group_id, local_group_id, member_count, epoch, peer_device_ids }
+  const idpGroupId = result?.idp_group_id;
+  const groupIdB64 = result?.local_group_id;
+  const peerDeviceIds = Array.isArray(result?.peer_device_ids) ? result.peer_device_ids : [];
+  if (!idpGroupId || !groupIdB64) {
+    throw new Error('ensureConversation: orchestrator returned no group ids');
+  }
+
+  // 3. Persist the IdP UUID ↔ openmls id mapping. This is what the send
+  //    path resolves against (resolveActiveGroupForOperator → groups.json).
+  //    The orchestrator doesn't write here — that file is a plugin
+  //    concern, not a wasm one. deviceLeaves stays empty: the orchestrator
+  //    bookkeeps the device → leaf map internally, and the local map was
+  //    only used by the old JS-side evict path that the orchestrator now
+  //    owns end-to-end.
+  await d.recordGroup({
+    scope,
+    idpGroupId,
+    groupIdB64,
+    operatorDid,
+    deviceIds: peerDeviceIds,
+    deviceLeaves: {},
   });
-  if (keyPackages.length === 0) {
-    throw new Error(
-      `operator ${operatorDid} has no MLS key packages published — can't establish a conversation yet`,
-    );
-  }
-
-  // 3. Author + register the group.
-  const groupIdB64 = d.randomGroupIdB64();
-  mls.createGroup(groupIdB64);
-  await mls.persist();
-  const mlsGroupInitB64 = mls.exportGroupInfo(groupIdB64);
-  const created = await d.createGroupOnIdp({
-    idpUrl,
-    name: 'Direct chat',
-    mlsGroupInitB64,
-    groupType: 'direct',
-    agentDid,
-    vcCompact,
-    signingKey,
-  });
-  if (!created || typeof created.id !== 'string') {
-    throw new Error('createGroupOnIdp returned no group id');
-  }
-
-  // 4. Invite EVERY operator device — one KeyPackage per device (the IdP
-  //    deduped/sorted them via per_device=true). Each addMember advances
-  //    the epoch and emits a commit + a welcome: the welcome goes to that
-  //    device, and the IdP fans the commit out to members already added.
-  //    Add them one at a time so a mid-loop failure leaves a smaller-but-
-  //    consistent group (the message still rides it) rather than nothing.
-  const deviceLeaves = {};
-  for (const kp of keyPackages) {
-    const add = mls.addMember(groupIdB64, kp.keyPackageB64);
-    await mls.persist();
-    // Capture device_id → leaf_index (from the wasm's assigned_leaf_indices)
-    // so a later reconcile can evict this device precisely.
-    const leaf = Array.isArray(add.assigned_leaf_indices) ? add.assigned_leaf_indices[0] : undefined;
-    if (kp.deviceId && typeof leaf === 'number') deviceLeaves[kp.deviceId] = leaf;
-    await d.addGroupMember({
-      idpUrl,
-      groupId: created.id,
-      inviteeDid: operatorDid,
-      mlsWelcomeB64: add.welcome_b64,
-      mlsCommitB64: add.commit_b64,
-      agentDid,
-      vcCompact,
-      signingKey,
-    });
-  }
-
-  // 5. Record so this + future sends resolve the group — including which
-  //    operator devices we invited (the reconcile baseline) and their leaf
-  //    indices (so reconcile can later evict a specific device).
-  const invitedDeviceIds = keyPackages.map((kp) => kp.deviceId).filter(Boolean)
-  await d.recordGroup({ scope, idpGroupId: created.id, groupIdB64, operatorDid, deviceIds: invitedDeviceIds, deviceLeaves });
   logLine(
-    `[lastid-agent] established a conversation with the operator → group ${created.id} ` +
-      `(invited ${keyPackages.length} device${keyPackages.length === 1 ? '' : 's'})`,
+    `[lastid-agent] established a conversation with the operator → group ${idpGroupId} ` +
+      `(${peerDeviceIds.length} device${peerDeviceIds.length === 1 ? '' : 's'})`,
   );
-  return { idpGroupId: created.id, groupIdB64, operatorDid };
+  return { idpGroupId, groupIdB64, operatorDid };
 }
