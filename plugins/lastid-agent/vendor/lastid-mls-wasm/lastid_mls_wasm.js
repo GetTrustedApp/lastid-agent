@@ -882,6 +882,49 @@ if (Symbol.dispose) PersistentBotMlsClient.prototype[Symbol.dispose] = Persisten
 exports.PersistentBotMlsClient = PersistentBotMlsClient;
 
 /**
+ * Seed the persisted IdP-UUID → openmls-group-id-b64 mapping that
+ * `WasmMlsClient::group_handle(idp_uuid)` reads when the orchestrator's
+ * reconcile / rotation paths look up a group by its IdP id.
+ *
+ * Background: `set_idp_group_id` writes this mapping when a group is
+ * FRESHLY CREATED in the orchestrator path (during
+ * `create_and_register_direct_group_shell`). For groups that existed
+ * BEFORE that fix landed — or any group whose initial create happened
+ * in a code revision that didn't write the mapping — there's no entry,
+ * so `group_handle(uuid)` falls back to treating the UUID itself as
+ * the openmls_b64 and `openmls_group_id()` panics on the UUID's first
+ * hyphen at position 8 ("base64: InvalidByte(8, 45)") the moment the
+ * caller tries to load the group.
+ *
+ * The console's `hydrateConversations` already knows both ids for
+ * every persisted conversation record — call this once per record at
+ * hydrate time to backfill the mapping idempotently. The cached
+ * `IndexedDbRawKv` is shared with every other consumer of the same
+ * bot_scope (see `IndexedDbRawKv::open`'s process cache), so this
+ * write is immediately visible to the orchestrator's client.
+ *
+ * Pure RawKv I/O — touches no `PersistentBotMlsClient` handle, so it
+ * can't collide with any in-flight handle method's wasm-bindgen borrow.
+ * Awaits a flush so the write is durable in IDB before the Promise
+ * resolves.
+ * @param {string} bot_did
+ * @param {string} idp_group_id
+ * @param {string} openmls_b64
+ * @returns {Promise<void>}
+ */
+function bindMlsGroupIdMapping(bot_did, idp_group_id, openmls_b64) {
+    const ptr0 = passStringToWasm0(bot_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(idp_group_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(openmls_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.bindMlsGroupIdMapping(ptr0, len0, ptr1, len1, ptr2, len2);
+    return ret;
+}
+exports.bindMlsGroupIdMapping = bindMlsGroupIdMapping;
+
+/**
  * Returns a JSON-serialized [`CiphersuiteSupportReport`]. Useful as a smoke
  * test from the credential-service test harness.
  * @returns {string}
@@ -1440,17 +1483,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 899, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 906, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 722, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 729, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 707, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 714, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb211d42f6d42ba37);
             return ret;
         },

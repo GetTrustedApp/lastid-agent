@@ -305,6 +305,35 @@ export class PersistentBotMlsClient {
 }
 
 /**
+ * Seed the persisted IdP-UUID → openmls-group-id-b64 mapping that
+ * `WasmMlsClient::group_handle(idp_uuid)` reads when the orchestrator's
+ * reconcile / rotation paths look up a group by its IdP id.
+ *
+ * Background: `set_idp_group_id` writes this mapping when a group is
+ * FRESHLY CREATED in the orchestrator path (during
+ * `create_and_register_direct_group_shell`). For groups that existed
+ * BEFORE that fix landed — or any group whose initial create happened
+ * in a code revision that didn't write the mapping — there's no entry,
+ * so `group_handle(uuid)` falls back to treating the UUID itself as
+ * the openmls_b64 and `openmls_group_id()` panics on the UUID's first
+ * hyphen at position 8 ("base64: InvalidByte(8, 45)") the moment the
+ * caller tries to load the group.
+ *
+ * The console's `hydrateConversations` already knows both ids for
+ * every persisted conversation record — call this once per record at
+ * hydrate time to backfill the mapping idempotently. The cached
+ * `IndexedDbRawKv` is shared with every other consumer of the same
+ * bot_scope (see `IndexedDbRawKv::open`'s process cache), so this
+ * write is immediately visible to the orchestrator's client.
+ *
+ * Pure RawKv I/O — touches no `PersistentBotMlsClient` handle, so it
+ * can't collide with any in-flight handle method's wasm-bindgen borrow.
+ * Awaits a flush so the write is durable in IDB before the Promise
+ * resolves.
+ */
+export function bindMlsGroupIdMapping(bot_did: string, idp_group_id: string, openmls_b64: string): Promise<void>;
+
+/**
  * Returns a JSON-serialized [`CiphersuiteSupportReport`]. Useful as a smoke
  * test from the credential-service test harness.
  */

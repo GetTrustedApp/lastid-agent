@@ -1,13 +1,9 @@
 /* tslint:disable */
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
-export const __wbg_mlsorchestrator_free: (a: number, b: number) => void;
-export const createMlsOrchestrator: (a: number, b: number, c: number, d: number, e: any, f: any, g: any) => any;
-export const mlsorchestrator_maybeRotateDirectGroup: (a: number, b: number, c: number, d: number, e: number) => any;
-export const mlsorchestrator_reconcileMemberDevices: (a: number, b: number, c: number) => any;
-export const mlsorchestrator_startDirectChat: (a: number, b: number, c: number) => any;
 export const __wbg_botmlsclient_free: (a: number, b: number) => void;
 export const __wbg_persistentbotmlsclient_free: (a: number, b: number) => void;
+export const bindMlsGroupIdMapping: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
 export const botmlsclient_addMember: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const botmlsclient_addMembers: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const botmlsclient_applyLoaded: (a: number, b: number, c: number) => [number, number];
@@ -52,6 +48,11 @@ export const persistentbotmlsclient_rollbackPendingCommit: (a: number, b: number
 export const persistentbotmlsclient_selfUpdate: (a: number, b: number, c: number) => any;
 export const targetCiphersuiteCodePoint: () => number;
 export const init: () => void;
+export const __wbg_mlsorchestrator_free: (a: number, b: number) => void;
+export const createMlsOrchestrator: (a: number, b: number, c: number, d: number, e: any, f: any, g: any) => any;
+export const mlsorchestrator_maybeRotateDirectGroup: (a: number, b: number, c: number, d: number, e: number) => any;
+export const mlsorchestrator_reconcileMemberDevices: (a: number, b: number, c: number) => any;
+export const mlsorchestrator_startDirectChat: (a: number, b: number, c: number) => any;
 export const wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152: (a: number, b: number, c: any) => [number, number];
 export const wasm_bindgen__convert__closures_____invoke__h40481bbae026f68a: (a: number, b: number, c: any, d: any) => void;
 export const wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe: (a: number, b: number, c: any) => void;
