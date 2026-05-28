@@ -152,6 +152,58 @@ export class BotMlsClient {
 }
 
 /**
+ * JS-side handle around the IndexedDB-backed wasm orchestrator. Cheap to
+ * clone (each field is Arc-shared) — but `wasm-bindgen` exposes it as an
+ * opaque handle; JS sees `MlsOrchestrator` and uses its methods.
+ */
+export class MlsOrchestrator {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Decide whether a direct group's backing session should be reconciled
+     * or rotated. Returns a Promise resolving to
+     *   `{ outcome: "noop" | "archive_and_rotate" }`.
+     *
+     * B5 design: core returns the decision; the JS host performs the
+     * archive + restart when `outcome === "archive_and_rotate"` (native
+     * equivalent: `archive_direct_group_session` + `mls_start_direct_chat`).
+     * Those steps touch native MLS LRU + the host's session/thread tables
+     * that have no equivalent in this crate, so they stay caller-side.
+     */
+    maybeRotateDirectGroup(group_id: string, peer_did: string): Promise<any>;
+    /**
+     * Run one pass of
+     * [`lastid_mls_core::reconcile::reconcile_group_device_membership_once`]
+     * for `group_id`. Returns a Promise resolving to
+     *   `{ changed: bool }`.
+     *
+     * Note: the core fn iterates ALL members of the group (not a single
+     * member — that's the native + core contract); the per-member granularity
+     * the planner operates on lives inside the loop, not in the entry
+     * signature.
+     */
+    reconcileMemberDevices(group_id: string): Promise<any>;
+    /**
+     * Create + finalize a direct chat with `peer_did`. Runs:
+     *   1. [`lastid_mls_core::commit_ops::create_and_register_direct_group_shell`]
+     *      — mint local group + register with IdP via the transport port,
+     *   2. [`lastid_mls_core::commit_ops::add_first_member_to_direct_group`]
+     *      — fetch peer key packages, prepare add, submit, confirm + persist.
+     *
+     * Returns a Promise resolving to a plain JS object:
+     *   `{ idp_group_id: string, local_group_id: string,
+     *      member_count: number, epoch: number,
+     *      peer_device_ids: string[] }`.
+     *
+     * On failure rejects with an Error carrying the
+     * `GetTrustedError::MLSError` message string (so the rotation classifier
+     * `is_direct_session_stale_error_message` matches across native + wasm).
+     */
+    startDirectChat(peer_did: string): Promise<any>;
+}
+
+/**
  * Durable MLS client. Constructed via the async
  * [`createPersistentBotClient`] free function below; this opaque
  * handle wraps the client + its backing `IndexedDbRawKv` so each
@@ -268,6 +320,25 @@ export function ciphersuiteSupportJson(): string;
  * and the openmls mechanics (`addMembers`); this just decides.
  */
 export function computeMemberReconcilePlan(input_json: string): string;
+
+/**
+ * Construct an orchestrator. Opens/rehydrates the IDB-backed RawKv backend
+ * for `bot_did` (the same scope key existing `createPersistentBotClient`
+ * uses, so the openmls state + this orchestrator's group-store keys share
+ * one IDB database scoped per-bot — never cross-contaminates), builds a
+ * PersistentBotMlsClient on it, then wires the three JS callback bundles
+ * into the W1 port impls.
+ *
+ * `my_did` is the identity the orchestration reports via
+ * [`lastid_mls_core::ports::MlsClientPort::my_did`] — usually the same as
+ * `bot_did` for a bot, or the operator DID for a console/agent use.
+ *
+ * The three callback args (`directory` / `transport` / `host`) are plain JS
+ * objects with Function-typed fields. See the W1 callback bundle docs for
+ * the exact JSON arg/return shape of each Function — JS just supplies
+ * thunks returning Promises.
+ */
+export function createMlsOrchestrator(bot_did: string, my_did: string, directory: any, transport: any, host: any): Promise<MlsOrchestrator>;
 
 /**
  * Open or rehydrate a persistent MLS client for `bot_did`. If
