@@ -29,6 +29,7 @@ import {
 } from './use-approval-loop.js';
 import { reapStaleServers } from './reap-stale-servers.js';
 import { MEMORY_TOOLS, MEMORY_TOOL_NAMES, handleMemoryTool } from './memory-tools.js';
+import { CORE_REACTION_EMOJIS, isSupportedReaction } from './reactions.js';
 
 const SERVER_INFO = {
   name: 'lastid-agent',
@@ -68,6 +69,24 @@ const PLUGIN_TOOLS = [
         },
       },
       required: ['text'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'lastid_react',
+    description:
+      "React to your operator's most recent message with an emoji — a real reaction badge on that message in their LastID chat (console + phone), exactly like tapping one in the app. This COUNTS as a reply: use it alone for a quick acknowledgement (👍 got it, 🙏 thanks), or alongside lastid_send_message when a word plus a reaction fits. You don't pick which message or handle any ids — it reacts to the last thing the operator sent you. Pick the emoji that matches your intent: 👍 acknowledge/agree/done · ❤️ love it/thanks · 😂 that was funny · 😮 surprised/unexpected · 😢 found a bug/something's broken · 🙏 thank you/please.",
+    requiredCapability: { resource: 'message:send', action: 'Send' },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        emoji: {
+          type: 'string',
+          enum: CORE_REACTION_EMOJIS,
+          description: 'The reaction to add: 👍 ❤️ 😂 😮 😢 🙏.',
+        },
+      },
+      required: ['emoji'],
       additionalProperties: false,
     },
   },
@@ -340,6 +359,42 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
       ],
     };
   }
+
+  if (name === 'lastid_react') {
+    const emoji = typeof _args?.emoji === 'string' ? _args.emoji : '';
+    // Validate against the shared reaction table (single source mirroring the
+    // SDK's ReactionType). The tool's enum already constrains it, but a defensive
+    // check keeps a bad value from riding to the listener as an undroppable line.
+    if (!isSupportedReaction(emoji)) {
+      throw new Error(
+        `lastid_react: unsupported emoji ${JSON.stringify(emoji)} — use one of 👍 ❤️ 😂 😮 😢 🙏`,
+      );
+    }
+    const operatorDid = claims.parent_human_did ?? null;
+    if (!operatorDid) {
+      throw new Error('agent VC has no parent_human_did — cannot resolve operator');
+    }
+    const { resolveActiveGroupForOperator } = await import('./agent-groups.js');
+    const { enqueueReaction } = await import('./agent-send.js');
+    const group = await resolveActiveGroupForOperator({ scope, operatorDid });
+    const id = await enqueueReaction({ scope, operatorDid, emoji });
+    const note = group
+      ? 'Reaction queued — your listener will add the badge to the operator’s last message within a couple seconds (console + phone).'
+      : "No conversation exists yet, so there's no message to react to — send a message first (lastid_send_message). The reaction is queued and will apply once a conversation exists and the operator has sent something.";
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            { queued: true, request_id: id, emoji, has_conversation: !!group, note },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
   if (name === 'lastid_whoami') {
     if (!loadedAgent) {
       return {

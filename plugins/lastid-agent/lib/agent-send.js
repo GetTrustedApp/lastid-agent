@@ -73,6 +73,7 @@ export async function enqueueSend({ scope, operatorDid, text }) {
   // automatically instead of being stuck on a dead one.
   const req = {
     id: newId(),
+    kind: 'message',
     operator_did: operatorDid,
     text,
     enqueued_at: new Date().toISOString(),
@@ -80,6 +81,36 @@ export async function enqueueSend({ scope, operatorDid, text }) {
   const path = outboxPath(scope);
   await mkdir(dirname(path), { recursive: true });
   // Append-only; the listener truncates after a successful drain.
+  await writeFile(path, `${JSON.stringify(req)}\n`, { flag: 'a' });
+  return req.id;
+}
+
+/**
+ * Append a REACTION request to the outbox. Like enqueueSend, safe from any
+ * process — it never touches MLS state (a reaction is a plaintext control
+ * frame, not an encrypted message). The listener drains it, resolves the
+ * operator's live group, and reacts to the operator's last message there (the
+ * agent never handles a message id — the listener already tracks it for the
+ * read-receipt path). `emoji` is validated at the tool boundary; we re-map it
+ * to the wire name at drain. Returns the request id.
+ */
+export async function enqueueReaction({ scope, operatorDid, emoji, action = 'add' }) {
+  if (!operatorDid || typeof operatorDid !== 'string') {
+    throw new Error('enqueueReaction: operatorDid required');
+  }
+  if (typeof emoji !== 'string' || emoji.length === 0) {
+    throw new Error('enqueueReaction: emoji required');
+  }
+  const req = {
+    id: newId(),
+    kind: 'reaction',
+    operator_did: operatorDid,
+    emoji,
+    reaction_action: action === 'remove' ? 'remove' : 'add',
+    enqueued_at: new Date().toISOString(),
+  };
+  const path = outboxPath(scope);
+  await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(req)}\n`, { flag: 'a' });
   return req.id;
 }
@@ -113,7 +144,7 @@ function textToB64(text) {
  * @param {string} [args.vcCompact]   - agent VC SD-JWT (bearer) for IdP group calls.
  * @param {import('node:crypto').KeyObject} [args.signingKey] - agent Ed25519 (DPoP).
  */
-export async function drainOutbox({ scope, mls, agentDid, send, log, idpUrl, vcCompact, signingKey }) {
+export async function drainOutbox({ scope, mls, agentDid, send, log, idpUrl, vcCompact, signingKey, reactToLastMessage }) {
   const path = outboxPath(scope);
   const logLine = log ?? ((l) => process.stderr.write(`${l}\n`));
   let raw;
@@ -138,10 +169,24 @@ export async function drainOutbox({ scope, mls, agentDid, send, log, idpUrl, vcC
       continue;
     }
     try {
-      await sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, signingKey, log: logLine });
-      logLine(
-        `[lastid-agent] outbox: sent ${req.id} → operator ${req.operator_did}`,
-      );
+      if (req.kind === 'reaction') {
+        // Reaction: no MLS encryption. Resolve the operator's group and react to
+        // their last message (the listener tracks it). A "can't react" outcome
+        // (no target message / unsupported emoji) is NOT retryable — drop it
+        // rather than wedge the drain; only a transient send/resolve error is
+        // kept (thrown below) for retry.
+        const dropped = await reactOne({ scope, req, reactToLastMessage, log: logLine });
+        if (dropped) {
+          logLine(`[lastid-agent] outbox: dropped reaction ${req.id} (${dropped})`);
+        } else {
+          logLine(`[lastid-agent] outbox: reacted ${req.id} → operator ${req.operator_did}`);
+        }
+      } else {
+        await sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, signingKey, log: logLine });
+        logLine(
+          `[lastid-agent] outbox: sent ${req.id} → operator ${req.operator_did}`,
+        );
+      }
     } catch (err) {
       const msg = err?.message ?? String(err);
       logLine(`[lastid-agent] outbox: send ${req.id} failed: ${msg}`);
@@ -229,4 +274,63 @@ async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, sig
   } catch {
     /* best-effort */
   }
+}
+
+/**
+ * Drain one reaction request. Resolves the operator's CURRENT active group
+ * (same as sendOne — handles rotation), then asks the listener to react to the
+ * operator's last message there via the injected `reactToLastMessage` callback
+ * (backed by PresenceEmitter, which holds the target message id). Returns a
+ * drop-reason string when the request is non-retryable (so the caller logs +
+ * discards it), or null on success. Throws only on a transient error worth a
+ * retry (no group yet, or no reactor wired).
+ */
+async function reactOne({ scope, req, reactToLastMessage, log }) {
+  if (typeof reactToLastMessage !== 'function') {
+    // The listener didn't wire a reactor (shouldn't happen in the daemon) —
+    // keep the request for a retry once it does.
+    throw new Error('no reactToLastMessage reactor wired');
+  }
+  const resolved = await resolveActiveGroupForOperator({
+    scope,
+    operatorDid: req.operator_did,
+  });
+  // No group yet → there's nothing to react to, but a conversation may be
+  // establishing. Retry on the next tick (do NOT self-heal/create one — you
+  // can't react to a message that was never received).
+  if (!resolved) {
+    throw new Error(
+      `no active group with operator ${req.operator_did} — waiting for one`,
+    );
+  }
+  const { idpGroupId } = resolved;
+  const action = req.reaction_action === 'remove' ? 'remove' : 'add';
+  const result = reactToLastMessage(idpGroupId, req.emoji, action);
+  if (!result || result.sent !== true) {
+    // Non-retryable: there's no target message in this group (e.g. the listener
+    // restarted and lost the in-memory pointer) or the emoji isn't a supported
+    // reaction. Either way, re-trying won't help — drop it.
+    return result?.reason ?? 'react_failed';
+  }
+  // Audit chain: an outbound reaction to the operator (the 'messages' class).
+  // NON-sensitive — the reaction name + targeted message id, never any content.
+  try {
+    enqueueAuditEvent({
+      scope,
+      eventType: 'ReactionSent',
+      metadata: {
+        to: 'operator',
+        request_id: req.id,
+        reaction: result.reaction,
+        action,
+        message_id: result.messageId,
+      },
+    });
+  } catch {
+    /* best-effort */
+  }
+  if (typeof log === 'function') {
+    log(`[lastid-agent] reaction ${result.reaction} (${action}) → message ${result.messageId}`);
+  }
+  return null;
 }

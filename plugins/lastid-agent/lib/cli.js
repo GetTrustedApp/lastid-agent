@@ -1579,6 +1579,13 @@ async function cmdListen(flags) {
       idpUrl,
       vcCompact: loaded.vcCompact,
       signingKey,
+      // Reaction drain: react to the operator's last message in the group via
+      // presence (it holds the target message id from the read-receipt path).
+      reactToLastMessage: (groupId, emoji, action) =>
+        presence?.reactToLastOperatorMessage(groupId, emoji, action) ?? {
+          sent: false,
+          reason: 'no_presence',
+        },
     })
       .catch((err) =>
         process.stderr.write(`[lastid-agent] outbox drain failed: ${err.message}\n`),

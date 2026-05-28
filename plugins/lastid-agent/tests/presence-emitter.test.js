@@ -124,3 +124,67 @@ test('NEGATIVE: read receipt is skipped without message_id or sender_did', () =>
 test('constructor requires a send function', () => {
   assert.throws(() => new PresenceEmitter({ userDid: AGENT }), /send required/);
 });
+
+// ── reactToLastOperatorMessage: real reaction badge on the operator's message ──
+
+function lastReaction(sent) {
+  return [...sent].reverse().find((x) => x.type === 'group_chat.reaction') ?? null;
+}
+
+test('reacts to the operator’s last message with the wire name + agent as reactor', () => {
+  const h = harness();
+  openTurn(h); // records { messageId: 'm1', senderDid: OPERATOR } for GROUP
+  h.sent.length = 0;
+  const r = h.emitter.reactToLastOperatorMessage(GROUP, '👍');
+  assert.deepEqual(r, { sent: true, messageId: 'm1', reaction: 'thumbs_up', action: 'add' });
+  const frame = lastReaction(h.sent);
+  assert.ok(frame, 'group_chat.reaction emitted');
+  assert.equal(frame.payload.group_id, GROUP);
+  assert.equal(frame.payload.message_id, 'm1');
+  assert.equal(frame.payload.reactor_did, AGENT);
+  assert.equal(frame.payload.reaction, 'thumbs_up');
+  assert.equal(frame.correlation_id, 'm1');
+});
+
+test('action:remove emits group_chat.reaction_removed', () => {
+  const h = harness();
+  openTurn(h);
+  h.sent.length = 0;
+  const r = h.emitter.reactToLastOperatorMessage(GROUP, '🙏', 'remove');
+  assert.equal(r.sent, true);
+  assert.equal(r.action, 'remove');
+  const removed = [...h.sent].reverse().find((x) => x.type === 'group_chat.reaction_removed');
+  assert.ok(removed, 'reaction_removed emitted');
+  assert.equal(removed.payload.reaction, 'pray');
+  assert.equal(lastReaction(h.sent), null, 'no add frame');
+});
+
+test('NEGATIVE: no message recorded for the group → no_target_message, no frame', () => {
+  const h = harness();
+  const r = h.emitter.reactToLastOperatorMessage('unseen-group', '👍');
+  assert.deepEqual(r, { sent: false, reason: 'no_target_message' });
+  assert.equal(lastReaction(h.sent), null);
+});
+
+test('NEGATIVE: unsupported emoji → unsupported_emoji, no frame', () => {
+  const h = harness();
+  openTurn(h);
+  h.sent.length = 0;
+  const r = h.emitter.reactToLastOperatorMessage(GROUP, '🍕');
+  assert.deepEqual(r, { sent: false, reason: 'unsupported_emoji' });
+  assert.equal(lastReaction(h.sent), null);
+});
+
+test('NEGATIVE: a message recorded without senderDid is not a target (gate matches read receipt)', () => {
+  const h = harness();
+  // The recording gate requires BOTH messageId and senderDid (same as the read
+  // receipt) — a half-populated message never becomes a reaction target.
+  h.emitter.onOperatorMessage(GROUP, { messageId: 'm9', senderDid: null });
+  const r = h.emitter.reactToLastOperatorMessage(GROUP, '👍');
+  assert.deepEqual(r, { sent: false, reason: 'no_target_message' });
+});
+
+test('NEGATIVE: no group id → no_group', () => {
+  const h = harness();
+  assert.deepEqual(h.emitter.reactToLastOperatorMessage('', '👍'), { sent: false, reason: 'no_group' });
+});

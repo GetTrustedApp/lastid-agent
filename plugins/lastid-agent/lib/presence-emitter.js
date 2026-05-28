@@ -15,6 +15,7 @@ import {
   initialPresence,
   DEFAULT_PRESENCE_CONFIG,
 } from './typing-presence.js';
+import { reactionWireName } from './reactions.js';
 
 export class PresenceEmitter {
   #send;
@@ -121,6 +122,47 @@ export class PresenceEmitter {
         working: state.workingOn,
       },
     });
+  }
+
+  /**
+   * React to the operator's most recent message in `groupId` with `emoji`.
+   * Sibling to #emitRead: it reuses the same `#lastMessageByGroup` record (the
+   * read-receipt path already captured which message the operator sent) so the
+   * agent never has to know — or be handed — a message id. Emits a plaintext
+   * `group_chat.reaction` frame the IdP relays to the group; clients render the
+   * badge on that message, exactly like a human tapping a reaction.
+   *
+   * Returns `{ sent, ... }`: `{sent:true, messageId, reaction}` on success;
+   * `{sent:false, reason}` when there's no message to react to
+   * ('no_target_message') or the emoji isn't a supported reaction
+   * ('unsupported_emoji'). Neither failure is retryable, so the caller drops the
+   * request rather than wedging the outbox.
+   */
+  reactToLastOperatorMessage(groupId, emoji, action = 'add') {
+    if (!groupId) return { sent: false, reason: 'no_group' };
+    const info = this.#lastMessageByGroup.get(groupId);
+    if (!info || !info.messageId) return { sent: false, reason: 'no_target_message' };
+    const wire = reactionWireName(emoji);
+    if (!wire) return { sent: false, reason: 'unsupported_emoji' };
+    const type =
+      action === 'remove' ? 'group_chat.reaction_removed' : 'group_chat.reaction';
+    const now = new Date().toISOString();
+    this.#send({
+      type,
+      // correlation_id mirrors the read receipt's convention (the targeted
+      // message id). Reaction TARGETING is via payload.message_id; the IdP only
+      // uses correlation_id for ACK matching.
+      correlation_id: info.messageId,
+      timestamp: now,
+      payload: {
+        group_id: groupId,
+        message_id: info.messageId,
+        reactor_did: this.#userDid, // the agent is the reactor
+        reaction: wire,
+        timestamp: now,
+      },
+    });
+    return { sent: true, messageId: info.messageId, reaction: wire, action };
   }
 
   #emitRead(groupId) {
