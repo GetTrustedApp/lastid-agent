@@ -27,6 +27,7 @@ import {
   listSubagents,
   uninstallSub,
   invokeSubagent,
+  applySubagentRecord,
 } from '../lib/subagents.js';
 
 // ── Pure layer ────────────────────────────────────────────────────────
@@ -307,4 +308,137 @@ test('listSubagents: sorted by slug', async () => {
   await installStubSub({ parentScope: p, slug: 'bravo', name: 'B', body: 'b' });
   const list = await listSubagents(p);
   assert.deepEqual(list.map((s) => s.slug), ['alpha', 'bravo', 'charlie']);
+});
+
+// ── Doorbell-driven install: applySubagentRecord ──────────────────────
+// The console publishes a subagent → IdP fans out a sealed record → the
+// listener's agent-state-sync decrypts → calls applySubagentRecord to
+// materialize the scope on disk. No human "install" step. These tests
+// stand in for the sync-side dispatch (which is itself end-to-end exercised
+// by agent-state-sync.test.js — the disk-write IS the contract here).
+
+test('applySubagentRecord: ACTIVE record writes scope dir + index entry (mode=published)', async () => {
+  const parentScope = 'main-published';
+  const entry = await applySubagentRecord({
+    scope: parentScope,
+    storeRecord: {
+      id: 'subagent-record-1',
+      kind: 'subagent',
+      status: 'active',
+      content: {
+        slug: 'echopub',
+        name: 'Echo (Published)',
+        body: 'You are Echo Published. Echo input verbatim.',
+        claude_tools: { allowed: ['Read'], disallowed: ['WebFetch'] },
+        mcp_allowed: ['lastid_react'],
+      },
+    },
+  });
+  assert.equal(entry.scope, 'main-published-echopub');
+  assert.equal(entry.mode, 'published');
+  // The record id is stable across re-applies (IdP-assigned).
+  assert.equal(entry.id, 'subagent-record-1');
+  // agent.md on disk reflects the published mode.
+  const raw = await readFile(entry.agent_md_path, 'utf-8');
+  const parsed = parseAgentMd(raw);
+  assert.equal(parsed.frontmatter.slug, 'echopub');
+  assert.equal(parsed.frontmatter.mode, 'published');
+  assert.equal(parsed.frontmatter.id, 'subagent-record-1');
+  assert.match(parsed.body, /Echo Published/);
+  // Parent index lists it.
+  const list = await listSubagents(parentScope);
+  assert.ok(list.find((s) => s.slug === 'echopub'));
+});
+
+test('applySubagentRecord: REVOKED record removes scope dir + index entry', async () => {
+  const parentScope = 'main-revoke';
+  // First, install via active record.
+  await applySubagentRecord({
+    scope: parentScope,
+    storeRecord: {
+      id: 'rec-2',
+      kind: 'subagent',
+      status: 'active',
+      content: {
+        slug: 'goingaway',
+        name: 'Going Away',
+        body: 'soon to be revoked',
+      },
+    },
+  });
+  // Confirm present.
+  let list = await listSubagents(parentScope);
+  assert.ok(list.find((s) => s.slug === 'goingaway'));
+  // Now revoke.
+  const r = await applySubagentRecord({
+    scope: parentScope,
+    storeRecord: { id: 'rec-2', kind: 'subagent', status: 'revoked', content: { slug: 'goingaway' } },
+  });
+  assert.equal(r.ok, true);
+  list = await listSubagents(parentScope);
+  assert.equal(list.find((s) => s.slug === 'goingaway'), undefined);
+});
+
+test('applySubagentRecord: re-apply ACTIVE updates body + preserves stable id (idempotent)', async () => {
+  const parentScope = 'main-idem';
+  const e1 = await applySubagentRecord({
+    scope: parentScope,
+    storeRecord: {
+      id: 'stable-id',
+      kind: 'subagent',
+      status: 'active',
+      content: { slug: 'idem', name: 'Idem', body: 'v1 body' },
+    },
+  });
+  const e2 = await applySubagentRecord({
+    scope: parentScope,
+    storeRecord: {
+      id: 'stable-id',
+      kind: 'subagent',
+      status: 'active',
+      content: { slug: 'idem', name: 'Idem', body: 'v2 body' },
+    },
+  });
+  assert.equal(e1.id, 'stable-id');
+  assert.equal(e2.id, 'stable-id');
+  // Body sha changed; entry was updated in place.
+  assert.notEqual(e1.body_sha256, e2.body_sha256);
+  const list = await listSubagents(parentScope);
+  // Still exactly one entry for that slug.
+  assert.equal(list.filter((s) => s.slug === 'idem').length, 1);
+});
+
+test('applySubagentRecord: NEGATIVE — malformed slug rejected', async () => {
+  await assert.rejects(
+    applySubagentRecord({
+      scope: 'main',
+      storeRecord: { id: 'x', kind: 'subagent', status: 'active', content: { slug: 'BadSlug', name: 'X', body: 'y' } },
+    }),
+    /slug missing or malformed/,
+  );
+  await assert.rejects(
+    applySubagentRecord({
+      scope: 'main',
+      storeRecord: { id: 'x', kind: 'subagent', status: 'active', content: { name: 'X', body: 'y' } },
+    }),
+    /slug missing or malformed/,
+  );
+});
+
+test('applySubagentRecord: NEGATIVE — active record without body rejected', async () => {
+  await assert.rejects(
+    applySubagentRecord({
+      scope: 'main',
+      storeRecord: { id: 'x', kind: 'subagent', status: 'active', content: { slug: 'ok', name: 'X' } },
+    }),
+    /body required/,
+  );
+});
+
+test('applySubagentRecord: NEGATIVE — missing scope/storeRecord rejected', async () => {
+  await assert.rejects(
+    applySubagentRecord({ storeRecord: { kind: 'subagent', content: { slug: 'x', body: 'y' } } }),
+    /scope required/,
+  );
+  await assert.rejects(applySubagentRecord({ scope: 'main' }), /storeRecord required/);
 });

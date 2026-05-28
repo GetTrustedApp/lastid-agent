@@ -30,6 +30,13 @@ export const MEMORIES_PATH = '/v1/agent-state/memories';
 export const VAULT_PATH = '/v1/agent-state/vault';
 export const AUDIT_POLICY_PATH = '/v1/agent-state/audit-policy';
 export const SELF_PROTECTION_PATH = '/v1/agent-state/self-protection';
+// Subagents — operator-authored peer agents this primary has authority to
+// invoke. Sealed under THIS agent's slot_seed by the operator's console,
+// fanned per-recipient, picked up here on `subagent.changed` doorbell.
+// Applied to disk via applySubagentRecord (lib/subagents.js): writes the
+// sub-scope's agent.md + updates the parent's subagents.json index, so
+// `lastid_invoke_subagent` resolves immediately without any CLI step.
+export const SUBAGENTS_PATH = '/v1/agent-state/subagents';
 
 /**
  * Decode one wire record into the OperatorStore shape. Revoked /
@@ -154,7 +161,8 @@ export async function syncAgentState({
   const sinceVault = store.cursorFor('vault');
   const sinceAudit = store.cursorFor('audit_policy');
   const sinceSelfProt = store.cursorFor('self_protection');
-  const [rules, memories, vault, auditPolicy, selfProtection] = await Promise.all([
+  const sinceSubagent = store.cursorFor('subagent');
+  const [rules, memories, vault, auditPolicy, selfProtection, subagents] = await Promise.all([
     fetchKind({ idpUrl, path: RULES_PATH, since: sinceRule, agentDid, vcCompact, signingKey, fetchImpl }),
     fetchKind({ idpUrl, path: MEMORIES_PATH, since: sinceMemory, agentDid, vcCompact, signingKey, fetchImpl }),
     // Vault shares. We store them SEALED (no decrypt here) — the listener
@@ -178,6 +186,15 @@ export async function syncAgentState({
     fetchKind({ idpUrl, path: SELF_PROTECTION_PATH, since: sinceSelfProt, agentDid, vcCompact, signingKey, fetchImpl }).catch(
       () => ({ records: [], cursor: sinceSelfProt, operatorJwk: null }),
     ),
+    // Subagents (kind 'subagent') — operator-authored peer agents the operator
+    // signed under THIS primary's slot_seed. Decoded + applied to disk below
+    // via applySubagentRecord: writes the sub-scope's agent.md + updates the
+    // parent's subagents.json so `lastid_invoke_subagent` resolves immediately
+    // — no human install step. Fail soft to empty so a missing/old IdP can't
+    // break the rest of the sync.
+    fetchKind({ idpUrl, path: SUBAGENTS_PATH, since: sinceSubagent, agentDid, vcCompact, signingKey, fetchImpl }).catch(
+      () => ({ records: [], cursor: sinceSubagent, operatorJwk: null }),
+    ),
   ]);
 
   // Vault: persist the sealed blobs to the local vault cache (never decrypted
@@ -199,7 +216,7 @@ export async function syncAgentState({
   // hands over a DIFFERENT key (a compromised/forged IdP) is ignored, so it
   // can't swap the verification key and forge operator rules/memories. (A test
   // override via operatorJwk wins, for determinism.)
-  const supplied = operatorJwk ?? rules.operatorJwk ?? memories.operatorJwk ?? auditPolicy.operatorJwk ?? selfProtection.operatorJwk ?? null;
+  const supplied = operatorJwk ?? rules.operatorJwk ?? memories.operatorJwk ?? auditPolicy.operatorJwk ?? selfProtection.operatorJwk ?? subagents.operatorJwk ?? null;
   const pinned = store.pinnedDelegationJwk;
   let opJwk = pinned;
   if (!pinned && supplied) {
@@ -214,7 +231,7 @@ export async function syncAgentState({
     verifyRecord ??
     ((rec, contentBytes) => verifyRecordSignature(rec, contentBytes, opJwk, { agentDid }));
 
-  const all = [...rules.records, ...memories.records, ...auditPolicy.records, ...selfProtection.records];
+  const all = [...rules.records, ...memories.records, ...auditPolicy.records, ...selfProtection.records, ...subagents.records];
   // Global high-water = max across every kind. It is NOT used as anyone's
   // `?since=` anymore (that's per-kind now); it only marks "have we ever synced"
   // for the policy cold-start gate (OperatorStore.policyDecision) + the CLI
@@ -226,6 +243,7 @@ export async function syncAgentState({
     vault.cursor ?? 0,
     auditPolicy.cursor ?? 0,
     selfProtection.cursor ?? 0,
+    subagents.cursor ?? 0,
   );
   const decoded = [];
   let reconciled = 0;
@@ -268,6 +286,26 @@ export async function syncAgentState({
       }
     }
 
+    // Subagents — write the sub-scope's agent.md to disk + add to the parent's
+    // subagents.json index. This is the doorbell-driven install rail: the
+    // operator authored a subagent in the console, sealed it under this
+    // primary's slot_seed, posted it; we decrypted above; now we materialize
+    // the scope dir so `lastid_invoke_subagent` resolves on the next call —
+    // no human install step. A 'revoked' record removes the scope dir; an
+    // 'active' record writes/overwrites it.
+    if (rec.kind === 'subagent') {
+      try {
+        // Lazy import — keeps the sync loop free of the subagents FS code
+        // when this kind isn't in the batch (most syncs).
+        const { applySubagentRecord } = await import('./subagents.js');
+        await applySubagentRecord({ scope, storeRecord });
+      } catch (err) {
+        safely(onReject, rec, `apply subagent: ${err?.message ?? err}`);
+      }
+      // Don't add to decoded[] — subagents live on disk, not in operator-store.
+      continue;
+    }
+
     // The agent's OWN authored memory ACTIVES live in the memory store, not the
     // operator-store — skip them here to avoid double-injection. Revokes still
     // flow to the operator-store (it removes the id if it holds it; harmless
@@ -288,6 +326,7 @@ export async function syncAgentState({
   store.setCursorFor('vault', vault.cursor);
   store.setCursorFor('audit_policy', auditPolicy.cursor);
   store.setCursorFor('self_protection', selfProtection.cursor);
+  store.setCursorFor('subagent', subagents.cursor);
 
   const applied = store.applyRecords(decoded, maxCursor);
   return {
@@ -315,7 +354,7 @@ function safely(fn, ...args) {
  * GET used for catch-up. Returns true if it handled the event.
  */
 export function makeDoorbellHandler(triggerSync, { debounceMs = 250 } = {}) {
-  const CHANGED = new Set(['rules.changed', 'memory.changed', 'vault.changed', 'agent_state.changed']);
+  const CHANGED = new Set(['rules.changed', 'memory.changed', 'vault.changed', 'subagent.changed', 'agent_state.changed']);
   let timer = null;
   return function onEvent(event) {
     const type = typeof event === 'string' ? event : event?.type ?? '';

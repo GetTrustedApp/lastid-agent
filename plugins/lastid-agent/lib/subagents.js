@@ -288,6 +288,8 @@ export async function installStubSub({
   body,
   claudeTools,
   mcpAllowed,
+  mode,
+  id,
 }) {
   if (!parentScope) throw new Error('installStubSub: parentScope required');
   if (!slug || !/^[a-z][a-z0-9_-]*$/.test(slug)) {
@@ -302,11 +304,11 @@ export async function installStubSub({
 
   const frontmatter = {
     lastid_version: 1,
-    id: makeSubagentId(),
+    id: typeof id === 'string' && id.length > 0 ? id : makeSubagentId(),
     name,
     slug,
     parent_scope: parentScope,
-    mode: 'stub',
+    mode: mode === 'published' ? 'published' : 'stub',
     created_at: new Date().toISOString(),
     claude_tools: {
       allowed: Array.isArray(claudeTools?.allowed) ? claudeTools.allowed : [],
@@ -321,7 +323,7 @@ export async function installStubSub({
     slug,
     name,
     scope: subScope,
-    mode: 'stub',
+    mode: frontmatter.mode,
     id: frontmatter.id,
     agent_md_path: agentMdPath,
     body_sha256: sha256Hex(body),
@@ -331,6 +333,65 @@ export async function installStubSub({
   };
   await addToIndex(parentScope, entry);
   return entry;
+}
+
+/**
+ * Apply one decoded `subagent`-kind agent-state record locally. Called by
+ * agent-state-sync's dispatch loop when a `subagent.changed` doorbell brings
+ * down records sealed by the operator's console — this is the doorbell-driven
+ * install rail (operator never touches a CLI).
+ *
+ * Record content shape (set by lastid.co publishSubagent):
+ *   { slug, name, body, claude_tools: { allowed[], disallowed[] }, mcp_allowed[] }
+ *
+ * Active → write the sub-scope's agent.md + add to the parent's index.
+ * Revoked → remove the index entry + delete the scope dir (best-effort).
+ *
+ * Parent scope = the scope running this sync (the listener owns its own scope,
+ * and a subagent published TO this agent slots under it). We do NOT trust a
+ * `parent_scope` field in the content — the receiving listener IS the parent
+ * by definition, so trust the listener's own scope.
+ */
+export async function applySubagentRecord({ scope, storeRecord }) {
+  if (!scope) throw new Error('applySubagentRecord: scope required');
+  if (!storeRecord || typeof storeRecord !== 'object') {
+    throw new Error('applySubagentRecord: storeRecord required');
+  }
+  const status = storeRecord.status ?? 'active';
+  const content = storeRecord.content ?? {};
+  const slug = typeof content.slug === 'string' ? content.slug : null;
+  if (!slug || !/^[a-z][a-z0-9_-]*$/.test(slug)) {
+    throw new Error('applySubagentRecord: content.slug missing or malformed');
+  }
+  if (status === 'revoked') {
+    // Idempotent: uninstall returns not_found if it's already gone.
+    return uninstallSub({ parentScope: scope, slug });
+  }
+  // Active — install or refresh.
+  const name = typeof content.name === 'string' && content.name.length > 0 ? content.name : slug;
+  const body = typeof content.body === 'string' ? content.body : '';
+  if (body.length === 0) {
+    throw new Error('applySubagentRecord: content.body required for active record');
+  }
+  const claudeTools = content.claude_tools ?? {};
+  const allowed = Array.isArray(claudeTools.allowed) ? claudeTools.allowed : [];
+  const disallowed = Array.isArray(claudeTools.disallowed) ? claudeTools.disallowed : [];
+  const mcpAllowed = Array.isArray(content.mcp_allowed) ? content.mcp_allowed : [];
+
+  // Reuse the stub-install path so a console-published subagent lands at the
+  // same on-disk shape (~/.lastid-agent/<parent>-<slug>/agent.md + the parent's
+  // subagents.json) as a dev-installed stub. installStubSub is idempotent
+  // (writes over the existing agent.md + updates the index entry in place).
+  return installStubSub({
+    parentScope: scope,
+    slug,
+    name,
+    body,
+    claudeTools: { allowed, disallowed },
+    mcpAllowed,
+    mode: 'published',
+    id: typeof storeRecord.id === 'string' && storeRecord.id.length > 0 ? storeRecord.id : null,
+  });
 }
 
 /** Uninstall a subagent: remove from index, delete its scope dir. */
