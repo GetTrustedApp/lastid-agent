@@ -1142,7 +1142,7 @@ async function cmdSelfProtectionStatus(flags) {
  * on-connect triggers. Returns the sync result; throws on transport
  * errors (callers fail open).
  */
-async function runAgentStateSync(loaded, scope) {
+async function runAgentStateSync(loaded, scope, opts = {}) {
   const [
     { deriveAgentEd25519Keypair },
     { OperatorStore, deriveOperatorStateMacKey },
@@ -1185,6 +1185,7 @@ async function runAgentStateSync(loaded, scope) {
     memoryStore,
     scope, // vault shares cache per scope
     fetchImpl: globalThis.fetch,
+    ...(typeof opts.onReject === 'function' ? { onReject: opts.onReject } : {}),
   });
 }
 
@@ -1276,7 +1277,12 @@ async function cmdListen(flags) {
   // restart. Best-effort + fail-open — a failed sync never disrupts the
   // listener. (saas-migration.md §6.)
   const onDoorbell = makeDoorbellHandler(() => {
-    runAgentStateSync(loaded, scope)
+    runAgentStateSync(loaded, scope, {
+      onReject: (rec, reason) =>
+        process.stderr.write(
+          `[lastid-agent] agent-state sync reject: kind=${rec?.kind ?? '?'} id=${rec?.id ?? '?'} reason=${reason}\n`,
+        ),
+    })
       .then((r) =>
         process.stderr.write(
           `[lastid-agent] doorbell sync: applied ${r.applied}, cursor ${r.cursor}\n`,
@@ -1465,11 +1471,37 @@ async function cmdListen(flags) {
       // Catch-up: pull current operator rules/memories on (re)connect, so
       // a freshly-provisioned or long-offline agent gets up to date.
       void runAgentStateSync(loaded, scope)
-        .then((r) =>
+        .then(async (r) => {
           process.stderr.write(
             `[lastid-agent] agent-state sync on connect: applied ${r.applied}, cursor ${r.cursor}\n`,
-          ),
-        )
+          );
+          // Subagent self-heal: walk the installed subagents index and
+          // run provisionSubagent for any without a VC. Handles the case
+          // where the doorbell-driven apply wrote the scope dir but the
+          // OID4VCI round-trip silently failed (the doorbell sync path
+          // discards rejections via safely(undefined, ...)). Idempotent —
+          // provisionSubagent short-circuits when a VC already exists.
+          try {
+            const { selfHealSubagents } = await import('./subagent-provisioning.js');
+            const heal = await selfHealSubagents({
+              idpUrl,
+              parentSlotSeed: loaded.slotSeed,
+              parentSigningKey: signingKey,
+              parentDid: loaded.agentDid,
+              parentVcCompact: loaded.vcCompact,
+              parentScope: scope,
+            });
+            if (heal.attempted > 0) {
+              process.stderr.write(
+                `[lastid-agent] subagent self-heal: attempted=${heal.attempted} provisioned=${heal.ok} already-ok=${heal.alreadyOk} failed=${heal.failed}\n`,
+              );
+            }
+          } catch (err) {
+            process.stderr.write(
+              `[lastid-agent] subagent self-heal failed: ${err?.message ?? err}\n`,
+            );
+          }
+        })
         .catch((err) =>
           process.stderr.write(`[lastid-agent] agent-state sync on connect failed: ${err?.message ?? err}\n`),
         );

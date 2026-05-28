@@ -89,6 +89,9 @@ export async function provisionSubagent({
   // so a re-derive would produce the same identity anyway.
   const existing = await loadAgentVc(subScope).catch(() => null);
   if (existing && existing.vcCompact) {
+    process.stderr.write(
+      `[lastid-agent] subagent already provisioned: scope=${subScope}\n`,
+    );
     return {
       ok: true,
       alreadyProvisioned: true,
@@ -96,6 +99,9 @@ export async function provisionSubagent({
       agentDid: existing.agentDid,
     };
   }
+  process.stderr.write(
+    `[lastid-agent] subagent provisioning: scope=${subScope}\n`,
+  );
 
   const sdk = await initializeSdkBindings();
 
@@ -237,10 +243,81 @@ export async function provisionSubagent({
     subScope,
   );
 
+  process.stderr.write(
+    `[lastid-agent] subagent provisioned OK: scope=${subScope} did=${subAgentDid}\n`,
+  );
   return {
     ok: true,
     alreadyProvisioned: false,
     scope: subScope,
     agentDid: subAgentDid,
   };
+}
+
+/**
+ * On listener startup (and any time after the initial sync), walk the
+ * installed subagents index and run `provisionSubagent` for any entry
+ * whose sub-scope is missing a VC in keychain. This handles the case
+ * where the doorbell-driven apply wrote the scope dir + index entry but
+ * the OID4VCI provisioning round-trip failed (network blip, IdP error,
+ * etc.) — the on-disk artifact is there but the VC isn't.
+ *
+ * Idempotent: provisionSubagent itself short-circuits when a VC already
+ * exists, so this is safe to call whenever (startup, reconnect, etc.).
+ *
+ * Returns counts so the caller can log: { attempted, ok, failed, alreadyOk }.
+ */
+export async function selfHealSubagents({
+  idpUrl,
+  parentSlotSeed,
+  parentSigningKey,
+  parentDid,
+  parentVcCompact,
+  parentScope,
+  fetchImpl = globalThis.fetch,
+}) {
+  const { listSubagents } = await import('./subagents.js');
+  const installed = await listSubagents(parentScope).catch(() => []);
+  let attempted = 0;
+  let ok = 0;
+  let failed = 0;
+  let alreadyOk = 0;
+  for (const entry of installed) {
+    if (!entry || !entry.slug) continue;
+    attempted += 1;
+    try {
+      const result = await provisionSubagent({
+        idpUrl,
+        parentSlotSeed,
+        parentSigningKey,
+        parentDid,
+        parentVcCompact,
+        parentScope,
+        subagent: {
+          slug: entry.slug,
+          // The applied record's content isn't re-decrypted here — only
+          // the slug + capabilities are needed to rebuild the parent_auth
+          // claims. capabilities were captured on the on-disk index by
+          // installStubSub (via the published content). If the index lacks
+          // them, provisionSubagent treats it as an empty set and the IdP
+          // enforces subset rules.
+          name: entry.name,
+          capabilities: [],
+          may_delegate: false,
+        },
+        fetchImpl,
+      });
+      if (result.alreadyProvisioned) {
+        alreadyOk += 1;
+      } else {
+        ok += 1;
+      }
+    } catch (err) {
+      failed += 1;
+      process.stderr.write(
+        `[lastid-agent] subagent self-heal failed: scope=${parentScope}-${entry.slug} err=${err?.message ?? err}\n`,
+      );
+    }
+  }
+  return { attempted, ok, failed, alreadyOk };
 }
