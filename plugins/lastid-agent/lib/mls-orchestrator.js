@@ -43,6 +43,7 @@ import {
   addGroupMember,
   reconcileMemberDevicesAdd,
   evictMemberDevices,
+  listOwnDevices,
 } from './mls-groups-api.js';
 
 const localRequire = createRequire(import.meta.url);
@@ -85,6 +86,7 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
 
   const directoryDeps = {
     fetchPeerKeyPackages: deps.fetchPeerKeyPackages ?? fetchPeerKeyPackages,
+    listOwnDevices: deps.listOwnDevices ?? listOwnDevices,
     fetchGroupMemberDevices: deps.fetchGroupMemberDevices ?? fetchGroupMemberDevices,
   };
   const transportDeps = {
@@ -112,9 +114,16 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
     },
 
     async own_devices(_argJson) {
-      // The agent has exactly one device (itself). Hand back a minimal
-      // DeviceInfo list so the orchestrator's own-member loops have data.
-      return stringifyReturn([{ device_id: ctx.agentDid, did: ctx.agentDid }]);
+      // Hit GET /v1/devices for the agent's REAL device list so the
+      // orchestrator reconciles with proper device_ids (the prior
+      // synthetic `{device_id: ctx.agentDid}` placeholder confused any
+      // downstream code that compared device_ids — including the IdP
+      // ledger view used by `fetch_member_device_resolution`).
+      const list = await directoryDeps.listOwnDevices(auth());
+      const records = list
+        .filter((d) => d.active)
+        .map((d) => ({ device_id: d.device_id, did: ctx.agentDid }));
+      return stringifyReturn(records);
     },
 
     async peer_device_records(argJson) {
@@ -144,12 +153,25 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
       return stringifyReturn(out);
     },
 
-    async fetch_own_key_packages(_argJson) {
-      // The agent doesn't claim its own key packages over IdP — they're
-      // local. Returning an empty list keeps the orchestrator's
-      // own-member backfill path a no-op (the agent is already its own
-      // sole device).
-      return stringifyReturn([]);
+    async fetch_own_key_packages(argJson) {
+      // Claim one KP per OTHER own device so reconcile can add them as MLS
+      // members. The IdP's per-device claim (single-use) lives on
+      // /v1/mls/keypackages/:did?per_device=true with `:did` set to OUR did.
+      // If the agent only runs a single device this returns 0 entries (the
+      // orchestrator's own-member backfill path no-ops on []), so no
+      // regression for the common case; if the agent ever scales to N
+      // devices this is the path that lets them all join.
+      const { device_ids } = parseArg(argJson);
+      const want = new Set(Array.isArray(device_ids) ? device_ids : []);
+      const { keyPackages } = await directoryDeps.fetchPeerKeyPackages({
+        ...auth(),
+        targetDid: ctx.agentDid,
+        perDevice: true,
+      });
+      const out = keyPackages
+        .filter((kp) => kp.deviceId && (want.size === 0 || want.has(kp.deviceId)))
+        .map((kp) => ({ device_id: kp.deviceId, key_package: kp.keyPackageB64 }));
+      return stringifyReturn(out);
     },
 
     async fetch_peer_key_packages_per_device(argJson) {

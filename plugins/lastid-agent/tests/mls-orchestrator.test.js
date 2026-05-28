@@ -179,14 +179,63 @@ test('directory.fetch_peer_key_packages filters by requested device_ids', async 
   ]);
 });
 
-test('directory.own_devices reports the agent as its single device', async () => {
+test('directory.own_devices fetches GET /v1/devices and maps active devices to {device_id, did}', async () => {
+  // Regression for the multi-device gap: previously this returned a single
+  // synthetic `{device_id: agentDid}` entry — same shape openmls's reconcile
+  // can't actually match against the IdP's real device_ids. Now the callback
+  // hits listOwnDevices, filters active=false, and returns the REAL device
+  // ids so the orchestrator can iterate the agent's own device set.
   const ctx = makeCtx();
-  const { directory } = buildCallbackBundles({ ctx });
+  const { directory } = buildCallbackBundles({
+    ctx,
+    deps: {
+      async listOwnDevices(a) {
+        // Sanity: the helper closes over auth() — verify it threads through.
+        assert.equal(a.agentDid, ctx.agentDid);
+        return [
+          { device_id: 'device-listener-1', last_seen: '2026-05-28T15:00:00.000Z', active: true },
+          { device_id: 'device-inactive', last_seen: null, active: false },
+        ];
+      },
+    },
+  });
   const json = await directory.own_devices(null);
   const out = JSON.parse(json);
   assert.equal(out.length, 1);
-  assert.equal(out[0].device_id, ctx.agentDid);
+  assert.equal(out[0].device_id, 'device-listener-1');
   assert.equal(out[0].did, ctx.agentDid);
+});
+
+test('directory.fetch_own_key_packages claims one KP per OTHER own device via fetchPeerKeyPackages(agentDid)', async () => {
+  // Regression for the same multi-device gap on the agent side: previously
+  // returned [] hardcoded, which forced the agent's reconcile to skip its
+  // own-device backfill. Locks the wire: helper called with targetDid ===
+  // ctx.agentDid + perDevice: true, output filtered by device_ids when
+  // present.
+  const ctx = makeCtx();
+  let calledArgs;
+  const { directory } = buildCallbackBundles({
+    ctx,
+    deps: {
+      async fetchPeerKeyPackages(a) {
+        calledArgs = a;
+        return {
+          keyPackages: [
+            { keyPackageB64: 'KP-1', ref: 'r1', deviceId: 'device-listener-1' },
+            { keyPackageB64: 'KP-2', ref: 'r2', deviceId: 'device-other' },
+          ],
+          remainingCount: 0,
+        };
+      },
+    },
+  });
+  const json = await directory.fetch_own_key_packages(
+    JSON.stringify({ device_ids: ['device-listener-1'] }),
+  );
+  assert.equal(calledArgs.targetDid, ctx.agentDid);
+  assert.equal(calledArgs.perDevice, true);
+  const out = JSON.parse(json);
+  assert.deepEqual(out, [{ device_id: 'device-listener-1', key_package: 'KP-1' }]);
 });
 
 // ─── buildCallbackBundles: transport ───────────────────────────────────────

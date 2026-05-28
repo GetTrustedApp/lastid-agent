@@ -113,6 +113,42 @@ export async function fetchPeerKeyPackages({
 }
 
 /**
+ * GET /v1/devices — list the AUTHENTICATED principal's own active devices.
+ * For the agent that's the agent itself (one or more devices registered under
+ * the bot DID via prekey publish). Used by the MLS orchestrator's
+ * `own_devices` callback so the device-consistency reconcile can iterate
+ * the agent's own device set with REAL `device_id` values (not a synthetic
+ * `device_id === agentDid` placeholder).
+ *
+ * @returns {Promise<Array<{ device_id: string, last_seen: string|null, active: boolean }>>}
+ */
+export async function listOwnDevices({
+  idpUrl,
+  agentDid,
+  vcCompact,
+  signingKey,
+  fetchImpl,
+}) {
+  const body = await authedIdpFetch({
+    idpUrl,
+    method: 'GET',
+    path: '/v1/devices',
+    agentDid,
+    vcCompact,
+    signingKey,
+    fetchImpl,
+  });
+  const list = Array.isArray(body?.devices) ? body.devices : [];
+  return list
+    .map((d) => ({
+      device_id: typeof d?.device_id === 'string' ? d.device_id : '',
+      last_seen: typeof d?.last_seen === 'string' ? d.last_seen : null,
+      active: d?.active !== false,
+    }))
+    .filter((d) => d.device_id.length > 0);
+}
+
+/**
  * GET /v1/groups/:id/member-devices/:did — the IdP ledger's view of which of
  * a member's devices are active in the group (and which are pending eviction).
  * Non-consuming (unlike a key-package fetch). Used by device-consistency
