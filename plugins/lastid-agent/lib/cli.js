@@ -1515,6 +1515,14 @@ async function cmdListen(flags) {
     // Doorbell events trigger a sync and are not MLS frames; everything
     // else goes to the MLS dispatcher.
     onEvent: (evt) => {
+      // TEMP DIAGNOSTIC: log every WS event type the listener sees so we can
+      // disambiguate "IdP not broadcasting" vs "listener dropping events".
+      // Remove once the doorbell sync flow is confirmed reliable.
+      try {
+        process.stderr.write(
+          `[lastid-agent] ws event: type=${evt?.type ?? '?'} recipient_did=${evt?.target?.recipient_did ?? '?'} ts=${evt?.timestamp ?? '?'}\n`,
+        );
+      } catch { /* never break the dispatch on a log */ }
       if (onDoorbell(evt)) return;
       dispatcher.onEvent(evt);
     },
