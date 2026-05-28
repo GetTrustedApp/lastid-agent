@@ -362,6 +362,19 @@ export async function provisionSubagent({
  * the /sub request body. /sub re-checks transactionally; a stale value
  * here returns sub_agent_index_stale (409) and the caller should refetch.
  */
+/**
+ * Build the (htu, url) pair for GET /sub/next-index. The DPoP `htu` claim
+ * MUST exclude the query string (RFC 9449 §4.2); the IdP verifier strips
+ * the query when computing the expected htu, so passing the full URL here
+ * would yield "htu mismatch" and a 401 that silently drops the provision.
+ * Pure for the regression test in tests/subagent-provisioning.test.js.
+ */
+export function subagentNextIndexUrls(idpUrl, subAgentClass) {
+  const htu = `${idpUrl}/v1/oid4vci/agent-provision/sub/next-index`;
+  const url = `${htu}?sub_agent_class=${encodeURIComponent(subAgentClass)}`;
+  return { htu, url };
+}
+
 async function fetchNextSubagentIndex({
   idpUrl,
   parentDid,
@@ -370,11 +383,11 @@ async function fetchNextSubagentIndex({
   subAgentClass,
   fetchImpl,
 }) {
-  const url = `${idpUrl}/v1/oid4vci/agent-provision/sub/next-index?sub_agent_class=${encodeURIComponent(subAgentClass)}`;
+  const { htu, url } = subagentNextIndexUrls(idpUrl, subAgentClass);
   const dpop = mintDpopJwt({
     agentDid: parentDid,
     httpMethod: 'GET',
-    httpUri: url,
+    httpUri: htu,
     signingKey: parentSigningKey,
   });
   const res = await fetchImpl(url, {
