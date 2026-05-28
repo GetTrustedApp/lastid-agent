@@ -462,6 +462,15 @@ export class MlsDispatcher {
       if (msg.includes('GroupNotFound') || msg.includes('group_not_found')) {
         return;
       }
+      // WrongEpoch: a concurrent committer raced us and the IdP picked a
+      // different winner. The losing commit shows up here with epoch
+      // BEHIND local. Same status as native — drop silently and let the
+      // IdP's `group_chat.proposal_reassigned` recovery path catch up.
+      // Logging it as a hard failure spams what's expected MLS behavior
+      // in any multi-device flow (mirror of the console-side fix).
+      if (msg.includes('WrongEpoch') || msg.includes('wrong_epoch')) {
+        return;
+      }
       this.#log(`[lastid-agent] commit processing failed: ${msg}`);
     }
   }
@@ -478,6 +487,19 @@ export class MlsDispatcher {
       await this.#mls.processInbound(mlsProposalB64);
       await this.#mls.persist();
     } catch (err) {
+      const msg = err?.message ?? String(err);
+      // Same race-tolerant classification as #handleCommit: GroupNotFound
+      // (we forgot it) and WrongEpoch (a commit already superseded this
+      // proposal) are both expected in a multi-committer multi-device
+      // setup. Drop silently.
+      if (
+        msg.includes('GroupNotFound') ||
+        msg.includes('group_not_found') ||
+        msg.includes('WrongEpoch') ||
+        msg.includes('wrong_epoch')
+      ) {
+        return;
+      }
       this.#log(`[lastid-agent] proposal processing failed: ${errText(err)}`);
     }
   }
