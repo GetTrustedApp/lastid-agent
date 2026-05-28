@@ -128,6 +128,33 @@ const PLUGIN_TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'lastid_list_subagents',
+    description:
+      "List the subagents your operator authored under YOU (this parent agent). Returns each subagent's slug, name, scope, mode (stub/signed), and the Claude tool surface they were authored with. A subagent is a peer agent the operator signed into existence — invoking one runs a fresh Claude session bound to that subagent's identity. Use this to discover what subagents you can call via `lastid_invoke_subagent`.",
+    requiredCapability: null,
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'lastid_invoke_subagent',
+    description:
+      "Invoke one of your subagents (find its slug via `lastid_list_subagents`). Spawns a fresh Claude session bound to the subagent's scope + system prompt, passes `input` as the user prompt, and returns the subagent's final assistant text. Use for delegated work where the subagent has tools/grants/capabilities scoped narrower (or sometimes broader) than yours — e.g. operator authored a Deploy Bot with `gh` access you don't have. The subagent's calls are logged under ITS DID in the audit chain, cross-referenced to your invocation. Default timeout 5min; opts.timeout_ms overrides.",
+    requiredCapability: null,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        slug: { type: 'string', description: 'Subagent slug from `lastid_list_subagents`.' },
+        input: { type: 'string', description: 'What you want the subagent to do — passed verbatim as its user prompt.' },
+        timeout_ms: { type: 'integer', minimum: 1000, maximum: 30 * 60_000, description: 'Optional override; default 5 minutes.' },
+      },
+      required: ['slug', 'input'],
+      additionalProperties: false,
+    },
+  },
   // Memory tools — served locally against the agent's own memory store
   // (lib/memory-store.js). These names override any same-named desktop
   // tools in the tools/list merge below, so memory is local-first.
@@ -392,6 +419,71 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
           ),
         },
       ],
+    };
+  }
+
+  if (name === 'lastid_list_subagents') {
+    // Lists subagents installed under THIS scope (parent agent's scope).
+    // The local index is the source of truth in stub mode; in signed mode
+    // it's hydrated from the IdP on sync.
+    const { listSubagents } = await import('./subagents.js');
+    const subs = await listSubagents(scope);
+    // Public projection — strip filesystem paths and internal bookkeeping
+    // before showing to the agent. Path is useful for debugging via the
+    // CLI but not something the parent agent should reason about.
+    const publicSubs = subs.map((s) => ({
+      slug: s.slug,
+      name: s.name,
+      scope: s.scope,
+      mode: s.mode,
+      id: s.id,
+      installed_at: s.installed_at,
+      claude_tools: s.claude_tools,
+      mcp_allowed: s.mcp_allowed,
+    }));
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ subagents: publicSubs }, null, 2) }],
+    };
+  }
+
+  if (name === 'lastid_invoke_subagent') {
+    const slug = typeof _args?.slug === 'string' ? _args.slug : '';
+    const input = typeof _args?.input === 'string' ? _args.input : '';
+    const timeoutMs = Number.isInteger(_args?.timeout_ms) ? _args.timeout_ms : undefined;
+    if (!slug) throw new Error('lastid_invoke_subagent: slug required');
+    if (!input) throw new Error('lastid_invoke_subagent: input required');
+    // SECURITY: defense-in-depth against argv flag smuggling. The current
+    // spawn pipes input via stdin (not argv) so this is moot today, but if
+    // a future refactor reintroduces a positional path, a leading '-' on
+    // input would be parsed as a claude CLI flag (e.g. an input of
+    // "--dangerously-skip-permissions" would flip that flag on). Refuse at
+    // the boundary. See subagents.js buildSpawnArgs SECURITY comment.
+    if (input.startsWith('-')) {
+      throw new Error(
+        'lastid_invoke_subagent: input must not start with "-" (argv-flag protection). Add a leading space or rephrase.',
+      );
+    }
+    // Same protection on slug — it's never used as argv directly but
+    // resolving "slug" to a scope name + filesystem path warrants the same
+    // hygiene check, and a well-formed slug never starts with a dash.
+    if (slug.startsWith('-') || slug.includes('/') || slug.includes('\\')) {
+      throw new Error(`lastid_invoke_subagent: invalid slug ${JSON.stringify(slug)}`);
+    }
+    const { invokeSubagent } = await import('./subagents.js');
+    const log = (line) => process.stderr.write(`${line}\n`);
+    const result = await invokeSubagent({
+      parentScope: scope,
+      slug,
+      input,
+      timeoutMs,
+      parentEnv: process.env,
+      log,
+    });
+    // Audit chain hookup is deferred — landing the spawn pipeline first.
+    // The invokeSubagent return already carries an `audit` object with
+    // hashes + scope info; downstream chain integration reads from there.
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
     };
   }
 

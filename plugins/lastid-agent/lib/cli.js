@@ -697,6 +697,155 @@ async function cmdVaultList(flags) {
 }
 
 /**
+ * `lastid-agent install-stub-sub --slug X --name "..." --body-file path.md [opts]`
+ *
+ * Install a subagent locally in STUB mode (no IdP, no signature). Writes the
+ * sub-scope dir + agent.md + updates the parent's index. The spawned Claude
+ * session will run with just Claude tools (no LastID MCP tools — the scope
+ * is unprovisioned). Useful for: testing the invocation pipeline, scripted
+ * subagent installs from the console before IdP integration lands, and
+ * one-off scratch subagents.
+ *
+ * Required: --slug, --name, --body-file (or --body "..." inline).
+ * Optional: --scope <parent_scope>, --allowed-tools "a,b,c", --disallowed-tools "x,y",
+ *           --mcp-allowed "lastid_send_message,lastid_memory_read".
+ */
+async function cmdInstallStubSub(flags) {
+  const parentScope = resolveScope(flags);
+  const slug = typeof flags.slug === 'string' ? flags.slug : '';
+  const name = typeof flags.name === 'string' ? flags.name : '';
+  let body = typeof flags.body === 'string' ? flags.body : null;
+  if (!body && typeof flags['body-file'] === 'string') {
+    const { readFile } = await import('node:fs/promises');
+    body = await readFile(flags['body-file'], 'utf-8');
+  }
+  if (!slug || !name || !body) {
+    process.stderr.write(
+      'install-stub-sub: --slug, --name, and (--body-file or --body) are all required.\n',
+    );
+    process.exit(2);
+  }
+  const splitCsv = (s) => (typeof s === 'string' && s.length > 0 ? s.split(',').map((x) => x.trim()).filter(Boolean) : []);
+  const { installStubSub } = await import('./subagents.js');
+  try {
+    const entry = await installStubSub({
+      parentScope,
+      slug,
+      name,
+      body,
+      claudeTools: {
+        allowed: splitCsv(flags['allowed-tools']),
+        disallowed: splitCsv(flags['disallowed-tools']),
+      },
+      mcpAllowed: splitCsv(flags['mcp-allowed']),
+    });
+    process.stdout.write(`${JSON.stringify({ ok: true, entry }, null, 2)}\n`);
+    process.exit(0);
+  } catch (e) {
+    process.stderr.write(`install-stub-sub: ${e?.message ?? e}\n`);
+    process.exit(1);
+  }
+}
+
+/** `lastid-agent list-subagents` — print installed subagents under the parent scope. */
+async function cmdListSubagents(flags) {
+  const parentScope = resolveScope(flags);
+  const { listSubagents } = await import('./subagents.js');
+  const subs = await listSubagents(parentScope);
+  process.stdout.write(`${JSON.stringify({ parent_scope: parentScope, subagents: subs }, null, 2)}\n`);
+  process.exit(0);
+}
+
+/**
+ * `lastid-agent install-from-bundle <path>` — install a subagent from a
+ * downloaded agent.md bundle. Reads the file, parses the frontmatter for
+ * slug/name + the body for system prompt + claude_tools, and writes the
+ * sub-scope locally.
+ *
+ * DEV-ONLY rail. The eventual install path is doorbell-driven (operator
+ * publishes from the console → IdP → WS doorbell → listener pickup, same
+ * shape vault/memory sync uses today). This command exists so the runtime
+ * can be tested before that sync rail is wired. Once doorbell sync lands,
+ * a dev can still use this to seed a subagent from a hand-edited agent.md
+ * for local iteration.
+ */
+async function cmdInstallFromBundle(flags) {
+  const parentScope = resolveScope(flags);
+  // Positionals land in flags._ per parseFlags(). Path can also be passed
+  // via --path for shell scripts that prefer named args.
+  const bundlePath =
+    (typeof flags.path === 'string' && flags.path) ||
+    (Array.isArray(flags._) && flags._[0]) ||
+    '';
+  if (!bundlePath) {
+    process.stderr.write(
+      'install-from-bundle: pass the bundle path as a positional or --path.\n  Example: lastid-agent install-from-bundle ~/Downloads/echobot.agent.md\n',
+    );
+    process.exit(2);
+  }
+  const { readFile } = await import('node:fs/promises');
+  let raw;
+  try {
+    raw = await readFile(bundlePath, 'utf-8');
+  } catch (e) {
+    process.stderr.write(`install-from-bundle: read ${bundlePath} failed: ${e?.message ?? e}\n`);
+    process.exit(1);
+  }
+  const { parseAgentMd, installStubSub } = await import('./subagents.js');
+  let parsed;
+  try {
+    parsed = parseAgentMd(raw);
+  } catch (e) {
+    process.stderr.write(`install-from-bundle: ${e?.message ?? e}\n`);
+    process.exit(1);
+  }
+  const fm = parsed.frontmatter ?? {};
+  if (!fm.slug || !fm.name) {
+    process.stderr.write('install-from-bundle: bundle frontmatter missing slug or name.\n');
+    process.exit(1);
+  }
+  // Trust the bundle's own parent_scope if it carries one (console embeds it
+  // at authoring time). Otherwise fall back to the CLI-resolved scope so the
+  // operator can install into whichever primary they choose.
+  const effectiveParent =
+    typeof fm.parent_scope === 'string' && fm.parent_scope.trim().length > 0
+      ? fm.parent_scope.trim()
+      : parentScope;
+  try {
+    const entry = await installStubSub({
+      parentScope: effectiveParent,
+      slug: fm.slug,
+      name: fm.name,
+      body: parsed.body,
+      claudeTools: {
+        allowed: Array.isArray(fm.claude_tools?.allowed) ? fm.claude_tools.allowed : [],
+        disallowed: Array.isArray(fm.claude_tools?.disallowed) ? fm.claude_tools.disallowed : [],
+      },
+      mcpAllowed: Array.isArray(fm.mcp_allowed) ? fm.mcp_allowed : [],
+    });
+    process.stdout.write(`${JSON.stringify({ ok: true, parent_scope: effectiveParent, entry }, null, 2)}\n`);
+    process.exit(0);
+  } catch (e) {
+    process.stderr.write(`install-from-bundle: ${e?.message ?? e}\n`);
+    process.exit(1);
+  }
+}
+
+/** `lastid-agent uninstall-sub --slug X` — remove a subagent + its scope dir. */
+async function cmdUninstallSub(flags) {
+  const parentScope = resolveScope(flags);
+  const slug = typeof flags.slug === 'string' ? flags.slug : '';
+  if (!slug) {
+    process.stderr.write('uninstall-sub: --slug is required.\n');
+    process.exit(2);
+  }
+  const { uninstallSub } = await import('./subagents.js');
+  const r = await uninstallSub({ parentScope, slug });
+  process.stdout.write(`${JSON.stringify(r, null, 2)}\n`);
+  process.exit(r.ok ? 0 : 1);
+}
+
+/**
  * `lastid-agent memory-search --prompt "..." [--exclude-bedrock]`
  *
  * Pure topical semantic search — different from `memory-retrieve`
@@ -1800,6 +1949,18 @@ async function main() {
       break;
     case 'run':
       await cmdRun(flags, cmdArgv);
+      break;
+    case 'install-stub-sub':
+      await cmdInstallStubSub(flags);
+      break;
+    case 'install-from-bundle':
+      await cmdInstallFromBundle(flags);
+      break;
+    case 'list-subagents':
+      await cmdListSubagents(flags);
+      break;
+    case 'uninstall-sub':
+      await cmdUninstallSub(flags);
       break;
     case 'help':
     case '--help':
