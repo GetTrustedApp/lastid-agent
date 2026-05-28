@@ -84,24 +84,48 @@ export async function provisionSubagent({
 
   const subScope = `${parentScope}-${subagent.slug}`;
 
+  // The OPERATOR-PICKED capabilities are the contract — log them at
+  // provision time so a wrong-caps issue is observable in the log instead
+  // of only showing up later in the issued VC.
+  const desiredCaps = Array.isArray(subagent.capabilities) ? subagent.capabilities : [];
+  process.stderr.write(
+    `[lastid-agent] subagent provisioning: scope=${subScope} caps=${JSON.stringify(desiredCaps)}\n`,
+  );
+
   // Idempotency: if the keychain already has a VC under this sub-scope,
-  // assume a prior sync already provisioned it. The seed is deterministic
-  // so a re-derive would produce the same identity anyway.
+  // check whether the VC's capabilities match what the operator currently
+  // picked. If they match — short-circuit (deterministic seed = same DID;
+  // the VC is still valid). If they DON'T match — the VC was minted with a
+  // stale cap set (e.g. an old self-heal that lacked the picked caps);
+  // re-mint by deleting the keychain entry first so the OID4VCI flow runs
+  // again with the correct caps. The operator's pick is the source of
+  // truth, period.
   const existing = await loadAgentVc(subScope).catch(() => null);
   if (existing && existing.vcCompact) {
+    const existingCaps = readCapabilitiesFromVc(existing.vcCompact);
+    if (capabilitiesEqual(existingCaps, desiredCaps)) {
+      process.stderr.write(
+        `[lastid-agent] subagent already provisioned: scope=${subScope} (caps match)\n`,
+      );
+      // Even on the already-provisioned path, make sure the listener
+      // daemon is alive. A previous successful provision spawned it, but
+      // a host reboot / SIGKILL / stale-version cleanup could have left
+      // the sub-scope without a running listener — ensureListenerRunning
+      // is idempotent and will respawn only when needed.
+      await spawnSubagentListener(subScope);
+      return {
+        ok: true,
+        alreadyProvisioned: true,
+        scope: subScope,
+        agentDid: existing.agentDid,
+      };
+    }
     process.stderr.write(
-      `[lastid-agent] subagent already provisioned: scope=${subScope}\n`,
+      `[lastid-agent] subagent caps drift: scope=${subScope} existing=${JSON.stringify(existingCaps)} desired=${JSON.stringify(desiredCaps)} — re-minting VC\n`,
     );
-    return {
-      ok: true,
-      alreadyProvisioned: true,
-      scope: subScope,
-      agentDid: existing.agentDid,
-    };
+    const { deleteAgentVc } = await import('./keychain.js');
+    await deleteAgentVc(subScope).catch(() => null);
   }
-  process.stderr.write(
-    `[lastid-agent] subagent provisioning: scope=${subScope}\n`,
-  );
 
   const sdk = await initializeSdkBindings();
 
@@ -246,12 +270,108 @@ export async function provisionSubagent({
   process.stderr.write(
     `[lastid-agent] subagent provisioned OK: scope=${subScope} did=${subAgentDid}\n`,
   );
+
+  // 7) Spawn the sub-agent's OWN listener daemon. A sub-agent is just an
+  //    agent — it gets its own running plugin: its own WS to the IdP, its
+  //    own agent-state sync (globals + project memories + records targeted
+  //    at its DID land in its scope's operator-store), its own audit
+  //    chain shipper, its own per-turn memory injection. Without this the
+  //    sub-agent has identity but no brain: no rules synced, no global
+  //    bedrocks, no operator-side updates flow to it.
+  await spawnSubagentListener(subScope);
+
   return {
     ok: true,
     alreadyProvisioned: false,
     scope: subScope,
     agentDid: subAgentDid,
   };
+}
+
+/**
+ * Spawn (or confirm) the sub-agent's own listener daemon. Idempotent —
+ * `ensureListenerRunning` no-ops when a current-version listener is
+ * already alive for this scope. Fail-soft: a spawn failure logs but
+ * never undoes provisioning or breaks the caller.
+ */
+async function spawnSubagentListener(subScope) {
+  try {
+    const { ensureListenerRunning } = await import('./listener-daemon.js');
+    const { fileURLToPath } = await import('node:url');
+    const cliPath = fileURLToPath(new URL('../bin/lastid-agent.js', import.meta.url));
+    const result = await ensureListenerRunning({ scope: subScope, cliPath });
+    process.stderr.write(
+      `[lastid-agent] subagent listener: scope=${subScope} status=${result?.status ?? '?'}${
+        result?.pid ? ` pid=${result.pid}` : ''
+      }\n`,
+    );
+    return result;
+  } catch (err) {
+    process.stderr.write(
+      `[lastid-agent] subagent listener spawn failed (non-fatal): scope=${subScope} err=${err?.message ?? err}\n`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Stop (reap) the sub-agent's listener daemon. Called from the
+ * revoke path so a revoked sub-agent doesn't keep a stray daemon
+ * holding an open WS + draining audits. Best-effort.
+ */
+export async function stopSubagentListener(subScope) {
+  try {
+    const { reapScopeListeners } = await import('./listener-daemon.js');
+    await reapScopeListeners({ scope: subScope, keep: null });
+    process.stderr.write(
+      `[lastid-agent] subagent listener stopped: scope=${subScope}\n`,
+    );
+  } catch (err) {
+    process.stderr.write(
+      `[lastid-agent] subagent listener stop failed (non-fatal): scope=${subScope} err=${err?.message ?? err}\n`,
+    );
+  }
+}
+
+/**
+ * Decode an SD-JWT VC's payload to extract the credentialSubject's
+ * capability list. Returns [] if the VC is unparseable or has no caps.
+ * Used by provisionSubagent's drift-detection to compare what the
+ * existing keychain VC actually grants vs. what the operator currently
+ * has picked. Not a security check (the VC's signature is validated by
+ * the IdP at issuance) — just a content read.
+ */
+function readCapabilitiesFromVc(vcCompact) {
+  try {
+    // SD-JWT format: JWS~disclosure~disclosure~... — we only need the JWS
+    // payload (segment 1 of the JWS).
+    const jwsPart = String(vcCompact).split('~')[0] ?? '';
+    const segs = jwsPart.split('.');
+    if (segs.length !== 3) return [];
+    const payload = JSON.parse(Buffer.from(segs[1], 'base64url').toString('utf-8'));
+    // SD-JWT credentialSubject claims may be top-level on the payload or
+    // nested under `credentialSubject` depending on issuer convention.
+    // Check both.
+    const caps =
+      payload?.capabilities ??
+      payload?.credentialSubject?.capabilities ??
+      [];
+    return Array.isArray(caps) ? caps : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Byte-compare two capability lists (deep equality). Capabilities are
+ * small JSON arrays of {resource, actions[], constraints?[]} — a
+ * canonical-JSON comparison is sufficient and avoids the order-sensitivity
+ * of deep-equal libraries.
+ */
+function capabilitiesEqual(a, b) {
+  const A = Array.isArray(a) ? a : [];
+  const B = Array.isArray(b) ? b : [];
+  return JSON.stringify(A) === JSON.stringify(B);
 }
 
 /**
@@ -295,15 +415,13 @@ export async function selfHealSubagents({
         parentScope,
         subagent: {
           slug: entry.slug,
-          // The applied record's content isn't re-decrypted here — only
-          // the slug + capabilities are needed to rebuild the parent_auth
-          // claims. capabilities were captured on the on-disk index by
-          // installStubSub (via the published content). If the index lacks
-          // them, provisionSubagent treats it as an empty set and the IdP
-          // enforces subset rules.
           name: entry.name,
-          capabilities: [],
-          may_delegate: false,
+          // Read capabilities + may_delegate VERBATIM from the index
+          // entry — those were persisted at apply time from the original
+          // operator-published content. The picker's selection IS the
+          // contract; never default to empty here.
+          capabilities: Array.isArray(entry.capabilities) ? entry.capabilities : [],
+          may_delegate: entry.may_delegate === true,
         },
         fetchImpl,
       });

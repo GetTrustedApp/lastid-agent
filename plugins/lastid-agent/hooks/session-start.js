@@ -26,6 +26,11 @@ import { ensureListenerRunning } from '../lib/listener-daemon.js';
 import { memoryGuidanceLines } from '../lib/memory-guidance.js';
 import { resolveScope } from '../lib/scope.js';
 import { formatCredentialBlock, writeSeenCreds } from '../lib/credential-awareness.js';
+import {
+  formatSubagentBlock,
+  writeSeenSubagents,
+} from '../lib/subagent-awareness.js';
+import { listSubagents } from '../lib/subagents.js';
 
 // This session's agent scope (LASTID_AGENT_SCOPE → 'main') — pins the listener,
 // sync, and memory-setup below to the right identity so one host can run
@@ -118,8 +123,26 @@ try {
   process.stderr.write(`[lastid-agent] vault-list (session-start): ${err.message}\n`);
 }
 
+// Enumerate operator-published subagents so the model sees them at startup
+// (and the REFLEX inside the block fires when a fit-for-purpose helper
+// exists). Seed the per-turn "new subagent" marker so the first turn
+// doesn't re-announce these. Best-effort — empty/missing → no block.
+let subagentsBlock = '';
+try {
+  const entries = await listSubagents(sessionScope);
+  subagentsBlock = formatSubagentBlock(entries);
+  writeSeenSubagents(
+    sessionScope,
+    entries.map((e) => e?.slug).filter(Boolean),
+  );
+} catch (err) {
+  process.stderr.write(
+    `[lastid-agent] listSubagents (session-start): ${err.message}\n`,
+  );
+}
+
 // Provisioned — emit the operating context.
-const context = buildOperatingContext(status, credentialsBlock);
+const context = buildOperatingContext(status, credentialsBlock, subagentsBlock);
 process.stderr.write(
   `[lastid-agent] provisioned: ${status.agent_did}\n`,
 );
@@ -231,7 +254,7 @@ function emit(additionalContext) {
   );
 }
 
-function buildOperatingContext(s, credentialsBlock = '') {
+function buildOperatingContext(s, credentialsBlock = '', subagentsBlock = '') {
   const caps = (s.capabilities ?? [])
     .map((c) => `- ${c.resource}: ${(c.actions ?? []).join(', ')}`)
     .join('\n');
@@ -301,6 +324,7 @@ function buildOperatingContext(s, credentialsBlock = '') {
     '  report it. Do not silently retry with a different credential.',
     '',
     ...(credentialsBlock ? [credentialsBlock, ''] : []),
+    ...(subagentsBlock ? [subagentsBlock, ''] : []),
     '## What lands in the audit chain',
     '',
     'Every tool call you make appends a record to a blake3-linked,',

@@ -333,6 +333,8 @@ export async function installStubSub({
   body,
   claudeTools,
   mcpAllowed,
+  capabilities,
+  mayDelegate,
   mode,
   id,
 }) {
@@ -347,6 +349,12 @@ export async function installStubSub({
   const subScopeDir = scopeDirFor(subScope);
   await mkdir(subScopeDir, { recursive: true });
 
+  // Capabilities are the OPERATOR-PICKED contract — the IdP issues a VC with
+  // exactly these. Persisted on the index so a later listener restart can
+  // replay them verbatim via selfHealSubagents (no defaults, no zeroing).
+  const normalizedCapabilities = Array.isArray(capabilities) ? capabilities : [];
+  const normalizedMayDelegate = mayDelegate === true;
+
   const frontmatter = {
     lastid_version: 1,
     id: typeof id === 'string' && id.length > 0 ? id : makeSubagentId(),
@@ -355,6 +363,8 @@ export async function installStubSub({
     parent_scope: parentScope,
     mode: mode === 'published' ? 'published' : 'stub',
     created_at: new Date().toISOString(),
+    capabilities: normalizedCapabilities,
+    may_delegate: normalizedMayDelegate,
     claude_tools: {
       allowed: Array.isArray(claudeTools?.allowed) ? claudeTools.allowed : [],
       disallowed: Array.isArray(claudeTools?.disallowed) ? claudeTools.disallowed : [],
@@ -373,11 +383,36 @@ export async function installStubSub({
     agent_md_path: agentMdPath,
     body_sha256: sha256Hex(body),
     installed_at: frontmatter.created_at,
+    capabilities: normalizedCapabilities,
+    may_delegate: normalizedMayDelegate,
+    // One-paragraph tagline extracted from the body — used by SessionStart's
+    // subagent-awareness block to give the agent a "when to use this helper"
+    // signal at a glance (parallel to credential-awareness rendering each
+    // vault item's purpose). Capped so the operating context stays compact.
+    brief: extractBrief(body),
     claude_tools: frontmatter.claude_tools,
     mcp_allowed: frontmatter.mcp_allowed,
   };
   await addToIndex(parentScope, entry);
   return entry;
+}
+
+/**
+ * Pull a short, one-paragraph tagline out of the body for SessionStart
+ * surfacing. Takes the first non-empty paragraph (up to the first blank
+ * line) and caps at 280 chars on a word boundary. Falls back to empty
+ * string when the body has no usable opening paragraph.
+ */
+export function extractBrief(body) {
+  if (typeof body !== 'string') return '';
+  const para = body.split(/\n\s*\n/, 1)[0]?.trim() ?? '';
+  if (!para) return '';
+  const single = para.replace(/\s+/g, ' ');
+  if (single.length <= 280) return single;
+  // Cut at the last word boundary before 280 to avoid mid-word truncation.
+  const cut = single.slice(0, 280);
+  const lastSp = cut.lastIndexOf(' ');
+  return (lastSp > 200 ? cut.slice(0, lastSp) : cut).replace(/[,;:]?\s*$/, '') + '…';
 }
 
 /**
@@ -423,6 +458,13 @@ export async function applySubagentRecord({ scope, storeRecord }) {
   const disallowed = Array.isArray(claudeTools.disallowed) ? claudeTools.disallowed : [];
   const mcpAllowed = Array.isArray(content.mcp_allowed) ? content.mcp_allowed : [];
 
+  // Capabilities + may_delegate are the OPERATOR-PICKED contract — pass them
+  // VERBATIM. Persisted on the index so the listener can replay them on
+  // restart (selfHealSubagents) and so any future re-mint uses the exact
+  // same set the operator chose. No defaults.
+  const capabilities = Array.isArray(content.capabilities) ? content.capabilities : [];
+  const mayDelegate = content.may_delegate === true;
+
   // Reuse the stub-install path so a console-published subagent lands at the
   // same on-disk shape (~/.lastid-agent/<parent>-<slug>/agent.md + the parent's
   // subagents.json) as a dev-installed stub. installStubSub is idempotent
@@ -434,6 +476,8 @@ export async function applySubagentRecord({ scope, storeRecord }) {
     body,
     claudeTools: { allowed, disallowed },
     mcpAllowed,
+    capabilities,
+    mayDelegate,
     mode: 'published',
     id: typeof storeRecord.id === 'string' && storeRecord.id.length > 0 ? storeRecord.id : null,
   });
@@ -444,6 +488,16 @@ export async function uninstallSub({ parentScope, slug }) {
   const map = await readIndex(parentScope);
   const entry = map[slug];
   if (!entry) return { ok: false, error: 'not_found' };
+  // Reap the sub-agent's listener daemon BEFORE removing the scope dir —
+  // a daemon holding an open WS + writing to the scope dir would race
+  // the rm and leave half-state behind. Best-effort; the daemon's own
+  // parent-watchdog catches a missed reap on the next host event anyway.
+  try {
+    const { stopSubagentListener } = await import('./subagent-provisioning.js');
+    await stopSubagentListener(entry.scope);
+  } catch {
+    /* best-effort */
+  }
   await removeFromIndex(parentScope, slug);
   try {
     await rm(scopeDirFor(entry.scope), { recursive: true, force: true });
