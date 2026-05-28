@@ -235,33 +235,6 @@ export class PersistentBotMlsClient {
      */
     createGroup(group_id_b64: string): Promise<string>;
     /**
-     * Construct an `MlsOrchestrator` that SHARES this handle's openmls
-     * storage. The orchestrator's internal `PersistentBotMlsClient` is built
-     * on a clone of this handle's `IndexedDbRawKv`; because that backend's
-     * in-memory cache + pending-flush queue + DB handle are all `Arc`-shared,
-     * a write through one is visible to both.
-     *
-     * This is the supported way to obtain an orchestrator in any host that
-     * also calls direct `PersistentBotMlsClient` methods (e.g. the console
-     * dock's `encryptApplicationMessage` send path) — using the free
-     * `createMlsOrchestrator` constructor gives the orchestrator its OWN
-     * `IndexedDbRawKv` instance, whose cache is rehydrated once at open and
-     * then diverges from the handle's cache. The dock would then call into
-     * the handle for send + see a stale cache → `MlsGroup::load` returns
-     * None → "group state not found for id …".
-     *
-     * SYNC (not `async`) on purpose. The body has no `.await` points — it
-     * just clones the (Arc-backed) backend and builds the orchestrator. An
-     * `async fn` here would have wasm-bindgen hold a `borrow()` on the
-     * handle for the full lifetime of the returned Promise, which collides
-     * with any concurrent `&mut self` async method already in flight on
-     * this same handle (e.g. `processInbound` during the dock's
-     * `fetch_queue on connect` fan-out) and panics with "recursive use of
-     * an object detected which would lead to unsafe aliasing in rust" at
-     * app load. Sync borrows only for the synchronous call duration.
-     */
-    createOrchestrator(my_did: string, directory: any, transport: any, host: any): MlsOrchestrator;
-    /**
      * Destroy a group. Returns JSON `DestroyGroupResult`.
      */
     destroyGroup(group_id_b64: string, farewell_plaintext_b64: string): Promise<string>;

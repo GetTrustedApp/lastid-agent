@@ -1,8 +1,12 @@
 /* tslint:disable */
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
-export const __wbg_botmlsclient_free: (a: number, b: number) => void;
 export const __wbg_mlsorchestrator_free: (a: number, b: number) => void;
+export const createMlsOrchestrator: (a: number, b: number, c: number, d: number, e: any, f: any, g: any) => any;
+export const mlsorchestrator_maybeRotateDirectGroup: (a: number, b: number, c: number, d: number, e: number) => any;
+export const mlsorchestrator_reconcileMemberDevices: (a: number, b: number, c: number) => any;
+export const mlsorchestrator_startDirectChat: (a: number, b: number, c: number) => any;
+export const __wbg_botmlsclient_free: (a: number, b: number) => void;
 export const __wbg_persistentbotmlsclient_free: (a: number, b: number) => void;
 export const botmlsclient_addMember: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
 export const botmlsclient_addMembers: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
@@ -28,17 +32,12 @@ export const botmlsclient_snapshotBaseline: (a: number) => [number, number];
 export const botmlsclient_takeDiffJson: (a: number) => [number, number, number, number];
 export const ciphersuiteSupportJson: () => [number, number, number, number];
 export const computeMemberReconcilePlan: (a: number, b: number) => [number, number, number, number];
-export const createMlsOrchestrator: (a: number, b: number, c: number, d: number, e: any, f: any, g: any) => any;
 export const createPersistentBotClient: (a: number, b: number) => any;
-export const mlsorchestrator_maybeRotateDirectGroup: (a: number, b: number, c: number, d: number, e: number) => any;
-export const mlsorchestrator_reconcileMemberDevices: (a: number, b: number, c: number) => any;
-export const mlsorchestrator_startDirectChat: (a: number, b: number, c: number) => any;
 export const persistentbotmlsclient_addMember: (a: number, b: number, c: number, d: number, e: number) => any;
 export const persistentbotmlsclient_addMembers: (a: number, b: number, c: number, d: number, e: number) => any;
 export const persistentbotmlsclient_botDid: (a: number) => [number, number];
 export const persistentbotmlsclient_commitPendingProposals: (a: number, b: number, c: number) => any;
 export const persistentbotmlsclient_createGroup: (a: number, b: number, c: number) => any;
-export const persistentbotmlsclient_createOrchestrator: (a: number, b: number, c: number, d: any, e: any, f: any) => [number, number, number];
 export const persistentbotmlsclient_destroyGroup: (a: number, b: number, c: number, d: number, e: number) => any;
 export const persistentbotmlsclient_encryptApplicationMessage: (a: number, b: number, c: number, d: number, e: number) => any;
 export const persistentbotmlsclient_exportGroupInfo: (a: number, b: number, c: number) => any;
