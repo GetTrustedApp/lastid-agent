@@ -161,6 +161,58 @@ export class MlsOrchestrator {
     free(): void;
     [Symbol.dispose](): void;
     /**
+     * Add a peer to an existing group. Resolves to JSON `AddMemberResult`.
+     */
+    addMember(group_id_b64: string, key_package_b64: string): Promise<any>;
+    /**
+     * Add several peers in ONE commit. `key_packages_b64_json` is a JSON
+     * array of base64 KeyPackages. Resolves to JSON `AddMemberResult`.
+     */
+    addMembers(group_id_b64: string, key_packages_b64_json: string): Promise<any>;
+    /**
+     * Commit every pending queued proposal. Resolves to JSON `CommitResult`.
+     */
+    commitPendingProposals(group_id_b64: string): Promise<any>;
+    /**
+     * Author a fresh group with this client as sole creator. Resolves to
+     * JSON `JoinedGroupInfo`.
+     */
+    createGroup(group_id_b64: string): Promise<any>;
+    /**
+     * Destroy a group (self-remove + farewell). `farewell_plaintext_b64` is
+     * base64. Resolves to JSON `DestroyGroupResult`.
+     */
+    destroyGroup(group_id_b64: string, farewell_plaintext_b64: string): Promise<any>;
+    /**
+     * Encrypt an application message in `group_id_b64`. `plaintext_b64` is
+     * base64; resolves to base64 of the wire payload.
+     */
+    encryptApplicationMessage(group_id_b64: string, plaintext_b64: string): Promise<any>;
+    /**
+     * Export the GroupInfo for a freshly-created group (TLS-serialized
+     * base64) for the IdP `POST /v1/groups` body. Read-only; no flush.
+     */
+    exportGroupInfo(group_id_b64: string): Promise<any>;
+    /**
+     * Explicit flush — drain the pending queue without a new MLS op.
+     * Idempotent; no-op when the queue is empty.
+     */
+    flushPending(): Promise<any>;
+    /**
+     * Wipe local state for a dissolved group. Idempotent.
+     */
+    forgetGroup(group_id_b64: string): Promise<any>;
+    /**
+     * Generate a fresh KeyPackage (base64 TLS-serialized). Flushes before
+     * resolving so the minted private credentials are durable.
+     */
+    generateKeyPackage(): Promise<any>;
+    /**
+     * Current MLS epoch for `group_id_b64`. Read-only — still serialized
+     * under the op-lock so it never reads torn state mid-commit.
+     */
+    groupEpoch(group_id_b64: string): Promise<any>;
+    /**
      * Decide whether a direct group's backing session should be reconciled
      * or rotated. Returns a Promise resolving to
      *   `{ outcome: "noop" | "archive_and_rotate" }`.
@@ -173,6 +225,15 @@ export class MlsOrchestrator {
      */
     maybeRotateDirectGroup(group_id: string, peer_did: string): Promise<any>;
     /**
+     * Process an inbound MLS message. Resolves to JSON `InboundResult`.
+     */
+    processInbound(message_b64: string): Promise<any>;
+    /**
+     * Process an MLS Welcome and join the new group. Resolves to JSON
+     * `JoinedGroupInfo`.
+     */
+    processWelcome(welcome_b64: string): Promise<any>;
+    /**
      * Run one pass of
      * [`lastid_mls_core::reconcile::reconcile_group_device_membership_once`]
      * for `group_id`. Returns a Promise resolving to
@@ -184,6 +245,19 @@ export class MlsOrchestrator {
      * signature.
      */
     reconcileMemberDevices(group_id: string): Promise<any>;
+    /**
+     * Remove a member by leaf index. Resolves to JSON `CommitResult`.
+     */
+    removeMember(group_id_b64: string, member_leaf_index: number): Promise<any>;
+    /**
+     * Discard a locally-prepared-but-not-yet-published commit.
+     */
+    rollbackPendingCommit(group_id_b64: string): Promise<any>;
+    /**
+     * Rotate this client's own leaf without changing membership. Resolves
+     * to JSON `CommitResult`.
+     */
+    selfUpdate(group_id_b64: string): Promise<any>;
     /**
      * Create + finalize a direct chat with `peer_did`. Runs:
      *   1. [`lastid_mls_core::commit_ops::create_and_register_direct_group_shell`]

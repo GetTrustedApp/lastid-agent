@@ -562,6 +562,141 @@ class MlsOrchestrator {
         wasm.__wbg_mlsorchestrator_free(ptr, 0);
     }
     /**
+     * Add a peer to an existing group. Resolves to JSON `AddMemberResult`.
+     * @param {string} group_id_b64
+     * @param {string} key_package_b64
+     * @returns {Promise<any>}
+     */
+    addMember(group_id_b64, key_package_b64) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(key_package_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_addMember(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * Add several peers in ONE commit. `key_packages_b64_json` is a JSON
+     * array of base64 KeyPackages. Resolves to JSON `AddMemberResult`.
+     * @param {string} group_id_b64
+     * @param {string} key_packages_b64_json
+     * @returns {Promise<any>}
+     */
+    addMembers(group_id_b64, key_packages_b64_json) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(key_packages_b64_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_addMembers(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * Commit every pending queued proposal. Resolves to JSON `CommitResult`.
+     * @param {string} group_id_b64
+     * @returns {Promise<any>}
+     */
+    commitPendingProposals(group_id_b64) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_commitPendingProposals(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Author a fresh group with this client as sole creator. Resolves to
+     * JSON `JoinedGroupInfo`.
+     * @param {string} group_id_b64
+     * @returns {Promise<any>}
+     */
+    createGroup(group_id_b64) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_createGroup(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Destroy a group (self-remove + farewell). `farewell_plaintext_b64` is
+     * base64. Resolves to JSON `DestroyGroupResult`.
+     * @param {string} group_id_b64
+     * @param {string} farewell_plaintext_b64
+     * @returns {Promise<any>}
+     */
+    destroyGroup(group_id_b64, farewell_plaintext_b64) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(farewell_plaintext_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_destroyGroup(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * Encrypt an application message in `group_id_b64`. `plaintext_b64` is
+     * base64; resolves to base64 of the wire payload.
+     * @param {string} group_id_b64
+     * @param {string} plaintext_b64
+     * @returns {Promise<any>}
+     */
+    encryptApplicationMessage(group_id_b64, plaintext_b64) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(plaintext_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_encryptApplicationMessage(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * Export the GroupInfo for a freshly-created group (TLS-serialized
+     * base64) for the IdP `POST /v1/groups` body. Read-only; no flush.
+     * @param {string} group_id_b64
+     * @returns {Promise<any>}
+     */
+    exportGroupInfo(group_id_b64) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_exportGroupInfo(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Explicit flush — drain the pending queue without a new MLS op.
+     * Idempotent; no-op when the queue is empty.
+     * @returns {Promise<any>}
+     */
+    flushPending() {
+        const ret = wasm.mlsorchestrator_flushPending(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Wipe local state for a dissolved group. Idempotent.
+     * @param {string} group_id_b64
+     * @returns {Promise<any>}
+     */
+    forgetGroup(group_id_b64) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_forgetGroup(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Generate a fresh KeyPackage (base64 TLS-serialized). Flushes before
+     * resolving so the minted private credentials are durable.
+     * @returns {Promise<any>}
+     */
+    generateKeyPackage() {
+        const ret = wasm.mlsorchestrator_generateKeyPackage(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * Current MLS epoch for `group_id_b64`. Read-only — still serialized
+     * under the op-lock so it never reads torn state mid-commit.
+     * @param {string} group_id_b64
+     * @returns {Promise<any>}
+     */
+    groupEpoch(group_id_b64) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_groupEpoch(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
      * Decide whether a direct group's backing session should be reconciled
      * or rotated. Returns a Promise resolving to
      *   `{ outcome: "noop" | "archive_and_rotate" }`.
@@ -584,6 +719,29 @@ class MlsOrchestrator {
         return ret;
     }
     /**
+     * Process an inbound MLS message. Resolves to JSON `InboundResult`.
+     * @param {string} message_b64
+     * @returns {Promise<any>}
+     */
+    processInbound(message_b64) {
+        const ptr0 = passStringToWasm0(message_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_processInbound(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Process an MLS Welcome and join the new group. Resolves to JSON
+     * `JoinedGroupInfo`.
+     * @param {string} welcome_b64
+     * @returns {Promise<any>}
+     */
+    processWelcome(welcome_b64) {
+        const ptr0 = passStringToWasm0(welcome_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_processWelcome(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
      * Run one pass of
      * [`lastid_mls_core::reconcile::reconcile_group_device_membership_once`]
      * for `group_id`. Returns a Promise resolving to
@@ -600,6 +758,41 @@ class MlsOrchestrator {
         const ptr0 = passStringToWasm0(group_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.mlsorchestrator_reconcileMemberDevices(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Remove a member by leaf index. Resolves to JSON `CommitResult`.
+     * @param {string} group_id_b64
+     * @param {number} member_leaf_index
+     * @returns {Promise<any>}
+     */
+    removeMember(group_id_b64, member_leaf_index) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_removeMember(this.__wbg_ptr, ptr0, len0, member_leaf_index);
+        return ret;
+    }
+    /**
+     * Discard a locally-prepared-but-not-yet-published commit.
+     * @param {string} group_id_b64
+     * @returns {Promise<any>}
+     */
+    rollbackPendingCommit(group_id_b64) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_rollbackPendingCommit(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * Rotate this client's own leaf without changing membership. Resolves
+     * to JSON `CommitResult`.
+     * @param {string} group_id_b64
+     * @returns {Promise<any>}
+     */
+    selfUpdate(group_id_b64) {
+        const ptr0 = passStringToWasm0(group_id_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_selfUpdate(this.__wbg_ptr, ptr0, len0);
         return ret;
     }
     /**
@@ -1554,17 +1747,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 951, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1005, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 774, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 828, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 759, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 813, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb211d42f6d42ba37);
             return ret;
         },
