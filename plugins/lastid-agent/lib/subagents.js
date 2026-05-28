@@ -439,9 +439,16 @@ export async function applySubagentRecord({ scope, storeRecord }) {
   }
   const status = storeRecord.status ?? 'active';
   const content = storeRecord.content ?? {};
-  const slug = typeof content.slug === 'string' ? content.slug : null;
+  // For revoked records there is NO ciphertext (the IdP's tombstone path on
+  // credential revoke carries only metadata + the slug in `tool` as plaintext
+  // routing). Fall back to storeRecord.tool when content.slug is missing so
+  // the IdP-cascaded revoke resolves to the right install. Active records
+  // still require content.slug — they must arrive with ciphertext.
+  const slug =
+    (typeof content.slug === 'string' ? content.slug : null) ??
+    (typeof storeRecord.tool === 'string' ? storeRecord.tool : null);
   if (!slug || !/^[a-z][a-z0-9_-]*$/.test(slug)) {
-    throw new Error('applySubagentRecord: content.slug missing or malformed');
+    throw new Error('applySubagentRecord: slug missing or malformed (content.slug or tool)');
   }
   if (status === 'revoked') {
     // Idempotent: uninstall returns not_found if it's already gone.
@@ -483,18 +490,33 @@ export async function applySubagentRecord({ scope, storeRecord }) {
   });
 }
 
-/** Uninstall a subagent: remove from index, delete its scope dir. */
+/** Uninstall a subagent: remove from index, delete its scope dir + wipe
+ *  the sub-scope's keychain entries (slot_seed, project_root_seed, VC,
+ *  agent_did, idp_url). Revoke means the sub-agent is GONE — no stranded
+ *  identity material left behind in keychain or on disk. */
 export async function uninstallSub({ parentScope, slug }) {
   const map = await readIndex(parentScope);
   const entry = map[slug];
   if (!entry) return { ok: false, error: 'not_found' };
-  // Reap the sub-agent's listener daemon BEFORE removing the scope dir —
-  // a daemon holding an open WS + writing to the scope dir would race
-  // the rm and leave half-state behind. Best-effort; the daemon's own
+  // Reap the sub-agent's listener daemon BEFORE deleting any state — a
+  // daemon holding an open WS + writing to the scope dir would race the
+  // rm and leave half-state behind. Best-effort; the daemon's own
   // parent-watchdog catches a missed reap on the next host event anyway.
   try {
     const { stopSubagentListener } = await import('./subagent-provisioning.js');
     await stopSubagentListener(entry.scope);
+  } catch {
+    /* best-effort */
+  }
+  // Wipe ALL keychain entries for the sub-scope (deleteAgentVc deletes
+  // slot_seed, project_root_seed, slot_index, agent_did, vc, idp_url
+  // under SERVICE_* keys for the given scope). Without this, the VC +
+  // slot_seed + seeds linger in keychain after revoke. Best-effort —
+  // a keychain miss on revoke is not a correctness failure (the entries
+  // become orphan but harmless), but a clean revoke must not leak.
+  try {
+    const { deleteAgentVc } = await import('./keychain.js');
+    await deleteAgentVc(entry.scope);
   } catch {
     /* best-effort */
   }

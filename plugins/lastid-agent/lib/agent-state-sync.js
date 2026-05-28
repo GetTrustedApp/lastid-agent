@@ -72,6 +72,11 @@ export function decodeRecord(record, slotSeed, projectRootSeed = null) {
     target,
     version: Number(record.version) || 0,
     updated_at: record.updated_at ?? null,
+    // The IdP's plaintext routing field. For rules it carries the tool name
+    // the rule binds to; for subagent records it carries the slug, which the
+    // listener needs to resolve a tombstone-driven revoke (a revoke carries
+    // no ciphertext, so without this the slug is unrecoverable here).
+    ...(typeof record.tool === 'string' && record.tool.length > 0 ? { tool: record.tool } : {}),
   };
   if (record.status && record.status !== 'active') {
     return { storeRecord: { ...base, status: record.status }, contentBytes: null };

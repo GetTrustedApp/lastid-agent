@@ -34,6 +34,13 @@ import {
   readSeenCreds,
   writeSeenCreds,
 } from '../lib/credential-awareness.js';
+import {
+  diffNewSubagents,
+  formatSubagentDelta,
+  readSeenSubagents,
+  writeSeenSubagents,
+} from '../lib/subagent-awareness.js';
+import { listSubagents } from '../lib/subagents.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cliPath = join(__dirname, '..', 'bin', 'lastid-agent.js');
@@ -108,7 +115,14 @@ const packetMarkdown = (result.stdout ?? '').trim();
 // effort + local-only (no secret); empty on any failure.
 const credentialDelta = computeCredentialDelta();
 
-const additionalContext = [credentialDelta, packetMarkdown]
+// Subagent-awareness delta: parallel to credentials — if a new sub-agent has
+// landed in the listener's local index since the last turn (operator just
+// published one), flash a compact "new helper available" note so the model
+// recognizes the delegation surface mid-session (not just at session start).
+// Best-effort + local-only; empty on any failure.
+const subagentDelta = await computeSubagentDelta();
+
+const additionalContext = [credentialDelta, subagentDelta, packetMarkdown]
   .filter((s) => s && s.trim().length > 0)
   .join('\n\n');
 if (additionalContext.length === 0) {
@@ -148,6 +162,26 @@ function computeCredentialDelta() {
     if (fresh.length === 0) return '';
     writeSeenCreds(scope, items.map((c) => c?.id).filter(Boolean));
     return formatCredentialDelta(fresh);
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Diff the listener's currently-installed subagents against the
+ * seen-slug marker. Inject a compact "new helper available" note when
+ * an operator publishes a new sub-agent mid-session — same flash
+ * pattern credentials use. Reads listSubagents directly (no CLI hop
+ * needed; the index is local-file). Soft-fail.
+ */
+async function computeSubagentDelta() {
+  try {
+    const scope = resolveScope();
+    const entries = await listSubagents(scope);
+    const fresh = diffNewSubagents(readSeenSubagents(scope), entries);
+    if (fresh.length === 0) return '';
+    writeSeenSubagents(scope, entries.map((e) => e?.slug).filter(Boolean));
+    return formatSubagentDelta(fresh);
   } catch {
     return '';
   }

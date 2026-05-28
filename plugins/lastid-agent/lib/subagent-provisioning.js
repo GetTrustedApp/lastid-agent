@@ -116,14 +116,32 @@ export async function provisionSubagent({
       // sub-scope's keychain. Sub-agents provisioned BEFORE this fix
       // landed never got the seed → their listener can't decrypt
       // global-shared rules + memories. Writing it idempotently here
-      // closes that gap on the next sync without forcing a VC re-mint.
+      // closes that gap WITHOUT forcing a VC re-mint.
+      //
+      // Critical: a running sub-listener daemon LOADED its credentials
+      // at startup. Writing to keychain doesn't refresh the daemon's
+      // in-memory state. So when we add a missing seed, also REAP the
+      // running daemon so its parent-watchdog respawn picks up the
+      // fresh credential bundle on its next startup. Detect "missing
+      // before" by reading the sub-scope's current loaded bundle once.
+      let seedWasMissing = false;
       if (parentProjectRootSeed && Buffer.isBuffer(parentProjectRootSeed)) {
         try {
-          const { persistProjectRootSeed } = await import('./keychain.js');
-          await persistProjectRootSeed(
-            subScope,
-            Buffer.from(parentProjectRootSeed).toString('base64url'),
-          );
+          const existingSubLoaded = await loadAgentVc(subScope).catch(() => null);
+          seedWasMissing = !existingSubLoaded?.projectRootSeed;
+          if (seedWasMissing) {
+            const { persistProjectRootSeed } = await import('./keychain.js');
+            await persistProjectRootSeed(
+              subScope,
+              Buffer.from(parentProjectRootSeed).toString('base64url'),
+            );
+            process.stderr.write(
+              `[lastid-agent] subagent project_root_seed backfilled: scope=${subScope} — respawning listener so it picks up new creds\n`,
+            );
+            // Reap the running daemon. spawnSubagentListener below will
+            // respawn it on the same scope with a fresh credential load.
+            await stopSubagentListener(subScope);
+          }
         } catch (err) {
           process.stderr.write(
             `[lastid-agent] subagent project_root_seed backfill failed (non-fatal): scope=${subScope} err=${err?.message ?? err}\n`,
@@ -134,7 +152,8 @@ export async function provisionSubagent({
       // daemon is alive. A previous successful provision spawned it, but
       // a host reboot / SIGKILL / stale-version cleanup could have left
       // the sub-scope without a running listener — ensureListenerRunning
-      // is idempotent and will respawn only when needed.
+      // is idempotent and will respawn only when needed. If we just
+      // reaped above because of a seed backfill, this respawns it now.
       await spawnSubagentListener(subScope);
       return {
         ok: true,
@@ -152,18 +171,32 @@ export async function provisionSubagent({
 
   const sdk = await initializeSdkBindings();
 
-  // 1) Derive sub-agent seed deterministically from the parent's slot_seed.
-  //    `index = 0` for first instance of this slug; the SDK supports
-  //    multiple indices per slug, but the v1 console flow only allocates
-  //    one — slug is unique within the parent.
+  // 1) Ask the IdP for the next monotonic HKDF index for this
+  //    (parent_agent_did, sub_agent_class) pair. Revoke + re-create
+  //    advances the IdP-side counter so the new sub-agent gets a fresh
+  //    DID rather than reusing the revoked one. The /sub endpoint
+  //    transactionally validates the claimed index, so a stale value
+  //    here returns 409 sub_agent_index_stale (we then refetch + retry).
+  const subAgentIndex = await fetchNextSubagentIndex({
+    idpUrl,
+    parentDid,
+    parentSigningKey,
+    parentVcCompact,
+    subAgentClass: subagent.slug,
+    fetchImpl,
+  });
+
+  // 2) Derive sub-agent seed deterministically from the parent's slot_seed
+  //    + (slug, index). The index participates in the HKDF info so a fresh
+  //    index yields a fresh seed → fresh DID.
   const subSeedBytes = sdk.deriveSubAgentSeed(
     parentSlotSeed,
     subagent.slug,
-    0,
+    subAgentIndex,
   );
   const subagentSeed = Buffer.from(subSeedBytes);
 
-  // 2) Sub-agent keypair from seed (same HKDF path as top-level agents).
+  // 3) Sub-agent keypair from seed (same HKDF path as top-level agents).
   const {
     signingKey: subSigningKey,
     publicJwk: subPublicJwk,
@@ -172,7 +205,7 @@ export async function provisionSubagent({
   const subAgentDid = sdk.agentDidFromPubkey(subPubkeyBytes);
   const subPubkeyJwkThumb = sdk.ed25519JwkThumbprint(subPubkeyBytes);
 
-  // 3) Build parent_authorization claims + sign with parent's key.
+  // 4) Build parent_authorization claims + sign with parent's key.
   //    The parent's signing seed comes from re-deriving the keypair from
   //    its slot_seed; we already have parentSigningKey (KeyObject) for
   //    DPoP, but the WASM signer wants raw bytes — so call the derivation
@@ -185,6 +218,8 @@ export async function provisionSubagent({
   const claims = {
     iss: parentDid,
     sub: subAgentDid,
+    sub_agent_class: subagent.slug,
+    sub_agent_index: subAgentIndex,
     agent_pubkey_jwk_thumb: subPubkeyJwkThumb,
     capabilities: Array.isArray(subagent.capabilities)
       ? subagent.capabilities
@@ -221,6 +256,7 @@ export async function provisionSubagent({
     },
     body: JSON.stringify({
       sub_agent_class: subagent.slug,
+      sub_agent_index: subAgentIndex,
       sub_agent_pubkey_jwk: subPublicJwk,
       capabilities_subset: claims.capabilities,
       may_delegate: claims.may_delegate,
@@ -316,6 +352,48 @@ export async function provisionSubagent({
     scope: subScope,
     agentDid: subAgentDid,
   };
+}
+
+/**
+ * Read the IdP's authoritative next HKDF index for this
+ * (parent_agent_did, sub_agent_class) pair. Authenticated as the parent
+ * agent — same DPoP + VC the /sub call uses. Returns the integer index
+ * the caller MUST bind into both the parent_authorization JWS claims and
+ * the /sub request body. /sub re-checks transactionally; a stale value
+ * here returns sub_agent_index_stale (409) and the caller should refetch.
+ */
+async function fetchNextSubagentIndex({
+  idpUrl,
+  parentDid,
+  parentSigningKey,
+  parentVcCompact,
+  subAgentClass,
+  fetchImpl,
+}) {
+  const url = `${idpUrl}/v1/oid4vci/agent-provision/sub/next-index?sub_agent_class=${encodeURIComponent(subAgentClass)}`;
+  const dpop = mintDpopJwt({
+    agentDid: parentDid,
+    httpMethod: 'GET',
+    httpUri: url,
+    signingKey: parentSigningKey,
+  });
+  const res = await fetchImpl(url, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${parentVcCompact}`,
+      DPoP: dpop,
+      accept: 'application/json',
+    },
+  });
+  if (!res.ok) {
+    const text = typeof res.text === 'function' ? await res.text() : '';
+    throw new Error(`/sub/next-index failed: ${res.status} ${text}`);
+  }
+  const body = await res.json();
+  if (!body || !Number.isInteger(body.next_index) || body.next_index < 0) {
+    throw new Error(`/sub/next-index returned unexpected shape: ${JSON.stringify(body)}`);
+  }
+  return body.next_index;
 }
 
 /**

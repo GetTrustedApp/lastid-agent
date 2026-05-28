@@ -46,14 +46,20 @@ export function formatSubagentBlock(entries) {
   }
   lines.push('');
   lines.push(
-    'REFLEX: about to do a recurring chore one of these helpers was built for —',
-    'run tests across repos, scan logs, summarize a diff, work in a specific',
-    'sub-repo someone authored a helper for? CHECK this list FIRST. If a helper',
-    'matches the work, invoke it via `lastid_invoke_subagent({slug, input})`',
-    'instead of doing it inline. The operator signed those helpers with intent;',
-    'using them honors that intent, keeps your context clean, and lands the',
-    "work under the helper's OWN DID in the audit chain. Doing it yourself",
-    'when a fit-for-purpose helper exists ignores the operator\'s setup.',
+    'REFLEX — read this every turn. BEFORE you run any of these inline:',
+    '  - `npm test` / `vitest` / `jest`',
+    '  - `cargo test` / `cargo check` / `cargo clippy`',
+    '  - `tsc` / `eslint` / `ruff` / `pytest`',
+    '  - log scans, repeated greps for the same pattern, PR diff summaries,',
+    '    any recurring chore a helper above was clearly built for',
+    'CHECK the helper list above. If a helper matches the work, you MUST',
+    'invoke it via `lastid_invoke_subagent({slug, input})` instead of running',
+    'inline. Running inline when a fit-for-purpose, operator-signed helper',
+    'exists is a REFLEX VIOLATION — it flouts the operator\'s setup, leaves no',
+    'audit attribution under the helper\'s DID, and floods your context with',
+    'stdout the helper would have summarized. The operator built the helper',
+    'so you would delegate; not delegating tells them their work was wasted.',
+    'No exceptions for "just this one quick run."',
   );
   return lines.join('\n');
 }
