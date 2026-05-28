@@ -62,6 +62,15 @@ export async function initializeSdkBindings() {
       return wasm.verifyEd25519(pubkeyBytes, payload, signature);
     },
 
+    // ── Parent-authorization JWS (parent agent → sub-agent issuance) ──
+    // Compact JWS signed with the parent's existing Ed25519 agent signing
+    // key. Used by the listener when it acts as issuer for an operator-
+    // published sub-agent. Mirrors sign_human_authorization but EdDSA,
+    // verified by the IdP against the parent's VC cnf.jwk.
+    signParentAuthorization(signingKeyBytes, kid, claimsJson) {
+      return wasm.signParentAuthorization(signingKeyBytes, kid ?? undefined, claimsJson);
+    },
+
     // ── SessionFingerprint (agent-signed env claim) ────────────────
     // The wasm side canonicalizes via serde_json_canonicalizer (single
     // source of canonical bytes — no JS reimplementation, no drift).

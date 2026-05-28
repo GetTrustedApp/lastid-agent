@@ -746,6 +746,22 @@ export function sdkVaultSyncEncrypt(payload: Uint8Array): Promise<string>;
 export function signEd25519(signing_key_bytes: Uint8Array, payload: Uint8Array): Uint8Array;
 
 /**
+ * Sign a compact JWS authorizing a sub-agent VC issuance. Used by
+ * the parent agent's listener when it acts as issuer for an
+ * operator-published sub-agent. Mirrors `sign_human_authorization`
+ * but Ed25519 (the parent's existing agent signing key).
+ *
+ * `signing_key_bytes` — the parent agent's 32-byte Ed25519 secret
+ * (`AgentKeypair::signing_key().to_bytes()`). `claims_json` — a
+ * JSON-serialized claims object the IdP will verify (`iss`, `sub`,
+ * `agent_pubkey_jwk_thumb`, `capabilities`, `may_delegate`, `iat`,
+ * `exp`, `jti`). Pass `kid` to include a key id in the header
+ * (optional; the IdP resolves the verifying key from the parent VC's
+ * `cnf.jwk` regardless).
+ */
+export function signParentAuthorization(signing_key_bytes: Uint8Array, kid: string | null | undefined, claims_json: string): string;
+
+/**
  * Sign a SessionFingerprint with the agent's Ed25519 signing key.
  * Plugin path: SessionStart hook builds the unsigned fingerprint
  * (session_id, agent_did, project, timestamps, optional

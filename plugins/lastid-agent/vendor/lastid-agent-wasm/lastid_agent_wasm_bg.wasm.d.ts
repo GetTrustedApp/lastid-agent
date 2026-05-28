@@ -69,6 +69,7 @@ export const sdkVaultPutItem: (a: number, b: number) => any;
 export const sdkVaultSyncDecrypt: (a: number, b: number) => any;
 export const sdkVaultSyncEncrypt: (a: number, b: number) => any;
 export const signEd25519: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+export const signParentAuthorization: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const signSessionFingerprint: (a: number, b: number, c: any) => [number, number, number];
 export const verifiedagentvcjs_claims: (a: number) => any;
 export const verifiedagentvcjs_humanAuthorizationVerified: (a: number) => number;

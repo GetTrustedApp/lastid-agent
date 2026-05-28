@@ -28,6 +28,7 @@ import {
   uninstallSub,
   invokeSubagent,
   applySubagentRecord,
+  mcpConfigForSubagent,
 } from '../lib/subagents.js';
 
 // ── Pure layer ────────────────────────────────────────────────────────
@@ -112,6 +113,55 @@ test('buildSpawnArgs: produces the right argv + scope env (input via stdin, NOT 
   assert.equal(out.env.LASTID_AGENT_SCOPE, 'main-echobot');
   assert.equal(out.env.PATH, '/usr/bin'); // parent env carried through
   assert.equal(out.env.SOMETHING_ELSE, 'kept');
+});
+
+test('buildSpawnArgs: injects --mcp-config + --strict-mcp-config when mcpConfigPath given', () => {
+  const out = buildSpawnArgs({
+    subagent: { slug: 'echobot', scope: 'main-echobot', claude_tools: {} },
+    systemPromptPath: '/tmp/sys.md',
+    mcpConfigPath: '/tmp/mcp-123.json',
+    parentEnv: {},
+  });
+  const i = out.args.indexOf('--mcp-config');
+  assert.notEqual(i, -1, '--mcp-config flag present');
+  assert.equal(out.args[i + 1], '/tmp/mcp-123.json');
+  assert.ok(
+    out.args.includes('--strict-mcp-config'),
+    '--strict-mcp-config present so only the injected server is loaded',
+  );
+});
+
+test('buildSpawnArgs: omits MCP flags when mcpConfigPath is missing/empty', () => {
+  const out = buildSpawnArgs({
+    subagent: { slug: 'x', scope: 'main-x', claude_tools: {} },
+    systemPromptPath: '/tmp/sys.md',
+    parentEnv: {},
+  });
+  assert.equal(out.args.includes('--mcp-config'), false);
+  assert.equal(out.args.includes('--strict-mcp-config'), false);
+
+  const outEmpty = buildSpawnArgs({
+    subagent: { slug: 'x', scope: 'main-x', claude_tools: {} },
+    systemPromptPath: '/tmp/sys.md',
+    mcpConfigPath: '',
+    parentEnv: {},
+  });
+  assert.equal(outEmpty.args.includes('--mcp-config'), false);
+  assert.equal(outEmpty.args.includes('--strict-mcp-config'), false);
+});
+
+test('mcpConfigForSubagent: returns the canonical lastid-agent server entry', () => {
+  const cfg = mcpConfigForSubagent();
+  assert.ok(cfg.mcpServers, 'has mcpServers map');
+  assert.ok(cfg.mcpServers['lastid-agent'], 'registers lastid-agent server');
+  const srv = cfg.mcpServers['lastid-agent'];
+  assert.equal(srv.command, 'node');
+  assert.equal(srv.type, 'stdio');
+  assert.ok(Array.isArray(srv.args), 'args is array');
+  assert.equal(srv.args.length, 2);
+  // First arg = absolute path to bin/lastid-agent.js; second arg = 'serve'.
+  assert.match(srv.args[0], /bin\/lastid-agent\.js$/);
+  assert.equal(srv.args[1], 'serve');
 });
 
 test('buildSpawnArgs: omits tool flags when arrays are empty/missing', () => {

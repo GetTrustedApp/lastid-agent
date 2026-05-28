@@ -28,9 +28,20 @@
 
 import { mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID, randomBytes } from 'node:crypto';
+
+// Absolute path to the plugin's own MCP server entry. Resolved at
+// load time from this module's location so it's stable across cwd
+// changes. We pass this into the spawned subagent's --mcp-config so
+// the child Claude Code session gets the SAME lastid-agent MCP
+// server the parent has — capabilities + rules + vault all enforced
+// uniformly. See `mcpConfigForSubagent` below.
+const PLUGIN_MCP_SERVER_PATH = fileURLToPath(
+  new URL('../bin/lastid-agent.js', import.meta.url),
+);
 
 // ── Pure layer ───────────────────────────────────────────────────────────
 
@@ -161,7 +172,7 @@ function parseScalar(raw) {
  * starting with `-` at the boundary, in case a future refactor reintroduces
  * a positional path before this comment gets read.
  */
-export function buildSpawnArgs({ subagent, systemPromptPath, parentEnv }) {
+export function buildSpawnArgs({ subagent, systemPromptPath, parentEnv, mcpConfigPath }) {
   const args = [
     '--print',
     '--verbose',
@@ -170,6 +181,17 @@ export function buildSpawnArgs({ subagent, systemPromptPath, parentEnv }) {
     '--output-format',
     'stream-json',
   ];
+  // MCP injection: when the caller wrote a one-off .mcp.json (the live
+  // invoke path), inject ONLY the lastid-agent server — no operator-
+  // machine MCP bleed. `--strict-mcp-config` makes the child ignore
+  // any other .mcp.json that might be discovered up the tree. Result:
+  // the subagent has the SAME LastID tool surface its parent does
+  // (vault_use, http_fetch, lastid_memory_*, lastid_send_message,
+  // lastid_invoke_subagent if may_delegate), all capability-gated by
+  // its own VC. Without this the subagent sees only Claude built-ins.
+  if (typeof mcpConfigPath === 'string' && mcpConfigPath.length > 0) {
+    args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config');
+  }
   const allowed = subagent.claude_tools?.allowed;
   const disallowed = subagent.claude_tools?.disallowed;
   if (Array.isArray(allowed) && allowed.length > 0) {
@@ -182,6 +204,29 @@ export function buildSpawnArgs({ subagent, systemPromptPath, parentEnv }) {
     cmd: 'claude',
     args,
     env: { ...(parentEnv ?? {}), LASTID_AGENT_SCOPE: subagent.scope },
+  };
+}
+
+/**
+ * Return the in-memory `.mcp.json` content that registers ONLY the
+ * lastid-agent MCP server, pointed at this plugin's own server entry.
+ * `invokeSubagent` writes this to a tempfile and passes the path to
+ * `claude --mcp-config`; with `--strict-mcp-config` the child sees
+ * exactly this server + nothing else (no ambient operator config).
+ *
+ * The plugin's own `.mcp.json` uses `${CLAUDE_PLUGIN_ROOT}` for
+ * portability; we resolve it absolutely here (PLUGIN_MCP_SERVER_PATH)
+ * so the spawned child doesn't need that env var set.
+ */
+export function mcpConfigForSubagent() {
+  return {
+    mcpServers: {
+      'lastid-agent': {
+        command: 'node',
+        args: [PLUGIN_MCP_SERVER_PATH, 'serve'],
+        type: 'stdio',
+      },
+    },
   };
 }
 
@@ -448,6 +493,17 @@ export async function invokeSubagent({
   const sysPromptPath = join(tmpdir(), `lastid-subagent-${randomUUID()}.md`);
   await writeFile(sysPromptPath, parsed.body, 'utf-8');
 
+  // One-off .mcp.json registering ONLY the lastid-agent server — so
+  // the spawned child sees the same MCP tool surface the parent has
+  // (and nothing else, via --strict-mcp-config). Written next to the
+  // system prompt; cleaned up below in the same finally-shaped path.
+  const mcpConfigPath = join(tmpdir(), `lastid-subagent-mcp-${randomUUID()}.json`);
+  await writeFile(
+    mcpConfigPath,
+    JSON.stringify(mcpConfigForSubagent(), null, 2),
+    'utf-8',
+  );
+
   const subagent = {
     slug: entry.slug,
     scope: entry.scope,
@@ -456,6 +512,7 @@ export async function invokeSubagent({
   const { cmd, args, env } = buildSpawnArgs({
     subagent,
     systemPromptPath: sysPromptPath,
+    mcpConfigPath,
     parentEnv,
   });
 
@@ -519,6 +576,7 @@ export async function invokeSubagent({
 
   // Cleanup temp system prompt file (best-effort).
   try { await rm(sysPromptPath, { force: true }); } catch { /* */ }
+  try { await rm(mcpConfigPath, { force: true }); } catch { /* */ }
 
   const durationMs = Date.now() - startedAt;
   return {

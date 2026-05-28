@@ -299,6 +299,31 @@ export async function syncAgentState({
         // when this kind isn't in the batch (most syncs).
         const { applySubagentRecord } = await import('./subagents.js');
         await applySubagentRecord({ scope, storeRecord });
+
+        // For ACTIVE records, also mint the sub-agent's identity (DID +
+        // VC). Idempotent: short-circuits if keychain already has a VC
+        // for the sub-scope. Fail-soft — a provisioning error logs but
+        // doesn't break the sync loop or other kinds. The disk scope is
+        // already written above, so even if provisioning fails the
+        // operator sees the helper listed (with an empty VC); a future
+        // sync re-attempts.
+        if (storeRecord.status === 'active' && storeRecord.content?.slug) {
+          try {
+            const { provisionSubagent } = await import('./subagent-provisioning.js');
+            await provisionSubagent({
+              idpUrl,
+              parentSlotSeed: slotSeed,
+              parentSigningKey: signingKey,
+              parentDid: agentDid,
+              parentVcCompact: vcCompact,
+              parentScope: scope,
+              subagent: storeRecord.content,
+              fetchImpl,
+            });
+          } catch (err) {
+            safely(onReject, rec, `provision subagent: ${err?.message ?? err}`);
+          }
+        }
       } catch (err) {
         safely(onReject, rec, `apply subagent: ${err?.message ?? err}`);
       }
