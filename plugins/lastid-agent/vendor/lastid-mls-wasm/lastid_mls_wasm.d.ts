@@ -249,8 +249,18 @@ export class PersistentBotMlsClient {
      * then diverges from the handle's cache. The dock would then call into
      * the handle for send + see a stale cache → `MlsGroup::load` returns
      * None → "group state not found for id …".
+     *
+     * SYNC (not `async`) on purpose. The body has no `.await` points — it
+     * just clones the (Arc-backed) backend and builds the orchestrator. An
+     * `async fn` here would have wasm-bindgen hold a `borrow()` on the
+     * handle for the full lifetime of the returned Promise, which collides
+     * with any concurrent `&mut self` async method already in flight on
+     * this same handle (e.g. `processInbound` during the dock's
+     * `fetch_queue on connect` fan-out) and panics with "recursive use of
+     * an object detected which would lead to unsafe aliasing in rust" at
+     * app load. Sync borrows only for the synchronous call duration.
      */
-    createOrchestrator(my_did: string, directory: any, transport: any, host: any): Promise<MlsOrchestrator>;
+    createOrchestrator(my_did: string, directory: any, transport: any, host: any): MlsOrchestrator;
     /**
      * Destroy a group. Returns JSON `DestroyGroupResult`.
      */

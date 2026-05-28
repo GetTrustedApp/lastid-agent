@@ -38,7 +38,7 @@ export const persistentbotmlsclient_addMembers: (a: number, b: number, c: number
 export const persistentbotmlsclient_botDid: (a: number) => [number, number];
 export const persistentbotmlsclient_commitPendingProposals: (a: number, b: number, c: number) => any;
 export const persistentbotmlsclient_createGroup: (a: number, b: number, c: number) => any;
-export const persistentbotmlsclient_createOrchestrator: (a: number, b: number, c: number, d: any, e: any, f: any) => any;
+export const persistentbotmlsclient_createOrchestrator: (a: number, b: number, c: number, d: any, e: any, f: any) => [number, number, number];
 export const persistentbotmlsclient_destroyGroup: (a: number, b: number, c: number, d: number, e: number) => any;
 export const persistentbotmlsclient_encryptApplicationMessage: (a: number, b: number, c: number, d: number, e: number) => any;
 export const persistentbotmlsclient_exportGroupInfo: (a: number, b: number, c: number) => any;

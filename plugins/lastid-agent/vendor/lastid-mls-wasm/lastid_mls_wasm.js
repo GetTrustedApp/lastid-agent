@@ -740,17 +740,30 @@ class PersistentBotMlsClient {
      * then diverges from the handle's cache. The dock would then call into
      * the handle for send + see a stale cache → `MlsGroup::load` returns
      * None → "group state not found for id …".
+     *
+     * SYNC (not `async`) on purpose. The body has no `.await` points — it
+     * just clones the (Arc-backed) backend and builds the orchestrator. An
+     * `async fn` here would have wasm-bindgen hold a `borrow()` on the
+     * handle for the full lifetime of the returned Promise, which collides
+     * with any concurrent `&mut self` async method already in flight on
+     * this same handle (e.g. `processInbound` during the dock's
+     * `fetch_queue on connect` fan-out) and panics with "recursive use of
+     * an object detected which would lead to unsafe aliasing in rust" at
+     * app load. Sync borrows only for the synchronous call duration.
      * @param {string} my_did
      * @param {any} directory
      * @param {any} transport
      * @param {any} host
-     * @returns {Promise<MlsOrchestrator>}
+     * @returns {MlsOrchestrator}
      */
     createOrchestrator(my_did, directory, transport, host) {
         const ptr0 = passStringToWasm0(my_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.persistentbotmlsclient_createOrchestrator(this.__wbg_ptr, ptr0, len0, directory, transport, host);
-        return ret;
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return MlsOrchestrator.__wrap(ret[0]);
     }
     /**
      * Destroy a group. Returns JSON `DestroyGroupResult`.
@@ -1467,17 +1480,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 921, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 911, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 744, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 734, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 729, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 719, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb211d42f6d42ba37);
             return ret;
         },
