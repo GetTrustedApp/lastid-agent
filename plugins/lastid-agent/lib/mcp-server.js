@@ -142,7 +142,7 @@ const PLUGIN_TOOLS = [
   {
     name: 'lastid_invoke_subagent',
     description:
-      "Invoke one of your subagents (find its slug via `lastid_list_subagents`). Spawns a fresh Claude session bound to the subagent's scope + system prompt, passes `input` as the user prompt, and returns the subagent's final assistant text. Use for delegated work where the subagent has tools/grants/capabilities scoped narrower (or sometimes broader) than yours — e.g. operator authored a Deploy Bot with `gh` access you don't have. The subagent's calls are logged under ITS DID in the audit chain, cross-referenced to your invocation. Default timeout 5min; opts.timeout_ms overrides.",
+      "Invoke one of your subagents (find its slug via `lastid_list_subagents`). Spawns a fresh Claude session bound to the subagent's scope + system prompt, passes `input` as the user prompt, and returns the subagent's final assistant text. Use for delegated work where the subagent has tools/grants/capabilities scoped narrower (or sometimes broader) than yours — e.g. operator authored a Deploy Bot with `gh` access you don't have. The subagent's calls are logged under ITS DID in the audit chain, cross-referenced to your invocation. Default timeout 5min; opts.timeout_ms overrides. Pass `background: true` to return immediately with an invocation_id while the helper runs detached — useful for long jobs (test suites, builds) so the parent conversation isn't blocked. Poll the result with `lastid_subagent_result({invocation_id})` or scan running ones with `lastid_subagent_list_running()`.",
     requiredCapability: null,
     inputSchema: {
       type: 'object',
@@ -150,8 +150,36 @@ const PLUGIN_TOOLS = [
         slug: { type: 'string', description: 'Subagent slug from `lastid_list_subagents`.' },
         input: { type: 'string', description: 'What you want the subagent to do — passed verbatim as its user prompt.' },
         timeout_ms: { type: 'integer', minimum: 1000, maximum: 30 * 60_000, description: 'Optional override; default 5 minutes.' },
+        background: { type: 'boolean', description: "Return immediately with an invocation_id while the helper runs detached. Defaults to false (blocking)." },
       },
       required: ['slug', 'input'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'lastid_subagent_result',
+    description:
+      "Read the state of a backgrounded subagent invocation (started via `lastid_invoke_subagent({background:true})`). Returns the current snapshot: `status` ('running' / 'completed' / 'errored'), and on completion the full `text` + `audit` + `duration_ms`. Returns null when the invocation_id is unknown to this scope (never started here, or pruned after 24h).",
+    requiredCapability: null,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        invocation_id: { type: 'string', description: 'The id returned by the original `lastid_invoke_subagent({background:true})` call.' },
+      },
+      required: ['invocation_id'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'lastid_subagent_list_running',
+    description:
+      "List backgrounded subagent invocations under this agent. Returns only those currently `status:'running'` by default — pass `include_all:true` to also see recently-completed/errored ones (within 24h). Use this to discover what helpers are still pending before assuming they're done.",
+    requiredCapability: null,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        include_all: { type: 'boolean', description: 'Also return completed/errored invocations within the retention window. Default false.' },
+      },
       additionalProperties: false,
     },
   },
@@ -450,6 +478,7 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
     const slug = typeof _args?.slug === 'string' ? _args.slug : '';
     const input = typeof _args?.input === 'string' ? _args.input : '';
     const timeoutMs = Number.isInteger(_args?.timeout_ms) ? _args.timeout_ms : undefined;
+    const background = _args?.background === true;
     if (!slug) throw new Error('lastid_invoke_subagent: slug required');
     if (!input) throw new Error('lastid_invoke_subagent: input required');
     // SECURITY: defense-in-depth against argv flag smuggling. The current
@@ -478,12 +507,37 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
       timeoutMs,
       parentEnv: process.env,
       log,
+      background,
     });
     // Audit chain hookup is deferred — landing the spawn pipeline first.
     // The invokeSubagent return already carries an `audit` object with
     // hashes + scope info; downstream chain integration reads from there.
     return {
       content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+    };
+  }
+
+  if (name === 'lastid_subagent_result') {
+    const invocationId = typeof _args?.invocation_id === 'string' ? _args.invocation_id : '';
+    if (!invocationId) throw new Error('lastid_subagent_result: invocation_id required');
+    const { readSubagentInvocation } = await import('./subagents.js');
+    const state = await readSubagentInvocation({ parentScope: scope, invocationId });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(state ?? { invocation_id: invocationId, status: 'unknown' }, null, 2),
+        },
+      ],
+    };
+  }
+
+  if (name === 'lastid_subagent_list_running') {
+    const includeAll = _args?.include_all === true;
+    const { listRunningSubagentInvocations } = await import('./subagents.js');
+    const items = await listRunningSubagentInvocations({ parentScope: scope, includeAll });
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ invocations: items }, null, 2) }],
     };
   }
 
@@ -858,6 +912,86 @@ function startInboxChannel({ server, scope }) {
   return timer;
 }
 
+/**
+ * Push a `notifications/claude/channel` the moment a backgrounded
+ * subagent invocation transitions from `running` to terminal
+ * (`completed` / `errored`). Without this, the parent agent only learns
+ * by polling `lastid_subagent_result` — fine when the parent is actively
+ * waiting, terrible when the parent moved on and would otherwise sit
+ * idle. This loop closes the loop with no per-turn polling cost.
+ *
+ * Strategy: in-memory seen-set of invocation_ids we've already notified
+ * about. Every POLL_MS we list ALL invocations (including terminal via
+ * `includeAll: true`) and push one notification per fresh terminal id.
+ * Seed the seen-set with any terminal entries present at startup so we
+ * don't re-notify on prior runs. Best-effort throughout.
+ */
+function startSubagentCompletionChannel({ server, scope }) {
+  const POLL_MS = 2_000;
+  const notified = new Set();
+  let busy = false;
+  let seeded = false;
+  const timer = setInterval(() => {
+    if (busy) return;
+    busy = true;
+    void (async () => {
+      try {
+        const { listRunningSubagentInvocations } = await import('./subagents.js');
+        const all = await listRunningSubagentInvocations({
+          parentScope: scope,
+          includeAll: true,
+        });
+        // First tick: seed the seen-set with whatever's already terminal —
+        // those landed before this server booted (or in a prior session),
+        // so a notification now would just be noise.
+        if (!seeded) {
+          for (const inv of all) {
+            if (inv.status === 'completed' || inv.status === 'errored') {
+              notified.add(inv.invocation_id);
+            }
+          }
+          seeded = true;
+          return;
+        }
+        for (const inv of all) {
+          if (!inv?.invocation_id) continue;
+          if (inv.status !== 'completed' && inv.status !== 'errored') continue;
+          if (notified.has(inv.invocation_id)) continue;
+          notified.add(inv.invocation_id);
+          const outcome = inv.status === 'completed' && inv.ok !== false
+            ? 'completed'
+            : 'errored';
+          const dur = typeof inv.duration_ms === 'number'
+            ? ` in ${(inv.duration_ms / 1000).toFixed(1)}s`
+            : '';
+          await server.notification({
+            method: 'notifications/claude/channel',
+            params: {
+              content:
+                `Sub-agent **${inv.slug ?? 'helper'}** ${outcome}${dur}. ` +
+                `Read the result with ` +
+                `\`lastid_subagent_result({invocation_id: "${inv.invocation_id}"})\`.`,
+              meta: {
+                invocation_id: inv.invocation_id,
+                slug: inv.slug ?? '',
+                status: inv.status,
+              },
+            },
+          });
+        }
+      } catch (err) {
+        process.stderr.write(
+          `[lastid-agent] subagent completion push failed: ${err?.message ?? err}\n`,
+        );
+      } finally {
+        busy = false;
+      }
+    })();
+  }, POLL_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
+
 export async function runMcpServer({ scope = 'main', http = null } = {}) {
   // Before binding our transport, reap any serve left running on an OLDER
   // plugin version (a prior session's process the runtime didn't reap on
@@ -873,6 +1007,10 @@ export async function runMcpServer({ scope = 'main', http = null } = {}) {
     // — that's the one bound to an interactive agent session that can
     // receive pushed notifications.
     startInboxChannel({ server, scope });
+    // Same transport: notify the agent the moment a backgrounded
+    // subagent completes, so it doesn't have to poll. Stdio-only for the
+    // same reason — only interactive sessions can receive pushes.
+    startSubagentCompletionChannel({ server, scope });
     return;
   }
   const [hostIn, portIn] = http.split(':');

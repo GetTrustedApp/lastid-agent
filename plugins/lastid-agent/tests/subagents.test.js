@@ -29,6 +29,8 @@ import {
   invokeSubagent,
   applySubagentRecord,
   mcpConfigForSubagent,
+  readSubagentInvocation,
+  listRunningSubagentInvocations,
 } from '../lib/subagents.js';
 
 // ── Pure layer ────────────────────────────────────────────────────────
@@ -491,4 +493,120 @@ test('applySubagentRecord: NEGATIVE — missing scope/storeRecord rejected', asy
     /scope required/,
   );
   await assert.rejects(applySubagentRecord({ scope: 'main' }), /storeRecord required/);
+});
+
+// ── Backgrounded-invocation state files ──────────────────────────────
+//
+// readSubagentInvocation / listRunningSubagentInvocations operate on
+// `~/.lastid-agent/<parent-scope>/subagent-invocations/<id>.json`. The
+// tmpHome fixture above redirects $HOME so these tests don't touch the
+// operator's real agent dir. We seed state files directly (no real
+// spawn) so we can assert listing/filtering/pruning behavior cleanly.
+
+import { mkdir as fsMkdir, writeFile as fsWriteFile } from 'node:fs/promises';
+
+async function seedInvocation(scope, id, state) {
+  const dir = join(tmpHome, '.lastid-agent', scope, 'subagent-invocations');
+  await fsMkdir(dir, { recursive: true });
+  await fsWriteFile(join(dir, `${id}.json`), JSON.stringify(state, null, 2), 'utf-8');
+}
+
+test('readSubagentInvocation: returns the state when the file exists', async () => {
+  await seedInvocation('main', 'bg-1', {
+    status: 'running',
+    invocation_id: 'bg-1',
+    slug: 'testy',
+    started_at: new Date().toISOString(),
+  });
+  const state = await readSubagentInvocation({ parentScope: 'main', invocationId: 'bg-1' });
+  assert.equal(state?.status, 'running');
+  assert.equal(state?.invocation_id, 'bg-1');
+  assert.equal(state?.slug, 'testy');
+});
+
+test('readSubagentInvocation: NEGATIVE — null when missing (unknown id / pruned)', async () => {
+  const state = await readSubagentInvocation({
+    parentScope: 'main',
+    invocationId: 'nonexistent',
+  });
+  assert.equal(state, null);
+});
+
+test('readSubagentInvocation: NEGATIVE — required args throw', async () => {
+  await assert.rejects(
+    readSubagentInvocation({ invocationId: 'x' }),
+    /parentScope \+ invocationId required/,
+  );
+  await assert.rejects(
+    readSubagentInvocation({ parentScope: 'main' }),
+    /parentScope \+ invocationId required/,
+  );
+});
+
+test('listRunningSubagentInvocations: empty when no directory yet', async () => {
+  const items = await listRunningSubagentInvocations({ parentScope: 'never-spawned' });
+  assert.deepEqual(items, []);
+});
+
+test('listRunningSubagentInvocations: returns ONLY running by default', async () => {
+  const now = new Date().toISOString();
+  await seedInvocation('main-filter', 'r-1', {
+    status: 'running', invocation_id: 'r-1', slug: 'a', started_at: now,
+  });
+  await seedInvocation('main-filter', 'r-2', {
+    status: 'running', invocation_id: 'r-2', slug: 'b', started_at: now,
+  });
+  await seedInvocation('main-filter', 'done-1', {
+    status: 'completed', invocation_id: 'done-1', slug: 'c', started_at: now,
+    audit: { completed_at: now },
+  });
+  const running = await listRunningSubagentInvocations({ parentScope: 'main-filter' });
+  assert.equal(running.length, 2);
+  assert.ok(running.every((r) => r.status === 'running'));
+});
+
+test('listRunningSubagentInvocations: include_all also returns terminal', async () => {
+  const now = new Date().toISOString();
+  await seedInvocation('main-all', 'r-1', {
+    status: 'running', invocation_id: 'r-1', slug: 'a', started_at: now,
+  });
+  await seedInvocation('main-all', 'done-1', {
+    status: 'completed', invocation_id: 'done-1', slug: 'b', started_at: now,
+    audit: { completed_at: now },
+  });
+  const all = await listRunningSubagentInvocations({
+    parentScope: 'main-all',
+    includeAll: true,
+  });
+  assert.equal(all.length, 2);
+});
+
+test('listRunningSubagentInvocations: prunes terminal files older than 24h', async () => {
+  const fresh = new Date().toISOString();
+  const stale = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+  await seedInvocation('main-prune', 'r-1', {
+    status: 'running', invocation_id: 'r-1', slug: 'a', started_at: fresh,
+  });
+  await seedInvocation('main-prune', 'old-1', {
+    status: 'completed', invocation_id: 'old-1', slug: 'b', started_at: stale,
+    audit: { completed_at: stale },
+  });
+  // The default-running listing skips terminal entries anyway — but the
+  // pruning happens BEFORE the filter, and we can observe via include_all
+  // that the stale file is gone on the next read.
+  await listRunningSubagentInvocations({ parentScope: 'main-prune' });
+  const all = await listRunningSubagentInvocations({
+    parentScope: 'main-prune',
+    includeAll: true,
+  });
+  // old-1 pruned; only r-1 remains.
+  assert.equal(all.length, 1);
+  assert.equal(all[0].invocation_id, 'r-1');
+});
+
+test('listRunningSubagentInvocations: NEGATIVE — missing parentScope throws', async () => {
+  await assert.rejects(
+    listRunningSubagentInvocations({}),
+    /parentScope required/,
+  );
 });

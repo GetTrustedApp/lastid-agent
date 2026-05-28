@@ -26,8 +26,8 @@
  *     installStubSub, listSubagents, invokeSubagent (spawns child claude).
  */
 
-import { mkdir, readFile, writeFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, writeFile, rm, readdir } from 'node:fs/promises';
+import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
@@ -535,10 +535,122 @@ export async function listSubagents(parentScope) {
   return Object.values(map).sort((a, b) => a.slug.localeCompare(b.slug));
 }
 
+// ── Backgrounded-invocation state files ─────────────────────────────────
+//
+// Foreground invokes block the MCP call until the child Claude exits —
+// fine for sub-second helpers, painful for 5-minute test runs that lock
+// up the parent's whole conversation. Background mode writes a state file
+// and detaches the child; the parent polls `lastid_subagent_result` or
+// scans `lastid_subagent_list_running` to discover when it's done.
+//
+// Layout: `~/.lastid-agent/<parent-scope>/subagent-invocations/<id>.json`
+// One file per invocation, atomically written (tmp+rename). Status field:
+//   - 'running'   — child spawned, awaiting close
+//   - 'completed' — child exited cleanly with structured result text
+//   - 'errored'   — spawn / IO / timeout failure
+// State files older than INVOCATION_RETENTION_MS get pruned opportunistically
+// on every list call so the directory doesn't grow without bound.
+
+const INVOCATION_RETENTION_MS = 24 * 60 * 60 * 1000; // 24h
+
+function invocationsDirFor(parentScope) {
+  return join(scopeDirFor(parentScope), 'subagent-invocations');
+}
+
+function invocationFilePath(parentScope, invocationId) {
+  return join(invocationsDirFor(parentScope), `${invocationId}.json`);
+}
+
+async function writeInvocationState(parentScope, invocationId, state) {
+  const file = invocationFilePath(parentScope, invocationId);
+  await mkdir(dirname(file), { recursive: true });
+  const tmp = `${file}.${randomBytes(4).toString('hex')}.tmp`;
+  await writeFile(tmp, JSON.stringify(state, null, 2), 'utf-8');
+  // rename is atomic on POSIX so a concurrent reader either sees the old
+  // file or the new — never a half-written one. Important: a backgrounded
+  // child may be writing the terminal state at the same moment the parent
+  // polls for it.
+  const { rename } = await import('node:fs/promises');
+  await rename(tmp, file);
+}
+
+/**
+ * Read a single backgrounded invocation's state file. Returns the parsed
+ * JSON or null if the file is missing (id not known to this scope, or it
+ * was pruned). Callers — the MCP `lastid_subagent_result` tool — use this
+ * to surface the status + (when complete) text + audit metadata back to
+ * the parent agent.
+ */
+export async function readSubagentInvocation({ parentScope, invocationId }) {
+  if (!parentScope || !invocationId) {
+    throw new Error('readSubagentInvocation: parentScope + invocationId required');
+  }
+  try {
+    const raw = await readFile(invocationFilePath(parentScope, invocationId), 'utf-8');
+    return JSON.parse(raw);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+/**
+ * List backgrounded invocations under this parent. By default returns only
+ * those with `status === 'running'` (the actionable "what's still pending"
+ * surface). Opportunistically prunes terminal files older than
+ * INVOCATION_RETENTION_MS so the directory stays bounded.
+ */
+export async function listRunningSubagentInvocations({ parentScope, includeAll = false } = {}) {
+  if (!parentScope) {
+    throw new Error('listRunningSubagentInvocations: parentScope required');
+  }
+  const dir = invocationsDirFor(parentScope);
+  let entries;
+  try {
+    entries = await readdir(dir);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return [];
+    throw err;
+  }
+  const cutoffMs = Date.now() - INVOCATION_RETENTION_MS;
+  const out = [];
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    const file = join(dir, entry);
+    let state;
+    try {
+      state = JSON.parse(await readFile(file, 'utf-8'));
+    } catch {
+      continue;
+    }
+    const completedAt = state?.audit?.completed_at
+      ? Date.parse(state.audit.completed_at)
+      : null;
+    const isTerminal = state?.status === 'completed' || state?.status === 'errored';
+    // Prune terminal files older than retention. Best-effort — a failed rm
+    // just means we try again on the next call.
+    if (isTerminal && completedAt !== null && completedAt < cutoffMs) {
+      rm(file, { force: true }).catch(() => {});
+      continue;
+    }
+    if (includeAll || state?.status === 'running') {
+      out.push(state);
+    }
+  }
+  // Newest first — most-recently-started is usually what the parent wants.
+  out.sort((a, b) => String(b.started_at ?? '').localeCompare(String(a.started_at ?? '')));
+  return out;
+}
+
 /**
  * Spawn the subagent and capture its result. Streams stdout, writes the
  * final body to memory, returns a structured result. Times out via SIGTERM
  * + falls back to SIGKILL after a grace period.
+ *
+ * When `background: true`, returns immediately with
+ * `{ status: 'running', invocation_id, ... }`; the child runs detached and
+ * writes its terminal state to disk. The parent polls via
+ * `readSubagentInvocation({invocationId})` or `listRunningSubagentInvocations`.
  */
 export async function invokeSubagent({
   parentScope,
@@ -547,6 +659,7 @@ export async function invokeSubagent({
   timeoutMs = 5 * 60_000,
   parentEnv = process.env,
   log,
+  background = false,
 }) {
   if (typeof input !== 'string' || input.length === 0) {
     return { ok: false, error: 'input_required', text: '' };
@@ -595,9 +708,137 @@ export async function invokeSubagent({
   const invocationId = randomUUID();
   const startedAt = Date.now();
   if (typeof log === 'function') {
-    log(`[lastid-agent] subagent invoke ${slug} → scope=${subagent.scope} input_sha256=${sha256Hex(input).slice(0, 12)}…`);
+    log(`[lastid-agent] subagent invoke ${slug} → scope=${subagent.scope} input_sha256=${sha256Hex(input).slice(0, 12)}…${background ? ' (background)' : ''}`);
   }
 
+  // ── Background path ──────────────────────────────────────────────────
+  // Returns immediately with the invocation_id; the child runs detached
+  // and writes its terminal state to disk. The parent polls via
+  // `readSubagentInvocation` / `listRunningSubagentInvocations`. This is
+  // the right shape for long helpers (test runs, builds) so the parent
+  // conversation isn't blocked waiting on the MCP call.
+  if (background) {
+    const initialState = {
+      status: 'running',
+      invocation_id: invocationId,
+      slug,
+      subagent_id: entry.id,
+      sub_scope: entry.scope,
+      parent_scope: parentScope,
+      input_sha256: sha256Hex(input),
+      started_at: new Date(startedAt).toISOString(),
+      timeout_ms: timeoutMs,
+    };
+    await writeInvocationState(parentScope, invocationId, initialState);
+
+    const child = spawn(cmd, args, {
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      // detached: child gets its own process group so it survives the
+      // parent MCP call returning. unref() lets the parent event loop
+      // exit independently.
+      detached: true,
+    });
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (b) => { stdout += b.toString('utf-8'); });
+    child.stderr.on('data', (b) => { stderr += b.toString('utf-8'); });
+
+    try {
+      child.stdin.end(input, 'utf-8');
+    } catch (err) {
+      // stdin write failure on background path is rare; record terminal
+      // state + return so the operator sees the failure on poll.
+      await writeInvocationState(parentScope, invocationId, {
+        ...initialState,
+        status: 'errored',
+        ok: false,
+        error: `stdin_write_failed: ${err?.message ?? err}`,
+        text: '',
+        exit_code: -1,
+        stderr_tail: '',
+        duration_ms: Date.now() - startedAt,
+        audit: {
+          ...initialState,
+          output_sha256: sha256Hex(''),
+          completed_at: new Date().toISOString(),
+        },
+      });
+      try { child.kill('SIGKILL'); } catch { /* */ }
+      return initialState;
+    }
+
+    // Terminal-state recorder shared between close + error + timeout.
+    let terminalRecorded = false;
+    const recordTerminal = async (val) => {
+      if (terminalRecorded) return;
+      terminalRecorded = true;
+      const durationMs = Date.now() - startedAt;
+      const finalState = {
+        ...initialState,
+        status: val.ok ? 'completed' : 'errored',
+        ok: val.ok,
+        error: val.error,
+        text: val.text,
+        exit_code: val.exit_code,
+        stderr_tail: val.stderr_tail,
+        duration_ms: durationMs,
+        audit: {
+          invocation_id: invocationId,
+          subagent_id: entry.id,
+          sub_scope: entry.scope,
+          parent_scope: parentScope,
+          input_sha256: sha256Hex(input),
+          output_sha256: sha256Hex(val.text ?? ''),
+          started_at: new Date(startedAt).toISOString(),
+          completed_at: new Date(startedAt + durationMs).toISOString(),
+        },
+      };
+      try {
+        await writeInvocationState(parentScope, invocationId, finalState);
+      } catch {
+        /* best-effort — the file is the only place this lives, but the
+           parent can still survive a failed write by polling and seeing
+           the running state never advance + the child's PID gone. */
+      }
+      try { await rm(sysPromptPath, { force: true }); } catch { /* */ }
+      try { await rm(mcpConfigPath, { force: true }); } catch { /* */ }
+    };
+
+    child.on('error', (err) => {
+      recordTerminal({
+        ok: false,
+        error: `spawn_error: ${err.message ?? err}`,
+        text: '',
+        exit_code: -1,
+        stderr_tail: stderr.slice(-2000),
+      }).catch(() => {});
+    });
+    child.on('close', (exitCode) => {
+      const parsed = parseStreamJsonResult(stdout);
+      recordTerminal({
+        ok: parsed.ok && exitCode === 0,
+        error: parsed.ok ? null : parsed.error,
+        text: parsed.text,
+        exit_code: exitCode,
+        stderr_tail: stderr.slice(-2000),
+      }).catch(() => {});
+    });
+
+    const timer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch { /* */ }
+      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 3_000);
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    // Detach: parent event loop is free to exit even while the child runs.
+    child.unref();
+
+    return initialState;
+  }
+
+  // ── Foreground path (unchanged) ──────────────────────────────────────
   const result = await new Promise((resolve) => {
     // stdio: ['pipe', 'pipe', 'pipe'] — input rides stdin (NOT argv: see the
     // SECURITY comment on buildSpawnArgs above for why).
