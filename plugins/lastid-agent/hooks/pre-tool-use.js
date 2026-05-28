@@ -40,6 +40,15 @@ import { enqueueAuditEvent } from '../lib/audit-spool.js';
 import { isAuditEnabled, loadAuditPolicy } from '../lib/audit-policy.js';
 import { redactSecrets } from '../lib/bug-report.js';
 import { selfProtectionAuditEvent } from '../lib/self-protection.js';
+import {
+  extractMemoryIds,
+  nextStateAfterInject,
+  nextStateAfterSkip,
+  readState as readAmbientRecallState,
+  shouldInjectBlock,
+  shouldRunAmbientRecall,
+  writeState as writeAmbientRecallState,
+} from '../lib/ambient-recall-state.js';
 import { readCliBindings } from '../lib/vault-cache.js';
 import { planCliRewrite } from '../lib/cli-rewrite.js';
 import { isOwnPluginTool } from '../lib/own-tools.js';
@@ -305,10 +314,42 @@ if (toolName && AMBIENT_RETRIEVE_TOOLS.has(toolName)) {
     projectKey = null; // best-effort — never block a tool on project resolution
   }
   const query = stringifyToolInput(toolInput);
+  // Throttle + dedup. The hook used to spawnSync memory-search on EVERY tool
+  // call, which (a) cost a node spawn + desktop round-trip per call, and
+  // (b) pushed often-identical memories into the agent's system-reminder
+  // stream every few seconds — which the agent reads as turn boundaries
+  // and stops mid-flow. State persists at
+  // ~/.lastid-agent/<scope>/ambient-recall.json:
+  //   - shouldRunAmbientRecall(state): skip the spawn entirely while inside
+  //     the throttle window (30s default).
+  //   - shouldInjectBlock(state, ids): even after the spawn runs, skip
+  //     pushing the block when the memory-id set is byte-equal to the
+  //     last injection (pure dedup).
+  // Both are best-effort: any read/write error degrades to the previous
+  // behavior (always spawn, always inject). Operator can override by
+  // deleting the state file.
   if (query && query.length > 0) {
-    const ambient = runAmbientMemoryRetrieve(query, projectKey);
-    if (ambient && ambient.trim().length > 0) {
-      contextParts.push(ambient.trim());
+    const recallState = readAmbientRecallState(activeScope);
+    if (shouldRunAmbientRecall(recallState)) {
+      const ambient = runAmbientMemoryRetrieve(query, projectKey);
+      const trimmed = ambient ? ambient.trim() : '';
+      if (trimmed.length > 0) {
+        const ids = extractMemoryIds(trimmed);
+        if (shouldInjectBlock(recallState, ids)) {
+          contextParts.push(trimmed);
+          writeAmbientRecallState(
+            activeScope,
+            nextStateAfterInject(recallState, { memoryIds: ids }),
+          );
+        } else {
+          // Dedup hit: spawn ran but the result is the same memories the
+          // agent already has. Don't surface the block again.
+          writeAmbientRecallState(activeScope, nextStateAfterSkip(recallState));
+        }
+      }
+    } else {
+      // Throttled — note the skip for telemetry; do not spawn.
+      writeAmbientRecallState(activeScope, nextStateAfterSkip(recallState));
     }
   }
 }
