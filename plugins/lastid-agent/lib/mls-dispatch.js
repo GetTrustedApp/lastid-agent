@@ -207,6 +207,16 @@ export class MlsDispatcher {
         case 'group_chat.queue_batch':
           await this.#handleQueueBatch(event);
           return;
+        case 'group_chat.ack':
+          // Sender-side delivery confirmation. The agent doesn't render
+          // outbound "Delivered" badges in real time (its outbox tracking
+          // is internal), so for now this is a no-op classification —
+          // routing it explicitly stops the default branch from passing
+          // an ack through `#defensiveMlsRoute` (which sniffs payloads
+          // for stray mls_* fields and logs a soft warning). Mirrors the
+          // console handler at mls-dispatch.ts which just routes the
+          // (group_id, message_id) pair to its onAck callback.
+          return;
         default:
           await this.#defensiveMlsRoute(event);
       }
@@ -378,7 +388,23 @@ export class MlsDispatcher {
     try {
       inbound = await this.#mls.processInbound(mlsMessageB64);
     } catch (err) {
-      this.#log(`[lastid-agent] processInbound failed: ${errText(err)}`);
+      const msg = err?.message ?? String(err);
+      // Same race-tolerant classification as #handleCommit / #handleProposal:
+      // a peer message at an epoch we've already advanced past beyond
+      // max_past_epochs surfaces as WrongEpoch or TooDistantInThePast.
+      // GroupNotFound = dissolved. All three are expected MLS conditions
+      // in a multi-device flow; drop silently.
+      if (
+        msg.includes('GroupNotFound') ||
+        msg.includes('group_not_found') ||
+        msg.includes('WrongEpoch') ||
+        msg.includes('wrong_epoch') ||
+        msg.includes('TooDistantInThePast') ||
+        msg.includes('too_distant_in_the_past')
+      ) {
+        return;
+      }
+      this.#log(`[lastid-agent] processInbound failed: ${msg}`);
       return;
     }
 
@@ -633,15 +659,29 @@ export class MlsDispatcher {
     }
     if (!mlsBytes) return;
     try {
-      this.#mls.processInbound(mlsBytes);
+      // processInbound is async on PersistentBotMlsClient — missing
+      // await was masking real failures into uncaught Promise rejections
+      // that the catch block below couldn't see.
+      await this.#mls.processInbound(mlsBytes);
       await this.#mls.persist();
       this.#log(
         `[lastid-agent] defensive mls route ok for unknown event type=${event?.type ?? '?'}`,
       );
     } catch (err) {
       // Don't treat this as fatal — many candidate fields will not
-      // be MLS bytes at all. Logged at debug-equivalent only.
+      // be MLS bytes at all. Logged at debug-equivalent only. Also
+      // swallow the same race-tolerant set the dispatcher's other
+      // branches drop silently — defensive routing should be silent
+      // on those too.
       const msg = err?.message ?? String(err);
+      if (
+        msg.includes('WrongEpoch') ||
+        msg.includes('wrong_epoch') ||
+        msg.includes('TooDistantInThePast') ||
+        msg.includes('too_distant_in_the_past')
+      ) {
+        return;
+      }
       if (!msg.includes('GroupNotFound') && !msg.includes('group_not_found')) {
         this.#log(
           `[lastid-agent] defensive route did not parse as mls bytes ` +
