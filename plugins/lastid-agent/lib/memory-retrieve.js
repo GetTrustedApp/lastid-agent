@@ -69,9 +69,67 @@ function tierLabel(m) {
   return parts.length > 0 ? ` (${parts.join(', ')})` : '';
 }
 
-function renderItem(m) {
-  const summary = m.summary && m.summary.trim().length > 0 ? ` ${m.summary.trim()}` : '';
-  return `- [${m.id ?? m.memory_id}]${tierLabel(m)} ${m.claim}${summary}`;
+/**
+ * Injection relevance gate. The per-turn packet and the ambient PreToolUse
+ * block are UNSOLICITED — the agent did not ask for them — so they must be
+ * more conservative than an explicit `lastid_memory_search` (which returns its
+ * top-K on demand, floor 0.2). Two cuts, both pure and scorer-agnostic WITHIN
+ * one result set (every hit in a set is scored by the same scorer — all-cosine
+ * or all-keyword — so comparing them is apples-to-apples):
+ *   - absolute floor: drop anything below INJECT_FLOOR. Quantized MiniLM scores
+ *     ~0.3 for genuinely related text (see embeddings.SEMANTIC_FLOOR note), so a
+ *     0.28 floor injects NOTHING topical when the whole set is only loosely
+ *     on-topic (the "meta turn" case) while keeping real matches. On the keyword
+ *     fallback the same number means ≥28% of the query terms are present — also
+ *     a sane bar.
+ *   - relative gap: drop hits more than INJECT_GAP below the top hit, so a weak
+ *     tail can't ride into the context behind one strong match.
+ * Returns the kept hits (already sorted desc by the caller). Empty when the top
+ * hit itself is below the floor.
+ */
+export const INJECT_FLOOR = 0.28;
+export const INJECT_GAP = 0.12;
+
+export function gateInjectedHits(hits, { floor = INJECT_FLOOR, gap = INJECT_GAP } = {}) {
+  const scored = (hits ?? []).filter((h) => typeof h.score === 'number');
+  if (scored.length === 0) return [];
+  const top = scored.reduce((max, h) => (h.score > max ? h.score : max), -Infinity);
+  if (top < floor) return [];
+  return scored.filter((h) => h.score >= floor && h.score >= top - gap);
+}
+
+/** Trim a claim to `cap` chars for the compact topical render, adding an
+ *  ellipsis so it's visibly truncated (the id is right there to fetch full). */
+const TOPICAL_CLAIM_CAP = 280;
+function truncateClaim(s, cap = TOPICAL_CLAIM_CAP) {
+  const t = String(s ?? '').trim();
+  return t.length > cap ? `${t.slice(0, cap).trimEnd()}…` : t;
+}
+
+/** Compact body for an auto-surfaced row: the authored short summary if present,
+ *  else a truncated claim. Shared by the per-turn topical render and the ambient
+ *  block so both stay small and consistent. */
+function compactBody(m) {
+  const summ = m.summary && m.summary.trim().length > 0 ? m.summary.trim() : null;
+  return summ ?? truncateClaim(m.claim);
+}
+
+/**
+ * Render one memory line. `full` (bedrock) prints the verbatim claim + summary —
+ * bedrock is curated ground truth that must be exact. Topical rows are
+ * auto-surfaced every turn, so they render COMPACT (summary, else truncated
+ * claim). Either way the id leads the line so the agent can `lastid_memory_get`
+ * the full text when a match actually matters (the packet preamble says so).
+ * Keeps the per-turn footprint small without hiding what each memory is about.
+ */
+function renderItem(m, { full = true } = {}) {
+  const id = m.id ?? m.memory_id;
+  const label = tierLabel(m);
+  if (full) {
+    const summary = m.summary && m.summary.trim().length > 0 ? ` ${m.summary.trim()}` : '';
+    return `- [${id}]${label} ${m.claim}${summary}`;
+  }
+  return `- [${id}]${label} ${compactBody(m)}`;
 }
 
 /**
@@ -163,9 +221,11 @@ export async function retrievePacket({
     searchMemories(mem, prompt ?? '', { limit: topicalLimit, excludeBedrock: true, embedder, projectKey, includeDrafts: true }),
     topicalOperatorMemories(operatorStore, prompt ?? '', embedder, topicalLimit),
   ]);
-  const topical = [...agentTopical, ...opTopical]
-    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-    .slice(0, topicalLimit);
+  // Sort desc, gate out the weak/irrelevant tail (the packet is unsolicited, so
+  // it must be conservative — see gateInjectedHits), THEN cap at topicalLimit.
+  const topical = gateInjectedHits(
+    [...agentTopical, ...opTopical].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)),
+  ).slice(0, topicalLimit);
 
   if (bedrock.length === 0 && topical.length === 0) {
     return { markdown: '', injectedIds: [] };
@@ -173,10 +233,12 @@ export async function retrievePacket({
 
   const lines = ['<lastid-memory>', PACKET_PREAMBLE];
   if (bedrock.length > 0) {
-    lines.push('', '## Bedrock', ...bedrock.map(renderItem));
+    // Bedrock = curated ground truth → render verbatim.
+    lines.push('', '## Bedrock', ...bedrock.map((m) => renderItem(m, { full: true })));
   }
   if (topical.length > 0) {
-    lines.push('', '## Relevant to this turn', ...topical.map(renderItem));
+    // Topical = auto-surfaced every turn → render compact (summary/id).
+    lines.push('', '## Relevant to this turn', ...topical.map((m) => renderItem(m, { full: false })));
   }
   lines.push('</lastid-memory>');
 
@@ -211,7 +273,11 @@ export async function retrieveSearchBlock({
   projectKey = null,
 } = {}) {
   const mem = store ?? new MemoryStore(scope, undefined, { agentDid, parentHumanDid });
-  const hits = await searchMemories(mem, query ?? '', { limit, excludeBedrock, embedder, projectKey, includeDrafts: true });
+  // Gate the same way the per-turn packet does — ambient injection is unsolicited,
+  // so a weak/irrelevant tail must not ride into the context behind a tool call.
+  const hits = gateInjectedHits(
+    await searchMemories(mem, query ?? '', { limit, excludeBedrock, embedder, projectKey, includeDrafts: true }),
+  );
   // When the agent is working in a repo, always surface that repo's project
   // bedrock (ground truth) here too — so moving to a new repo mid-turn brings
   // its always-inject memories immediately, not just on the next turn. These
@@ -229,8 +295,9 @@ export async function retrieveSearchBlock({
   for (const h of hits) {
     const score = typeof h.score === 'number' ? ` [match ${h.score.toFixed(2)}]` : '';
     const subject = Array.isArray(h.subject) && h.subject.length > 0 ? ` (subject: ${h.subject.join(', ')})` : '';
-    lines.push(`- [${h.memory_id}]${tierLabel(h)} ${h.claim}${score}${subject}`);
-    if (h.summary && h.summary.trim().length > 0) lines.push(`  ${h.summary.trim()}`);
+    // Compact body (summary, else truncated claim) — the id is on the line for
+    // lastid_memory_get when the agent needs the full text.
+    lines.push(`- [${h.memory_id}]${tierLabel(h)} ${compactBody(h)}${score}${subject}`);
   }
   lines.push('</lastid-memory>');
   return lines.join('\n');

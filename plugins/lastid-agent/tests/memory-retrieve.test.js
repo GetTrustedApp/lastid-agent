@@ -10,7 +10,13 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { MemoryStore } from '../lib/memory-store.js';
-import { retrievePacket, retrieveSearchBlock } from '../lib/memory-retrieve.js';
+import {
+  retrievePacket,
+  retrieveSearchBlock,
+  gateInjectedHits,
+  INJECT_FLOOR,
+  INJECT_GAP,
+} from '../lib/memory-retrieve.js';
 
 function freshStore() {
   return new MemoryStore('test', join(tmpdir(), `mem-${randomUUID()}.json`), {
@@ -128,4 +134,86 @@ test('retrieveSearchBlock: nothing relevant → empty string', async () => {
   s.write({ kind: 'fact', subject: ['x'], claim: 'alpha', source_kind: 'inferred' });
   const block = await retrieveSearchBlock({ query: 'kubernetes helm charts', store: s });
   assert.equal(block, '');
+});
+
+// ── Injection relevance gate (gateInjectedHits) ──────────────────────────────
+
+test('gateInjectedHits: empty / unscored input → empty', () => {
+  assert.deepEqual(gateInjectedHits([]), []);
+  assert.deepEqual(gateInjectedHits(undefined), []);
+  assert.deepEqual(gateInjectedHits([{ memory_id: 'a' }]), []); // no numeric score
+});
+
+test('gateInjectedHits: a strong cluster is kept whole', () => {
+  const hits = [{ score: 0.5 }, { score: 0.42 }, { score: 0.4 }]; // all within INJECT_GAP of top
+  assert.equal(gateInjectedHits(hits).length, 3);
+});
+
+test('gateInjectedHits: a weak tail riding behind one strong hit is dropped', () => {
+  // 0.30 clears the floor but is > INJECT_GAP below the 0.5 top → cut.
+  const kept = gateInjectedHits([{ score: 0.5, memory_id: 'top' }, { score: 0.3, memory_id: 'tail' }]);
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].memory_id, 'top');
+});
+
+test('gateInjectedHits: an all-weak set (top below the floor) injects nothing', () => {
+  // The "meta turn" case — everything is only loosely on-topic.
+  assert.deepEqual(gateInjectedHits([{ score: 0.25 }, { score: 0.24 }]), []);
+});
+
+test('gateInjectedHits: a hit exactly at the floor is kept', () => {
+  assert.equal(gateInjectedHits([{ score: INJECT_FLOOR }]).length, 1);
+  // sanity: the constants are the documented values
+  assert.equal(INJECT_FLOOR, 0.28);
+  assert.equal(INJECT_GAP, 0.12);
+});
+
+// ── Compact topical/ambient rendering ────────────────────────────────────────
+
+test('retrievePacket: a topical hit WITH a summary renders summary-only (full claim omitted)', async () => {
+  const s = freshStore();
+  s.write({
+    kind: 'fact', subject: ['deploy'], source_kind: 'user_explicit',
+    claim: 'the kubernetes helm pipeline rolls out via argocd using a gitops_unique_marker flow',
+    summary: 'deploy via argocd',
+  });
+  const { markdown } = await retrievePacket({ prompt: 'kubernetes helm', store: s });
+  assert.match(markdown, /## Relevant to this turn/);
+  assert.match(markdown, /deploy via argocd/, 'short summary is shown');
+  assert.doesNotMatch(markdown, /gitops_unique_marker/, 'full claim body is not injected for topical');
+});
+
+test('retrievePacket: a long topical claim with NO summary is truncated with an ellipsis', async () => {
+  const s = freshStore();
+  s.write({
+    kind: 'fact', subject: ['k8s'], source_kind: 'user_explicit',
+    claim: `kubernetes ${'y'.repeat(300)} END_OF_CLAIM_MARKER`, // > the topical cap
+  });
+  const { markdown } = await retrievePacket({ prompt: 'kubernetes', store: s });
+  assert.match(markdown, /…/, 'truncation ellipsis present');
+  assert.doesNotMatch(markdown, /END_OF_CLAIM_MARKER/, 'tail of the long claim is cut');
+});
+
+test('retrievePacket: a weak topical hit is gated out (bedrock still injects)', async () => {
+  const s = freshStore();
+  s.write({ kind: 'fact', subject: ['x'], claim: 'always inject this ground truth', source_kind: 'user_explicit', bedrock: true });
+  // 1 of 5 query terms present → keyword score 0.2, below INJECT_FLOOR.
+  s.write({ kind: 'fact', subject: ['x'], claim: 'alpha only here, nothing else', source_kind: 'inferred' });
+  const { markdown } = await retrievePacket({ prompt: 'alpha beta gamma delta epsilon', store: s });
+  assert.match(markdown, /## Bedrock/);
+  assert.match(markdown, /always inject this ground truth/);
+  assert.doesNotMatch(markdown, /## Relevant to this turn/, 'weak topical set → no topical section');
+  assert.doesNotMatch(markdown, /alpha only here/);
+});
+
+test('retrieveSearchBlock: hit with a summary renders summary-only', async () => {
+  const s = freshStore();
+  s.write({
+    kind: 'fact', subject: ['deploy'], source_kind: 'user_explicit',
+    claim: 'pnpm install runs behind socketfirewall_unique_marker scanning every package',
+    summary: 'pnpm is the package manager',
+  });
+  const block = await retrieveSearchBlock({ query: 'package manager', store: s, excludeBedrock: true });
+  assert.match(block, /pnpm is the package manager/);
+  assert.doesNotMatch(block, /socketfirewall_unique_marker/, 'full claim omitted for ambient rows');
 });
