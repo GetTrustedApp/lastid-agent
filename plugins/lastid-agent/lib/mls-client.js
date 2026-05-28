@@ -1,27 +1,31 @@
 /**
- * MLS client wrapper around `lastid-mls-wasm::BotMlsClient`.
+ * MLS client wrapper around `lastid-mls-wasm::PersistentBotMlsClient`.
  *
  * Bindings are vendored (CJS, `--target nodejs`) at
  * `vendor/lastid-mls-wasm/`. Build + copy via
  * `lastid-sdk/scripts/build-and-copy-mls-wasm.sh`.
  *
- * Wraps the raw wasm surface with:
- *   - Lifecycle: instantiate fresh or from persisted state.
- *   - Persistence: serialize to a base64 state blob the plugin saves
- *     under `~/.lastid-agent/<scope>/mls-state.b64`. Sealed by the
- *     agent's slot_seed-derived AES key so a host-disk leak doesn't
- *     expose group epochs / committer state.
- *   - Inbound dispatch: parse the JSON `InboundResult` enum into a
- *     discriminated union JS consumers can switch on.
+ * BACKED BY a real openmls StorageProvider (lastid-mls-storage's
+ * KvBackedStorageProvider, parameterized over a JS-callback-based RawKv).
+ * NOT MemoryStorage + dump/restore: that path silently lost KeyPackage
+ * bundle private parts and processWelcome would fail with NoMatchingKeyPackage
+ * on multi-device delivery — the wasm port mistake that matched the native
+ * SDK's storage-provider behaviour finally fixes here. The on-disk format
+ * stays compatible (existing mls-state.b64 files load as-is).
+ *
+ * Persistence: the wasm-side method auto-flushes after every state-mutating
+ * op. The flush callback this file supplies seals + writes the base64 blob
+ * to `~/.lastid-agent/<scope>/mls-state.b64`, AES-256-GCM sealed by the
+ * agent's slot_seed-derived key so a host-disk leak ≠ MLS state leak.
+ * `persist()` is now a no-op kept for source compatibility.
  *
  * State recovery semantics. If the persisted file is missing or
- * unparseable we fall back to `createBotClient` (fresh state). The
- * agent's stable Ed25519 keypair is unchanged across this fallback
- * — it lives in the OS keychain alongside the VC — so peers that
- * have the agent's KeyPackage continue to encrypt to the same
- * identity. They just need to re-add the agent to any group it
- * was previously a member of, because MLS group state is per-
- * client (not derivable from the keypair).
+ * unparseable we start fresh (no prior MLS state). The agent's stable
+ * Ed25519 keypair is unchanged across this fallback — it lives in the
+ * OS keychain alongside the VC — so peers that have the agent's
+ * KeyPackage continue to encrypt to the same identity. They just need
+ * to re-add the agent to any group it was previously a member of,
+ * because MLS group state is per-client (not derivable from the keypair).
  */
 import { createRequire } from 'node:module';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -108,11 +112,13 @@ function openStateBlob(slotSeed, blobB64) {
  * individual WS connects. Use:
  *
  *   const mls = await MlsClient.open({ agentDid, slotSeed, scope });
- *   const kpB64 = mls.generateKeyPackage();
- *   await mls.persist(); // after every state-mutating op
+ *   const kpB64 = await mls.generateKeyPackage();
+ *
+ * Every state-mutating method is async + auto-persists before its
+ * Promise resolves. `persist()` is a no-op kept for source compat.
  */
 export class MlsClient {
-  /** @type {import('../vendor/lastid-mls-wasm/lastid_mls_wasm.js').BotMlsClient} */
+  /** @type {import('../vendor/lastid-mls-wasm/lastid_mls_wasm.js').PersistentBotMlsClient} */
   #handle;
   #agentDid;
   #slotSeed;
@@ -126,27 +132,36 @@ export class MlsClient {
   }
 
   /**
-   * Open the agent's MLS client. Restores from disk when possible,
-   * otherwise creates fresh.
+   * Open the agent's MLS client. The wasm-side state is loaded from disk
+   * (sealed mls-state.b64) via the loadBlob callback; subsequent writes
+   * are flushed back via flushBlob after every state-mutating op. If the
+   * file is missing or unparseable we start fresh.
    */
   static async open({ agentDid, slotSeed, scope }) {
-    let handle;
-    try {
-      const blob = await readFile(stateFilePath(scope ?? 'main'), 'utf-8');
-      const stateB64 = openStateBlob(slotSeed, blob.trim());
-      handle = wasm.BotMlsClient.restoreBotClient(agentDid, stateB64);
-    } catch (err) {
-      // ENOENT or unparseable — start fresh. NOT an error; just means
-      // either first run or the file is from a different agent and
-      // can't be decrypted.
-      if (err.code !== 'ENOENT') {
+    const resolvedScope = scope ?? 'main';
+    const path = stateFilePath(resolvedScope);
+    const loadBlob = async () => {
+      try {
+        const blob = await readFile(path, 'utf-8');
+        return openStateBlob(slotSeed, blob.trim());
+      } catch (err) {
+        if (err.code === 'ENOENT') return null;
         process.stderr.write(
-          `[lastid-agent] mls: failed to restore prior state (${err.message}); starting fresh\n`,
+          `[lastid-agent] mls: failed to load prior state (${err.message}); starting fresh\n`,
         );
+        return null;
       }
-      handle = wasm.BotMlsClient.createBotClient(agentDid);
-    }
-    return new MlsClient({ handle, agentDid, slotSeed, scope });
+    };
+    const flushBlob = async (stateB64) => {
+      const sealed = sealStateBlob(slotSeed, stateB64);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, sealed, 'utf-8');
+    };
+    const handle = await wasm.createPersistentBotClientWithCallbacks(agentDid, {
+      loadBlob,
+      flushBlob,
+    });
+    return new MlsClient({ handle, agentDid, slotSeed, scope: resolvedScope });
   }
 
   get agentDid() {
@@ -154,84 +169,72 @@ export class MlsClient {
   }
 
   /**
-   * Generate a fresh MLS KeyPackage. Caller is responsible for:
-   *   1. POSTing to `/v1/mls/keypackages` so peers can fetch it.
-   *   2. Calling `persist()` immediately — the underlying wasm
-   *      generates a private credential the dump captures. Skipping
-   *      persist means the generated KeyPackage is unusable on the
-   *      next restart.
+   * Generate a fresh MLS KeyPackage. The bundle's private parts are written
+   * into the storage provider AND flushed to disk before this Promise
+   * resolves — the published public KeyPackage is usable across restarts.
    */
-  generateKeyPackage() {
-    return this.#handle.generateKeyPackage();
+  async generateKeyPackage() {
+    return await this.#handle.generateKeyPackage();
   }
 
   /**
    * Accept an MLS Welcome that adds this agent to a group. Returns
    * the parsed JoinedGroupInfo { group_id_b64, member_count, epoch }.
    */
-  processWelcome(welcomeB64) {
-    return JSON.parse(this.#handle.processWelcome(welcomeB64));
+  async processWelcome(welcomeB64) {
+    return JSON.parse(await this.#handle.processWelcome(welcomeB64));
   }
 
   /**
    * Author a fresh MLS group with this agent as sole creator. Pass a
-   * caller-reserved `group_id_b64`. Returns parsed JoinedGroupInfo
-   * { group_id_b64, member_count: 1, epoch: 0 }. Follow with
-   * `exportGroupInfo` (→ POST /v1/groups) then `addMember` per peer;
-   * persist after (this mints a signing key the state file must capture).
+   * caller-reserved `group_id_b64`. Returns parsed JoinedGroupInfo.
    */
-  createGroup(groupIdB64) {
-    return JSON.parse(this.#handle.createGroup(groupIdB64));
+  async createGroup(groupIdB64) {
+    return JSON.parse(await this.#handle.createGroup(groupIdB64));
   }
 
   /**
    * Export the group's GroupInfo as base64 TLS — the `mls_group_init`
    * POST /v1/groups requires (the IdP hashes it into the canonical
-   * mls_group_id). Read-only; no state mutation.
+   * mls_group_id). Read-only on group state, but async because the wasm
+   * surface is async.
    */
-  exportGroupInfo(groupIdB64) {
-    return this.#handle.exportGroupInfo(groupIdB64);
+  async exportGroupInfo(groupIdB64) {
+    return await this.#handle.exportGroupInfo(groupIdB64);
   }
 
   /**
    * Add a peer (base64-TLS KeyPackage) to a group this agent owns.
-   * Returns parsed { commit_b64, welcome_b64, new_epoch }: deliver
-   * `welcome_b64` to the invitee and let the IdP broadcast `commit_b64`
-   * to existing members. Persist after — the ratchet advanced.
+   * Returns parsed { commit_b64, welcome_b64, new_epoch }.
    */
-  addMember(groupIdB64, keyPackageB64) {
-    return JSON.parse(this.#handle.addMember(groupIdB64, keyPackageB64));
+  async addMember(groupIdB64, keyPackageB64) {
+    return JSON.parse(await this.#handle.addMember(groupIdB64, keyPackageB64));
   }
 
   /**
    * Add several peers in ONE commit. `keyPackagesB64` is an array of base64
-   * KeyPackages. Returns parsed { commit_b64, welcome_b64, new_epoch } — one
-   * welcome + one commit covering all. Used by device-consistency reconcile
-   * to add every missing device of the operator at once. Persist after.
+   * KeyPackages. Returns parsed { commit_b64, welcome_b64, new_epoch }.
    */
-  addMembers(groupIdB64, keyPackagesB64) {
-    return JSON.parse(this.#handle.addMembers(groupIdB64, JSON.stringify(keyPackagesB64)));
+  async addMembers(groupIdB64, keyPackagesB64) {
+    return JSON.parse(
+      await this.#handle.addMembers(groupIdB64, JSON.stringify(keyPackagesB64)),
+    );
   }
 
   /**
    * Remove a member by its MLS leaf index. Returns parsed { commit_b64,
-   * new_epoch } — broadcast the commit so peers advance; for a device-
-   * eviction reconcile, POST it to the IdP's member-devices/evict. Persist
-   * after — the ratchet advanced.
+   * new_epoch }.
    */
-  removeMember(groupIdB64, leafIndex) {
-    return JSON.parse(this.#handle.removeMember(groupIdB64, leafIndex));
+  async removeMember(groupIdB64, leafIndex) {
+    return JSON.parse(await this.#handle.removeMember(groupIdB64, leafIndex));
   }
 
   /**
    * Process an inbound message — application, commit, or proposal.
-   * Returns the parsed `InboundResult` JSON. Application messages
-   * include `application_b64` (the encrypted plaintext, base64);
-   * commits / proposals are merged into local group state and the
-   * result carries a `kind` tag callers can switch on.
+   * Returns the parsed `InboundResult` JSON.
    */
-  processInbound(messageB64) {
-    return JSON.parse(this.#handle.processInbound(messageB64));
+  async processInbound(messageB64) {
+    return JSON.parse(await this.#handle.processInbound(messageB64));
   }
 
   /**
@@ -239,58 +242,44 @@ export class MlsClient {
    * encoded MLS wire payload the caller POSTs as a
    * `group_chat.message` event.
    */
-  encryptApplicationMessage(groupIdB64, plaintextB64) {
-    return this.#handle.encryptApplicationMessage(groupIdB64, plaintextB64);
+  async encryptApplicationMessage(groupIdB64, plaintextB64) {
+    return await this.#handle.encryptApplicationMessage(groupIdB64, plaintextB64);
   }
 
-  /** Current MLS epoch for a group (as BigInt). */
+  /** Current MLS epoch for a group (as BigInt). Read-only; sync. */
   groupEpoch(groupIdB64) {
     return this.#handle.groupEpoch(groupIdB64);
   }
 
   /**
-   * Wipe local MlsGroup state for a dissolved group. Idempotent —
-   * absent group is a no-op. Subsequent `processInbound` for the
-   * same group_id surfaces `GroupNotFound`, which the dispatcher
-   * treats as "drop silently".
+   * Wipe local MlsGroup state for a dissolved group. Idempotent.
    */
-  forgetGroup(groupIdB64) {
-    this.#handle.forgetGroup(groupIdB64);
+  async forgetGroup(groupIdB64) {
+    await this.#handle.forgetGroup(groupIdB64);
   }
 
   /**
    * Issue a commit covering every pending proposal openmls has
-   * queued locally for this group. Triggered when the IdP
-   * designates this agent as the new committer via
-   * `group_chat.proposal_reassigned`. Returns JSON `CommitResult`
-   * ({ commit_b64, new_epoch }); caller broadcasts the commit
-   * via POST /v1/groups/:id/commits so peers can advance.
+   * queued locally for this group.
    */
-  commitPendingProposals(groupIdB64) {
-    return JSON.parse(this.#handle.commitPendingProposals(groupIdB64));
+  async commitPendingProposals(groupIdB64) {
+    return JSON.parse(await this.#handle.commitPendingProposals(groupIdB64));
   }
 
   /**
    * Discard any locally-prepared-but-not-yet-published commit.
-   * Called when committer authority is reassigned away from us so
-   * the stale pending commit doesn't sit in storage forever.
    */
-  rollbackPendingCommit(groupIdB64) {
-    this.#handle.rollbackPendingCommit(groupIdB64);
+  async rollbackPendingCommit(groupIdB64) {
+    await this.#handle.rollbackPendingCommit(groupIdB64);
   }
 
   /**
-   * Serialize + seal current state to disk. Call after every
-   * mutating op (generateKeyPackage / processWelcome /
-   * processInbound that landed a commit). Cheap (~few ms on small
-   * groups).
+   * No-op — kept for source compatibility with the old BotMlsClient path.
+   * The wasm-side method now auto-flushes via the flushBlob callback after
+   * every state-mutating op; callers don't need to persist explicitly.
    */
   async persist() {
-    const stateB64 = this.#handle.dumpState();
-    const sealed = sealStateBlob(this.#slotSeed, stateB64);
-    const path = stateFilePath(this.#scope);
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, sealed, 'utf-8');
+    /* state is already durable when the awaited mutating method resolved */
   }
 
   /** Free the underlying wasm handle. Call when shutting down. */

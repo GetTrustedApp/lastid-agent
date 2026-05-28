@@ -243,10 +243,10 @@ async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, sig
     payload: { text: req.text },
   };
   const envelopeB64 = textToB64(JSON.stringify(envelope));
-  const mlsMessage = mls.encryptApplicationMessage(groupIdB64, envelopeB64);
-  // Persist immediately — the ratchet advanced. If the send below
-  // fails the state is still consistent (the message generation was
-  // consumed; a retry re-encrypts at the next generation).
+  const mlsMessage = await mls.encryptApplicationMessage(groupIdB64, envelopeB64);
+  // encryptApplicationMessage auto-flushes through the storage-provider
+  // callback before the Promise resolves; persist() is a kept-for-compat
+  // no-op.
   await mls.persist();
 
   const epoch = Number(mls.groupEpoch(groupIdB64));

@@ -353,6 +353,22 @@ export function computeMemberReconcilePlan(input_json: string): string;
 export function createMlsOrchestrator(bot_did: string, my_did: string, directory: any, transport: any, host: any): Promise<MlsOrchestrator>;
 
 /**
+ * Node-side orchestrator constructor: same shape as `createMlsOrchestrator`
+ * but the RawKv backing is JS-callback-based instead of IndexedDB. The
+ * callback bundle is the same `{ loadBlob, flushBlob }` shape
+ * `createPersistentBotClientWithCallbacks` accepts — passing a separate
+ * bundle (vs sharing the agent client's) is intentional: the agent's MLS
+ * group state and the orchestrator's group-store keys both live in the same
+ * `mls-state.b64`-style blob in the host's data dir, but the orchestrator's
+ * reconcile/rotate paths are an independent process — they don't share an
+ * in-memory cache with the agent's main client (yet). To start, give them
+ * their own `loadBlob`/`flushBlob` pointing at distinct files. Future work
+ * can unify the backend (mirroring how the browser's `IndexedDbRawKv::open`
+ * is process-cached).
+ */
+export function createMlsOrchestratorWithCallbacks(bot_did: string, my_did: string, directory: any, transport: any, host: any, callbacks: any): Promise<MlsOrchestrator>;
+
+/**
  * Open or rehydrate a persistent MLS client for `bot_did`. If
  * IndexedDB has prior `mls_kv` rows for this scope they are
  * loaded into the in-mem cache; if not, the client starts
@@ -364,6 +380,33 @@ export function createMlsOrchestrator(bot_did: string, my_did: string, directory
  * in production (one client per bot_did per tab).
  */
 export function createPersistentBotClient(bot_did: string): Promise<PersistentBotMlsClient>;
+
+/**
+ * Open or rehydrate a persistent MLS client for `bot_did` with host-
+ * supplied storage callbacks. Designed for Node — the agent plugin runs
+ * outside a browser so `IndexedDbRawKv` (web-sys-backed) isn't an option.
+ *
+ * `callbacks` is a plain JS object with two Function fields:
+ *
+ *   - `loadBlob(): Promise<string | null>` — invoked ONCE at open. Return
+ *     the base64 of the previously-flushed state (or null / empty string
+ *     for a fresh client). The format is the same length-prefixed binary
+ *     `BotMlsClient::dump_state` produced, so EXISTING `mls-state.b64`
+ *     files migrate just by being handed back as the load result.
+ *
+ *   - `flushBlob(b64: string): Promise<void>` — invoked after every
+ *     state-mutating wasm method (the existing `flush(self)` async tail).
+ *     Receives the FULL current KV cache as base64; the host writes it
+ *     atomically (e.g. tmp + rename). Awaited so the JS Promise the
+ *     wasm-bindgen method returns only resolves once the host has the
+ *     blob durable.
+ *
+ * The returned handle is the SAME `PersistentBotMlsClient` JS class as
+ * `createPersistentBotClient` returns — every method (generateKeyPackage,
+ * processWelcome, encryptApplicationMessage, …) works identically. The
+ * JS host doesn't see which backend it's on.
+ */
+export function createPersistentBotClientWithCallbacks(bot_did: string, callbacks: any): Promise<PersistentBotMlsClient>;
 
 /**
  * Install a panic hook that pipes Rust panics to the JS console. Call once.

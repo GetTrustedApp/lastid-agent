@@ -303,7 +303,7 @@ export class MlsDispatcher {
       return;
     }
     try {
-      const info = this.#mls.processWelcome(welcomeB64);
+      const info = await this.#mls.processWelcome(welcomeB64);
       await this.#mls.persist();
       this.#log(
         `[lastid-agent] joined MLS group ${info.group_id_b64} (members=${info.member_count})`,
@@ -376,7 +376,7 @@ export class MlsDispatcher {
 
     let inbound;
     try {
-      inbound = this.#mls.processInbound(mlsMessageB64);
+      inbound = await this.#mls.processInbound(mlsMessageB64);
     } catch (err) {
       this.#log(`[lastid-agent] processInbound failed: ${errText(err)}`);
       return;
@@ -452,7 +452,7 @@ export class MlsDispatcher {
       return;
     }
     try {
-      this.#mls.processInbound(mlsCommitB64);
+      await this.#mls.processInbound(mlsCommitB64);
       await this.#mls.persist();
     } catch (err) {
       const msg = err?.message ?? String(err);
@@ -475,7 +475,7 @@ export class MlsDispatcher {
       return;
     }
     try {
-      this.#mls.processInbound(mlsProposalB64);
+      await this.#mls.processInbound(mlsProposalB64);
       await this.#mls.persist();
     } catch (err) {
       this.#log(`[lastid-agent] proposal processing failed: ${errText(err)}`);
@@ -528,7 +528,7 @@ export class MlsDispatcher {
 
     try {
       if (meIsCommitter) {
-        const result = this.#mls.commitPendingProposals(groupIdB64);
+        const result = await this.#mls.commitPendingProposals(groupIdB64);
         await this.#mls.persist();
         this.#log(
           `[lastid-agent] committed pending proposals group=${groupIdB64} ` +
@@ -545,7 +545,7 @@ export class MlsDispatcher {
           });
         }
       } else {
-        this.#mls.rollbackPendingCommit(groupIdB64);
+        await this.#mls.rollbackPendingCommit(groupIdB64);
         await this.#mls.persist();
         this.#log(
           `[lastid-agent] rolled back pending commit group=${groupIdB64} ` +
@@ -577,7 +577,7 @@ export class MlsDispatcher {
       return;
     }
     try {
-      this.#mls.forgetGroup(groupIdB64);
+      await this.#mls.forgetGroup(groupIdB64);
       await this.#mls.persist();
       this.#log(`[lastid-agent] forgot dissolved group ${groupIdB64}`);
     } catch (err) {

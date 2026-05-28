@@ -1001,6 +1001,37 @@ function createMlsOrchestrator(bot_did, my_did, directory, transport, host) {
 exports.createMlsOrchestrator = createMlsOrchestrator;
 
 /**
+ * Node-side orchestrator constructor: same shape as `createMlsOrchestrator`
+ * but the RawKv backing is JS-callback-based instead of IndexedDB. The
+ * callback bundle is the same `{ loadBlob, flushBlob }` shape
+ * `createPersistentBotClientWithCallbacks` accepts — passing a separate
+ * bundle (vs sharing the agent client's) is intentional: the agent's MLS
+ * group state and the orchestrator's group-store keys both live in the same
+ * `mls-state.b64`-style blob in the host's data dir, but the orchestrator's
+ * reconcile/rotate paths are an independent process — they don't share an
+ * in-memory cache with the agent's main client (yet). To start, give them
+ * their own `loadBlob`/`flushBlob` pointing at distinct files. Future work
+ * can unify the backend (mirroring how the browser's `IndexedDbRawKv::open`
+ * is process-cached).
+ * @param {string} bot_did
+ * @param {string} my_did
+ * @param {any} directory
+ * @param {any} transport
+ * @param {any} host
+ * @param {any} callbacks
+ * @returns {Promise<MlsOrchestrator>}
+ */
+function createMlsOrchestratorWithCallbacks(bot_did, my_did, directory, transport, host, callbacks) {
+    const ptr0 = passStringToWasm0(bot_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(my_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.createMlsOrchestratorWithCallbacks(ptr0, len0, ptr1, len1, directory, transport, host, callbacks);
+    return ret;
+}
+exports.createMlsOrchestratorWithCallbacks = createMlsOrchestratorWithCallbacks;
+
+/**
  * Open or rehydrate a persistent MLS client for `bot_did`. If
  * IndexedDB has prior `mls_kv` rows for this scope they are
  * loaded into the in-mem cache; if not, the client starts
@@ -1020,6 +1051,42 @@ function createPersistentBotClient(bot_did) {
     return ret;
 }
 exports.createPersistentBotClient = createPersistentBotClient;
+
+/**
+ * Open or rehydrate a persistent MLS client for `bot_did` with host-
+ * supplied storage callbacks. Designed for Node — the agent plugin runs
+ * outside a browser so `IndexedDbRawKv` (web-sys-backed) isn't an option.
+ *
+ * `callbacks` is a plain JS object with two Function fields:
+ *
+ *   - `loadBlob(): Promise<string | null>` — invoked ONCE at open. Return
+ *     the base64 of the previously-flushed state (or null / empty string
+ *     for a fresh client). The format is the same length-prefixed binary
+ *     `BotMlsClient::dump_state` produced, so EXISTING `mls-state.b64`
+ *     files migrate just by being handed back as the load result.
+ *
+ *   - `flushBlob(b64: string): Promise<void>` — invoked after every
+ *     state-mutating wasm method (the existing `flush(self)` async tail).
+ *     Receives the FULL current KV cache as base64; the host writes it
+ *     atomically (e.g. tmp + rename). Awaited so the JS Promise the
+ *     wasm-bindgen method returns only resolves once the host has the
+ *     blob durable.
+ *
+ * The returned handle is the SAME `PersistentBotMlsClient` JS class as
+ * `createPersistentBotClient` returns — every method (generateKeyPackage,
+ * processWelcome, encryptApplicationMessage, …) works identically. The
+ * JS host doesn't see which backend it's on.
+ * @param {string} bot_did
+ * @param {any} callbacks
+ * @returns {Promise<PersistentBotMlsClient>}
+ */
+function createPersistentBotClientWithCallbacks(bot_did, callbacks) {
+    const ptr0 = passStringToWasm0(bot_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.createPersistentBotClientWithCallbacks(ptr0, len0, callbacks);
+    return ret;
+}
+exports.createPersistentBotClientWithCallbacks = createPersistentBotClientWithCallbacks;
 
 /**
  * Install a panic hook that pipes Rust panics to the JS console. Call once.
@@ -1084,6 +1151,10 @@ function __wbg_get_imports() {
         __wbg__wbg_cb_unref_3c3b4f651835fbcb: function(arg0) {
             arg0._wbg_cb_unref();
         },
+        __wbg_call_7f2987183bb62793: function() { return handleError(function (arg0, arg1) {
+            const ret = arg0.call(arg1);
+            return ret;
+        }, arguments); },
         __wbg_call_d578befcc3145dee: function() { return handleError(function (arg0, arg1, arg2) {
             const ret = arg0.call(arg1, arg2);
             return ret;
@@ -1483,17 +1554,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 906, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 968, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 729, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 791, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 714, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 776, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb211d42f6d42ba37);
             return ret;
         },

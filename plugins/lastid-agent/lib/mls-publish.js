@@ -101,15 +101,17 @@ export async function publishAgentKeyPackage({
   const items = [];
   for (let i = 0; i < REGULAR_COUNT; i++) {
     items.push({
-      key_package: mls.generateKeyPackage(),
+      key_package: await mls.generateKeyPackage(),
       device_id: deviceId,
     });
   }
   items.push({
-    key_package: mls.generateKeyPackage(),
+    key_package: await mls.generateKeyPackage(),
     device_id: deviceId,
     is_last_resort: true,
   });
+  // generateKeyPackage already auto-flushes via the storage-provider's
+  // flushBlob callback; persist() is a kept-for-compat no-op.
   await mls.persist();
 
   const url = `${trimmed}/v1/mls/keypackages/batch`;
