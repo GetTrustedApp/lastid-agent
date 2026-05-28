@@ -104,6 +104,20 @@ export async function persistAgentVc(provisioned, scope = 'main') {
 }
 
 /**
+ * Persist (or update) the operator's project_root_seed for a scope.
+ * Used by the sub-agent provisioning flow to backfill the seed into
+ * a sub-scope's keychain so its listener can decrypt global-shared
+ * rules + memories. Pure write helper — no side effects beyond the
+ * single keychain entry.
+ *
+ * `projectRootSeedB64` is the operator's seed, base64url-encoded.
+ */
+export async function persistProjectRootSeed(scope, projectRootSeedB64) {
+  if (typeof projectRootSeedB64 !== 'string' || projectRootSeedB64.length === 0) return;
+  await writeSecret(`${SERVICE_PROJECT_ROOT_SEED}:${scope}`, projectRootSeedB64);
+}
+
+/**
  * Persist a sub-agent's identity bundle keyed by class slug.
  */
 export async function persistSubAgentVc(classSlug, sub) {

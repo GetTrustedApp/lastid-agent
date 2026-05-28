@@ -72,6 +72,11 @@ export async function provisionSubagent({
   parentDid,
   parentVcCompact,
   parentScope,
+  // Operator's project_root_seed — shared across ALL the operator's agents
+  // (parent + every sub) so they can all decrypt the same global-shared
+  // rules + memories. Sub-agents don't have their own; they reuse the
+  // operator's, passed in by the parent listener.
+  parentProjectRootSeed = null,
   subagent,
   fetchImpl = globalThis.fetch,
 }) {
@@ -107,6 +112,24 @@ export async function provisionSubagent({
       process.stderr.write(
         `[lastid-agent] subagent already provisioned: scope=${subScope} (caps match)\n`,
       );
+      // Backfill: ensure the operator's project_root_seed is in the
+      // sub-scope's keychain. Sub-agents provisioned BEFORE this fix
+      // landed never got the seed → their listener can't decrypt
+      // global-shared rules + memories. Writing it idempotently here
+      // closes that gap on the next sync without forcing a VC re-mint.
+      if (parentProjectRootSeed && Buffer.isBuffer(parentProjectRootSeed)) {
+        try {
+          const { persistProjectRootSeed } = await import('./keychain.js');
+          await persistProjectRootSeed(
+            subScope,
+            Buffer.from(parentProjectRootSeed).toString('base64url'),
+          );
+        } catch (err) {
+          process.stderr.write(
+            `[lastid-agent] subagent project_root_seed backfill failed (non-fatal): scope=${subScope} err=${err?.message ?? err}\n`,
+          );
+        }
+      }
       // Even on the already-provisioned path, make sure the listener
       // daemon is alive. A previous successful provision spawned it, but
       // a host reboot / SIGKILL / stale-version cleanup could have left
@@ -263,6 +286,13 @@ export async function provisionSubagent({
       agentDid: subAgentDid,
       vcCompact: issued.credential,
       idpUrl,
+      // Forward the operator's project_root_seed — shared across all
+      // the operator's agents. Without this the sub-agent's listener
+      // can decrypt per-agent records (under its own slot_seed) but
+      // NOT global-shared records (rules + memories the operator
+      // published with target='global'), so the sub-agent runs
+      // ungoverned. persistAgentVc no-ops when this is null/missing.
+      ...(parentProjectRootSeed ? { projectRootSeed: parentProjectRootSeed } : {}),
     },
     subScope,
   );
@@ -394,6 +424,7 @@ export async function selfHealSubagents({
   parentDid,
   parentVcCompact,
   parentScope,
+  parentProjectRootSeed = null,
   fetchImpl = globalThis.fetch,
 }) {
   const { listSubagents } = await import('./subagents.js');
@@ -413,6 +444,7 @@ export async function selfHealSubagents({
         parentDid,
         parentVcCompact,
         parentScope,
+        parentProjectRootSeed,
         subagent: {
           slug: entry.slug,
           name: entry.name,

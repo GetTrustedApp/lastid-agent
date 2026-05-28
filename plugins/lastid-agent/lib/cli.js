@@ -1490,6 +1490,7 @@ async function cmdListen(flags) {
               parentDid: loaded.agentDid,
               parentVcCompact: loaded.vcCompact,
               parentScope: scope,
+              parentProjectRootSeed: loaded.projectRootSeed,
             });
             if (heal.attempted > 0) {
               process.stderr.write(

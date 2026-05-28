@@ -317,6 +317,7 @@ export async function syncAgentState({
               parentDid: agentDid,
               parentVcCompact: vcCompact,
               parentScope: scope,
+              parentProjectRootSeed: projectRootSeed,
               subagent: storeRecord.content,
               fetchImpl,
             });
