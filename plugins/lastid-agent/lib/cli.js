@@ -1514,7 +1514,7 @@ async function cmdListen(flags) {
     },
     // Doorbell events trigger a sync and are not MLS frames; everything
     // else goes to the MLS dispatcher.
-    onEvent: (evt) => {
+    onEvent: async (evt) => {
       // TEMP DIAGNOSTIC: log every WS event type the listener sees so we can
       // disambiguate "IdP not broadcasting" vs "listener dropping events".
       // Remove once the doorbell sync flow is confirmed reliable.
@@ -1524,7 +1524,20 @@ async function cmdListen(flags) {
         );
       } catch { /* never break the dispatch on a log */ }
       if (onDoorbell(evt)) return;
-      dispatcher.onEvent(evt);
+      // Await the dispatcher so the ws-client layer's own try/catch can
+      // trap any rejection — without an await the rejection becomes an
+      // unhandledRejection on the loop tick (Node v15+ kills the process).
+      // The dispatcher already serializes internally via its single-flight
+      // chain (mls-dispatch.js:#chain), so awaits here don't change ordering.
+      try {
+        await dispatcher.onEvent(evt);
+      } catch (err) {
+        process.stderr.write(
+          `[lastid-agent] dispatcher.onEvent threw (caught): ${
+            err instanceof Error ? err.message : String(err)
+          }\n`,
+        );
+      }
     },
     onError: (err) => process.stderr.write(`[lastid-agent] ws error: ${err.message}\n`),
   });
@@ -1837,6 +1850,36 @@ async function cmdListen(flags) {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  // Stay-alive guards. Node v15+ defaults to terminating on an
+  // unhandledRejection — wasm-bindgen's borrow-tracking panic
+  // ("recursive use of an object detected ...") is thrown from inside a
+  // wasm future and was killing the listener mid-session (witnessed
+  // 2026-05-28 right after a welcome→queue_batch→message burst, before
+  // the dispatcher's serialization fix landed). Belt-and-suspenders: log
+  // the reason but DO NOT exit, so an isolated wasm or async error in
+  // one inbound never strands the operator with a dead listener. The
+  // SIGINT/SIGTERM paths above remain the only intentional shutdown.
+  process.on('unhandledRejection', (reason) => {
+    try {
+      process.stderr.write(
+        `[lastid-agent] unhandledRejection (kept alive): ${
+          reason instanceof Error
+            ? `${reason.message}\n${reason.stack ?? ''}`
+            : String(reason)
+        }\n`,
+      );
+    } catch { /* never throw from the guard */ }
+  });
+  process.on('uncaughtException', (err) => {
+    try {
+      process.stderr.write(
+        `[lastid-agent] uncaughtException (kept alive): ${
+          err instanceof Error ? `${err.message}\n${err.stack ?? ''}` : String(err)
+        }\n`,
+      );
+    } catch { /* never throw from the guard */ }
+  });
 
   // Parent-session watchdog. The detached listener is tied to the Claude Code
   // session that spawned it: the SessionStart hook resolves that session's PID

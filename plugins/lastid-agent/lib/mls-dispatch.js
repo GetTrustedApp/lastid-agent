@@ -152,6 +152,20 @@ export class MlsDispatcher {
   #log;
   #requestSend;
   #onOperatorMessage;
+  // Single-flight chain that serializes every entry through onEvent.
+  // The wasm MLS client is built on RefCell-backed state; two concurrent
+  // calls to methods on the same handle trip wasm-bindgen's borrow tracker
+  // ("recursive use of an object detected which would lead to unsafe
+  // aliasing in rust") and throw — and historically that throw escapes the
+  // listener as an unhandled rejection that kills the process. The crash
+  // ships up the stack from `js_sys::futures::future_to_promise` so a
+  // top-level try/catch in onEvent isn't enough — the real fix is to never
+  // let two onEvent calls overlap on the same wasm handle. Mirrors native's
+  // per-runtime `mls_membership_reconcile_lock` and lastid.co's
+  // `queueOrchestratorCall`. Callers (cli.js's WS callback) had been
+  // fire-and-forgetting onEvent without an await — that's why this lives
+  // inside the dispatcher: defense in depth, immune to caller slips.
+  #chain = Promise.resolve();
 
   /** @param {DispatcherOptions} opts */
   constructor({ mls, scope = 'main', log, requestSend, onOperatorMessage }) {
@@ -167,12 +181,33 @@ export class MlsDispatcher {
   }
 
   /**
-   * Entry point the WS layer calls for every inbound event. Inbound
-   * serialization (welcome-then-message ordering) is enforced by
-   * the caller via a Promise chain; this method only needs to be
-   * async — concurrent calls remain a programmer error.
+   * Entry point the WS layer calls for every inbound event. Serializes
+   * all dispatch through #chain so concurrent WS frames (welcome
+   * immediately followed by a queued message, etc.) can't race the
+   * underlying wasm MLS handle. The returned promise resolves AFTER the
+   * event has been fully processed — even if a caller fire-and-forgets,
+   * the next onEvent call still queues behind it.
    */
-  async onEvent(event) {
+  onEvent(event) {
+    const task = () => this.#dispatchEvent(event);
+    // .then(task, task) so a rejection in a prior task still lets the
+    // next one run — never let one bad frame stall the entire listener.
+    const next = this.#chain.then(task, task);
+    // Swallow on the stored chain so a rejection in `next` doesn't
+    // become an UnhandledPromiseRejection on the NEXT loop tick — the
+    // value returned to the caller still carries the original error.
+    this.#chain = next.catch(() => undefined);
+    return next;
+  }
+
+  /**
+   * The actual dispatch body — called only from within the single-flight
+   * #chain (via onEvent) or from #handleQueueBatch's recursive replay.
+   * Calling this directly bypasses the mutex; that is intentional for
+   * queue_batch replay (it's already inside the mutex via its parent
+   * onEvent call, and re-entering the mutex would deadlock).
+   */
+  async #dispatchEvent(event) {
     const type = typeof event?.type === 'string' ? event.type : null;
     if (!type) {
       this.#log('[lastid-agent] inbound event missing type; ignoring');
@@ -221,7 +256,7 @@ export class MlsDispatcher {
           await this.#defensiveMlsRoute(event);
       }
     } catch (err) {
-      this.#log(`[lastid-agent] dispatch ${type} threw: ${err?.message ?? err}`);
+      this.#log(`[lastid-agent] dispatch ${type} threw: ${errText(err)}`);
     }
   }
 
@@ -280,11 +315,15 @@ export class MlsDispatcher {
       // flat at top level — accept both.
       const inner = m.payload && typeof m.payload === 'object' ? m.payload : m;
       try {
-        await this.onEvent({ type: mtype, payload: inner });
+        // Use the internal dispatcher — we're already running inside the
+        // single-flight #chain (entered via onEvent for the queue_batch
+        // frame itself), so re-entering through onEvent would deadlock
+        // waiting for our own outer mutex to release.
+        await this.#dispatchEvent({ type: mtype, payload: inner });
         handled += 1;
       } catch (err) {
         this.#log(
-          `[lastid-agent] queue_batch replay of ${mtype} threw: ${err?.message ?? err}`,
+          `[lastid-agent] queue_batch replay of ${mtype} threw: ${errText(err)}`,
         );
       }
     }
