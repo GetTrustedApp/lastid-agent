@@ -193,8 +193,18 @@ test('directory.own_devices fetches GET /v1/devices and maps active devices to {
         // Sanity: the helper closes over auth() — verify it threads through.
         assert.equal(a.agentDid, ctx.agentDid);
         return [
-          { device_id: 'device-listener-1', last_seen: '2026-05-28T15:00:00.000Z', active: true },
-          { device_id: 'device-inactive', last_seen: null, active: false },
+          {
+            device_id: 'device-listener-1',
+            device_identity: 'device-listener-1',
+            last_seen: '2026-05-28T15:00:00.000Z',
+            active: true,
+          },
+          {
+            device_id: 'device-inactive',
+            device_identity: 'device-inactive',
+            last_seen: null,
+            active: false,
+          },
         ];
       },
     },
@@ -203,6 +213,9 @@ test('directory.own_devices fetches GET /v1/devices and maps active devices to {
   const out = JSON.parse(json);
   assert.equal(out.length, 1);
   assert.equal(out[0].device_id, 'device-listener-1');
+  // lastid-mls-core/reconcile.rs:98 filters live devices by `device_identity`
+  // — lock the wire so a regression where we drop it goes loud here.
+  assert.equal(out[0].device_identity, 'device-listener-1');
   assert.equal(out[0].did, ctx.agentDid);
 });
 

@@ -114,15 +114,21 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
     },
 
     async own_devices(_argJson) {
-      // Hit GET /v1/devices for the agent's REAL device list so the
-      // orchestrator reconciles with proper device_ids (the prior
-      // synthetic `{device_id: ctx.agentDid}` placeholder confused any
-      // downstream code that compared device_ids — including the IdP
-      // ledger view used by `fetch_member_device_resolution`).
+      // Hit GET /v1/identity/devices (V2 endpoint) for the agent's REAL
+      // device list so the orchestrator reconciles with proper device_ids
+      // (the prior synthetic `{device_id: ctx.agentDid}` placeholder confused
+      // any downstream code that compared device_ids — including the IdP
+      // ledger view used by `fetch_member_device_resolution`). Passes
+      // `device_identity` through because lastid-mls-core/reconcile.rs:98
+      // filters live devices by that field.
       const list = await directoryDeps.listOwnDevices(auth());
       const records = list
         .filter((d) => d.active)
-        .map((d) => ({ device_id: d.device_id, did: ctx.agentDid }));
+        .map((d) => ({
+          device_id: d.device_id,
+          device_identity: d.device_identity,
+          did: ctx.agentDid,
+        }));
       return stringifyReturn(records);
     },
 
