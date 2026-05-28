@@ -235,6 +235,23 @@ export class PersistentBotMlsClient {
      */
     createGroup(group_id_b64: string): Promise<string>;
     /**
+     * Construct an `MlsOrchestrator` that SHARES this handle's openmls
+     * storage. The orchestrator's internal `PersistentBotMlsClient` is built
+     * on a clone of this handle's `IndexedDbRawKv`; because that backend's
+     * in-memory cache + pending-flush queue + DB handle are all `Arc`-shared,
+     * a write through one is visible to both.
+     *
+     * This is the supported way to obtain an orchestrator in any host that
+     * also calls direct `PersistentBotMlsClient` methods (e.g. the console
+     * dock's `encryptApplicationMessage` send path) — using the free
+     * `createMlsOrchestrator` constructor gives the orchestrator its OWN
+     * `IndexedDbRawKv` instance, whose cache is rehydrated once at open and
+     * then diverges from the handle's cache. The dock would then call into
+     * the handle for send + see a stale cache → `MlsGroup::load` returns
+     * None → "group state not found for id …".
+     */
+    createOrchestrator(my_did: string, directory: any, transport: any, host: any): Promise<MlsOrchestrator>;
+    /**
      * Destroy a group. Returns JSON `DestroyGroupResult`.
      */
     destroyGroup(group_id_b64: string, farewell_plaintext_b64: string): Promise<string>;
@@ -321,23 +338,6 @@ export function ciphersuiteSupportJson(): string;
  */
 export function computeMemberReconcilePlan(input_json: string): string;
 
-/**
- * Construct an orchestrator. Opens/rehydrates the IDB-backed RawKv backend
- * for `bot_did` (the same scope key existing `createPersistentBotClient`
- * uses, so the openmls state + this orchestrator's group-store keys share
- * one IDB database scoped per-bot — never cross-contaminates), builds a
- * PersistentBotMlsClient on it, then wires the three JS callback bundles
- * into the W1 port impls.
- *
- * `my_did` is the identity the orchestration reports via
- * [`lastid_mls_core::ports::MlsClientPort::my_did`] — usually the same as
- * `bot_did` for a bot, or the operator DID for a console/agent use.
- *
- * The three callback args (`directory` / `transport` / `host`) are plain JS
- * objects with Function-typed fields. See the W1 callback bundle docs for
- * the exact JSON arg/return shape of each Function — JS just supplies
- * thunks returning Promises.
- */
 export function createMlsOrchestrator(bot_did: string, my_did: string, directory: any, transport: any, host: any): Promise<MlsOrchestrator>;
 
 /**
