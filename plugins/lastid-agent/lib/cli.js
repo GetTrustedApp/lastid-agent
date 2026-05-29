@@ -2025,9 +2025,25 @@ async function cmdRun(flags, cmdArgv) {
 
   // Mint a single-use handle (runs the full policy / approval / rate gate in the
   // listener). The secret is NOT released by this step.
+  //
+  // `--purpose "..."` is what the operator sees in the approval dialog under
+  // INTENT. The CLI is run by an agent (Claude / human), and the operator
+  // can't tell why this specific aws/gh/psql call wants the credential
+  // without it. Mobile + console both surface this; the CLI is the only
+  // path that lacked a flag, so approvals showed no INTENT section.
+  // Recommended: every wrapped command takes --purpose so every approval
+  // dialog reads "What it wants to do: <verb>".
+  const purpose = typeof flags.purpose === 'string' && flags.purpose.length > 0
+    ? flags.purpose
+    : undefined;
   let used;
   try {
-    used = await vaultRequest(scope, { op: 'vault_use', item_id: itemId, ctx: { now_ms: Date.now() } });
+    used = await vaultRequest(scope, {
+      op: 'vault_use',
+      item_id: itemId,
+      purpose,
+      ctx: { now_ms: Date.now() },
+    });
   } catch (e) {
     process.stderr.write(`run: vault listener unreachable (${e?.message ?? e}). Is the agent listener running?\n`);
     exit(1);
