@@ -579,8 +579,17 @@ export async function startVaultServer({ scope = 'main', deps }) {
 }
 
 /** Client (used by the MCP tool process): send one request, read one reply.
- *  Rejects if the listener socket isn't there (no listener running). */
-export function vaultRequest(scope, req, { timeoutMs = 30_000 } = {}) {
+ *  Rejects if the listener socket isn't there (no listener running).
+ *
+ *  Default timeout is 10min to cover the full operator-approval window
+ *  inside the listener — vault_use's approval loop blocks up to
+ *  use-approval-loop's PENDING_TTL_MS (5min) waiting for the operator's
+ *  decision JWS, plus headroom for cross-device propagation. Pre-fix the
+ *  default was 30s; a slow operator-decision time produced a misleading
+ *  "vault IPC timeout" while the listener was still happily polling, the
+ *  operator's eventual approval landed against a dead client, and the
+ *  whole flow looked broken when it was just impatient. */
+export function vaultRequest(scope, req, { timeoutMs = 600_000 } = {}) {
   const sockPath = vaultSocketPath(scope);
   return new Promise((resolve, reject) => {
     const conn = createConnection(sockPath);
