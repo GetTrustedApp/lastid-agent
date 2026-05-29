@@ -436,6 +436,8 @@ export class MlsDispatcher {
       // max_past_epochs surfaces as WrongEpoch or TooDistantInThePast.
       // GroupNotFound = dissolved. All three are expected MLS conditions
       // in a multi-device flow; drop silently.
+      const dropGroup =
+        event?.payload?.group_id ?? event?.payload?.group_id_b64 ?? '?';
       if (
         msg.includes('GroupNotFound') ||
         msg.includes('group_not_found') ||
@@ -444,6 +446,14 @@ export class MlsDispatcher {
         msg.includes('TooDistantInThePast') ||
         msg.includes('too_distant_in_the_past')
       ) {
+        // DIAGNOSTIC (multi-device): normally expected MLS races, but we were
+        // going dark on the operator's first message even though the agent is
+        // a direct member — surface the reason so we can see WHY it didn't
+        // decrypt instead of dropping silently.
+        this.#log(
+          `[lastid-agent] inbound dropped (expected-MLS) group=${dropGroup} ` +
+            `sender=${senderDid ?? '?'}: ${msg}`,
+        );
         return;
       }
       this.#log(`[lastid-agent] processInbound failed: ${msg}`);
@@ -459,13 +469,25 @@ export class MlsDispatcher {
     // Non-application inbound (commit, proposal, external) only
     // mutated MLS group state — already captured by the persist
     // above. No envelope to write to the inbox.
-    if (inbound?.kind !== 'application') return;
+    if (inbound?.kind !== 'application') {
+      this.#log(
+        `[lastid-agent] inbound kind=${inbound?.kind ?? '?'} (not application) ` +
+          `group=${event?.payload?.group_id ?? event?.payload?.group_id_b64 ?? '?'} — no inbox write`,
+      );
+      return;
+    }
 
     // Wasm returns `plaintext_b64`. (The previous version of this
     // file read `application_b64`, which never matched — so all
     // operator messages were silently dropped before this fix.)
     const plaintextB64 = inbound?.plaintext_b64;
-    if (typeof plaintextB64 !== 'string') return;
+    if (typeof plaintextB64 !== 'string') {
+      this.#log(
+        `[lastid-agent] application inbound missing plaintext_b64 ` +
+          `(keys=${Object.keys(inbound ?? {}).join(',')}) — dropping`,
+      );
+      return;
+    }
 
     let envelope;
     try {
