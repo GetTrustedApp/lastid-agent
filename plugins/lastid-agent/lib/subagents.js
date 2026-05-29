@@ -612,6 +612,53 @@ async function writeInvocationState(parentScope, invocationId, state) {
 }
 
 /**
+ * Per-sub-scope file the parent writes BEFORE spawning a backgrounded
+ * sub-agent, carrying the invocation context (invocationId + parent
+ * scope). The child's lastid_progress tool reads this to find its
+ * anchor — by sub-scope, NOT env vars, because Claude Code's MCP
+ * server launcher filters arbitrary env (LASTID_AGENT_SCOPE survives,
+ * arbitrary LASTID_SUBAGENT_* gets stripped — empirically 2026-05-28).
+ * Sub-scope IS reachable: it's the spawned helper's working scope and
+ * derivable from LASTID_AGENT_SCOPE which does propagate. The parent
+ * deletes the file on terminal state so a future foreground invoke of
+ * the same helper doesn't accidentally pick up a stale context.
+ */
+export function activeInvocationContextPath(subScope) {
+  return join(scopeDirFor(subScope), 'active-invocation.json');
+}
+
+export async function writeActiveInvocationContext({ subScope, invocationId, parentScope }) {
+  const p = activeInvocationContextPath(subScope);
+  await mkdir(scopeDirFor(subScope), { recursive: true });
+  const tmp = `${p}.${randomBytes(4).toString('hex')}.tmp`;
+  await writeFile(tmp, JSON.stringify({ invocationId, parentScope }, null, 2), 'utf-8');
+  const { rename } = await import('node:fs/promises');
+  await rename(tmp, p);
+}
+
+export async function readActiveInvocationContext(subScope) {
+  try {
+    const raw = await readFile(activeInvocationContextPath(subScope), 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.invocationId === 'string' && typeof parsed?.parentScope === 'string') {
+      return { invocationId: parsed.invocationId, parentScope: parsed.parentScope };
+    }
+    return null;
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+export async function clearActiveInvocationContext(subScope) {
+  try {
+    await rm(activeInvocationContextPath(subScope), { force: true });
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
  * Append a progress entry to a running backgrounded invocation's state
  * file. Called by the child sub-agent's `lastid_progress` MCP tool to
  * stream stage updates back to the parent without waiting on the
@@ -831,6 +878,16 @@ export async function invokeSubagent({
       timeout_ms: timeoutMs,
     };
     await writeInvocationState(parentScope, invocationId, initialState);
+    // Drop a per-sub-scope context file the child's lastid_progress tool
+    // reads to find its anchor. Done HERE (not in buildSpawnArgs) so the
+    // file exists on disk before the child's MCP server boots + tries
+    // to read it. Cleared in recordTerminal below so a future foreground
+    // invoke of the same helper doesn't pick up stale context.
+    await writeActiveInvocationContext({
+      subScope: entry.scope,
+      invocationId,
+      parentScope,
+    });
 
     const child = spawn(cmd, args, {
       env,
@@ -905,6 +962,9 @@ export async function invokeSubagent({
       }
       try { await rm(sysPromptPath, { force: true }); } catch { /* */ }
       try { await rm(mcpConfigPath, { force: true }); } catch { /* */ }
+      // Clear the per-sub-scope context file so a future foreground invoke
+      // of the same helper doesn't pick up this run's stale invocation_id.
+      await clearActiveInvocationContext(entry.scope);
     };
 
     child.on('error', (err) => {

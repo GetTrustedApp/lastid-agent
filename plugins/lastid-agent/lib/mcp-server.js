@@ -560,17 +560,23 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
     const stage = typeof _args?.stage === 'string' ? _args.stage.trim() : '';
     const detail = typeof _args?.detail === 'string' ? _args.detail.trim() : '';
     if (!stage) throw new Error('lastid_progress: stage required (non-empty string)');
-    // We're inside a backgrounded sub-agent ONLY when both env vars are set
-    // (injected by buildSpawnArgs's invocationContext path). Foreground spawns
-    // and the parent's own session don't see them — silent no-op there, so
-    // sprinkling lastid_progress in helper agent.md prompts is always safe.
-    const invocationId = process.env.LASTID_SUBAGENT_INVOCATION_ID;
-    const parentScope = process.env.LASTID_SUBAGENT_PARENT_SCOPE;
-    if (!invocationId || !parentScope) {
+    // We're inside a backgrounded sub-agent when the parent has dropped an
+    // active-invocation.json in this sub-scope's dir. Why a file and not
+    // env vars: Claude Code's MCP server launcher passes LASTID_AGENT_SCOPE
+    // through to the spawned MCP process but filters arbitrary other env
+    // (LASTID_SUBAGENT_* gets stripped — empirically 2026-05-28). LASTID_
+    // AGENT_SCOPE survives, so we use it to find the per-scope context
+    // file the parent wrote pre-spawn. Foreground spawns + the parent's own
+    // session won't have the file → silent no-op.
+    const { readActiveInvocationContext } = await import('./subagents.js');
+    const ctx = await readActiveInvocationContext(scope).catch(() => null);
+    if (!ctx) {
       return {
         content: [{ type: 'text', text: JSON.stringify({ ok: true, recorded: false, reason: 'not running in a backgrounded invocation' }, null, 2) }],
       };
     }
+    const invocationId = ctx.invocationId;
+    const parentScope = ctx.parentScope;
     const { appendInvocationProgress } = await import('./subagents.js');
     try {
       await appendInvocationProgress({
