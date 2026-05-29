@@ -113,15 +113,21 @@ export async function fetchPeerKeyPackages({
 }
 
 /**
- * GET /v1/identity/devices — V2 endpoint for the authenticated principal's
- * own active devices. The legacy `/v1/devices` is V1-only (master_fingerprint
- * keyed; v2 identities have no row in that collection — see IdP
- * prekey-storage.ts:320-322) and returns [] for v2, which made the MLS
- * orchestrator's reconcile decide "no live devices → evict everything" and
- * error out. `/v1/identity/devices` hits handleListDevices →
- * queryActiveDeviceRecordsForIdentity which is V2-aware. Reads `device_id`
- * AND `device_identity` because lastid-mls-core/reconcile.rs:98 filters by
- * `device_identity` when matching the own-device set.
+ * GET /v1/trust/:agent_did/devices — resolve the agent's OWN active device(s)
+ * through the SAME durable resolver every other participant uses to resolve a
+ * peer (IdP `handleGetPeerDevices` → `resolveDurableActiveDeviceIdsForDid` →
+ * `deriveAgentDeviceIds`). Self-reads are authorized because the auth
+ * middleware lets a principal enumerate its own devices (subjectDid ===
+ * targetDid).
+ *
+ * This deliberately replaces the old `/v1/identity/devices` call: that is a V1
+ * master_fingerprint path and 400s for agents (a child of a v2-only identity
+ * has no v2 identity/device row of its own). Routing self-resolution through
+ * the peer endpoint keeps ONE resolution source for the agent — what the agent
+ * sees of itself is byte-identical to what the operator's phone/desktop/console
+ * see of it — so reconcile can never desync on a device-id mismatch. The agent
+ * owns exactly one device and has no P-256 prekey; `device_identity` ==
+ * `device_id`. The endpoint returns `active` per device (no `status` string).
  *
  * @returns {Promise<Array<{ device_id: string, device_identity: string, last_seen: string|null, active: boolean }>>}
  */
@@ -132,10 +138,11 @@ export async function listOwnDevices({
   signingKey,
   fetchImpl,
 }) {
+  if (!agentDid) throw new Error('listOwnDevices: agentDid required');
   const body = await authedIdpFetch({
     idpUrl,
     method: 'GET',
-    path: '/v1/identity/devices',
+    path: `/v1/trust/${encodeURIComponent(agentDid)}/devices`,
     agentDid,
     vcCompact,
     signingKey,
@@ -145,16 +152,15 @@ export async function listOwnDevices({
   return list
     .map((d) => {
       const deviceId = typeof d?.device_id === 'string' ? d.device_id : '';
-      const deviceIdentity =
-        typeof d?.device_identity === 'string' && d.device_identity.length > 0
-          ? d.device_identity
-          : deviceId;
-      const status = typeof d?.status === 'string' ? d.status.toLowerCase() : 'active';
       return {
         device_id: deviceId,
-        device_identity: deviceIdentity,
+        // Agents own one device whose id IS its identity — the trust endpoint
+        // does not carry a separate device_identity field.
+        device_identity: deviceId,
         last_seen: typeof d?.last_seen === 'string' ? d.last_seen : null,
-        active: status !== 'revoked' && status !== 'inactive',
+        // Endpoint marks each returned device active; treat a missing flag as
+        // active, only an explicit false excludes (it never returns revoked).
+        active: d?.active !== false,
       };
     })
     .filter((d) => d.device_id.length > 0);

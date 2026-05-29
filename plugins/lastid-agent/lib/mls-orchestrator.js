@@ -115,11 +115,12 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
     },
 
     async own_devices(_argJson) {
-      // Hit GET /v1/identity/devices (V2 endpoint) for the agent's REAL
-      // device list so the orchestrator reconciles with proper device_ids
-      // (the prior synthetic `{device_id: ctx.agentDid}` placeholder confused
-      // any downstream code that compared device_ids — including the IdP
-      // ledger view used by `fetch_member_device_resolution`). Passes
+      // Resolve the agent's REAL device list through the SAME durable resolver
+      // every peer uses (GET /v1/trust/:agentDid/devices, a self-read) so the
+      // orchestrator reconciles with the exact device_ids others resolve for
+      // this agent — no drift between what the agent sees of itself and what
+      // the operator's phone/desktop see of it. (Replaces the old
+      // /v1/identity/devices V1 path, which 400s for agents.) Passes
       // `device_identity` through because lastid-mls-core/reconcile.rs:98
       // filters live devices by that field.
       const list = await directoryDeps.listOwnDevices(auth());

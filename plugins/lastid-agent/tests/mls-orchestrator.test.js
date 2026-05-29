@@ -193,12 +193,13 @@ test('directory.fetch_peer_key_packages filters by requested device_ids', async 
   ]);
 });
 
-test('directory.own_devices fetches GET /v1/devices and maps active devices to {device_id, did}', async () => {
+test('directory.own_devices resolves via listOwnDevices and maps active devices to {device_id, device_identity, did}', async () => {
   // Regression for the multi-device gap: previously this returned a single
-  // synthetic `{device_id: agentDid}` entry — same shape openmls's reconcile
+  // synthetic `{device_id: agentDid}` entry — a shape openmls's reconcile
   // can't actually match against the IdP's real device_ids. Now the callback
-  // hits listOwnDevices, filters active=false, and returns the REAL device
-  // ids so the orchestrator can iterate the agent's own device set.
+  // hits listOwnDevices (GET /v1/trust/:agentDid/devices — the durable
+  // resolver), filters active=false, and returns the REAL device ids so the
+  // orchestrator can iterate the agent's own device set.
   const ctx = makeCtx();
   const { directory } = buildCallbackBundles({
     ctx,

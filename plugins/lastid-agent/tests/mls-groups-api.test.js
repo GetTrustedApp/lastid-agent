@@ -12,6 +12,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import {
   authedIdpFetch,
   fetchPeerKeyPackages,
+  listOwnDevices,
   createGroupOnIdp,
   addGroupMember,
 } from '../lib/mls-groups-api.js';
@@ -105,6 +106,67 @@ test('fetchPeerKeyPackages: perDevice:false omits the query string', async () =>
   const fetchImpl = recordingFetch(res({ key_packages: [] }));
   await fetchPeerKeyPackages({ ...AUTH, targetDid: 'did:lastid:zX', perDevice: false, fetchImpl });
   assert.equal(fetchImpl.calls[0].url, 'https://idp.test/v1/mls/keypackages/did%3Alastid%3AzX');
+});
+
+test('listOwnDevices: self-resolves via GET /v1/trust/:agentDid/devices (the durable resolver)', async () => {
+  // The agent resolves its OWN device through the SAME peer endpoint everyone
+  // uses to resolve it — NOT the old /v1/identity/devices V1 path (which 400s
+  // for agents). Locks the URL + the {device_id, device_identity, last_seen,
+  // active} mapping reconcile depends on. device_identity == device_id (agents
+  // own one device whose id is its identity; endpoint carries no separate field).
+  const fetchImpl = recordingFetch(
+    res({
+      peer_did: AUTH.agentDid,
+      devices: [
+        { device_id: 'ad-aaa', last_seen: '2026-05-28T15:00:00.000Z', active: true },
+      ],
+    }),
+  );
+  const out = await listOwnDevices({ ...AUTH, fetchImpl });
+  assert.equal(
+    fetchImpl.calls[0].url,
+    'https://idp.test/v1/trust/did%3Alastid%3Aagent%3AzAgentTest/devices',
+  );
+  assert.deepEqual(out, [
+    {
+      device_id: 'ad-aaa',
+      device_identity: 'ad-aaa',
+      last_seen: '2026-05-28T15:00:00.000Z',
+      active: true,
+    },
+  ]);
+});
+
+test('listOwnDevices: empty device set → [] (agent not active/registered, no throw)', async () => {
+  const fetchImpl = recordingFetch(res({ peer_did: AUTH.agentDid, devices: [] }));
+  const out = await listOwnDevices({ ...AUTH, fetchImpl });
+  assert.deepEqual(out, []);
+});
+
+test('listOwnDevices: active flag — missing → true, explicit false → false; blank device_id dropped', async () => {
+  const fetchImpl = recordingFetch(
+    res({
+      devices: [
+        { device_id: 'ad-present' }, // no active flag → defaults active
+        { device_id: 'ad-off', active: false }, // explicit false preserved
+        { device_id: '', active: true }, // blank id → dropped
+      ],
+    }),
+  );
+  const out = await listOwnDevices({ ...AUTH, fetchImpl });
+  assert.deepEqual(out, [
+    { device_id: 'ad-present', device_identity: 'ad-present', last_seen: null, active: true },
+    { device_id: 'ad-off', device_identity: 'ad-off', last_seen: null, active: false },
+  ]);
+});
+
+test('listOwnDevices: requires agentDid', async () => {
+  const fetchImpl = recordingFetch(res({ devices: [] }));
+  await assert.rejects(
+    () => listOwnDevices({ ...AUTH, agentDid: undefined, fetchImpl }),
+    /listOwnDevices: agentDid required/,
+  );
+  assert.equal(fetchImpl.calls.length, 0); // throws before any network call
 });
 
 test('createGroupOnIdp: posts name + mls_group_init + group_type, returns descriptor', async () => {
