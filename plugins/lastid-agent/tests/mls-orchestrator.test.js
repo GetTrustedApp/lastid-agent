@@ -287,10 +287,34 @@ test('transport.register_direct_group POSTs the group + returns {idp_group_id}',
       bearer: 'ignored',
     }),
   );
-  assert.deepEqual(JSON.parse(json), { idp_group_id: 'idp-uuid-1' });
+  assert.deepEqual(JSON.parse(json), { idp_group_id: 'idp-uuid-1', existing: false });
   assert.equal(createArgs.mlsGroupInitB64, 'GINFO');
   assert.equal(createArgs.groupType, 'direct');
   assert.equal(createArgs.vcCompact, ctx.vcCompact);
+  // The peer is sent so the IdP get-or-creates ONE canonical group per pair;
+  // a normal create forwards forceNew:false (rotation would send true).
+  assert.equal(createArgs.peerDid, ctx.operatorDid);
+  assert.equal(createArgs.forceNew, false);
+});
+
+test('transport.register_direct_group surfaces existing:true when the IdP reused the canonical pair group', async () => {
+  const ctx = makeCtx();
+  const { transport } = buildCallbackBundles({
+    ctx,
+    deps: {
+      async createGroupOnIdp() {
+        return { id: 'canonical-1', mls_group_id: 'mgid', existing: true };
+      },
+    },
+  });
+  const json = await transport.register_direct_group(
+    JSON.stringify({
+      peer_did: ctx.operatorDid,
+      mls_group_init_b64: 'GINFO',
+      bearer: 'ignored',
+    }),
+  );
+  assert.deepEqual(JSON.parse(json), { idp_group_id: 'canonical-1', existing: true });
 });
 
 test('transport.register_direct_group throws if the IdP returns no id', async () => {

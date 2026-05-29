@@ -219,6 +219,7 @@ export async function createGroupOnIdp({
   mlsGroupInitB64,
   groupType = 'direct',
   peerDid,
+  forceNew,
   agentDid,
   vcCompact,
   signingKey,
@@ -232,6 +233,8 @@ export async function createGroupOnIdp({
   // response carries `existing:true` when the IdP returned an already-claimed
   // group for the pair instead of creating a new one.
   if (peerDid) body.peer_did = peerDid;
+  // Rotation self-heal: skip reuse + repoint the pair claim to a fresh group.
+  if (forceNew) body.force_new = true;
   return authedIdpFetch({
     idpUrl,
     method: 'POST',

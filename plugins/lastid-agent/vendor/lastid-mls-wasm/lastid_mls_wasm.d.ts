@@ -302,7 +302,7 @@ export class MlsOrchestrator {
      * `GetTrustedError::MLSError` message string (so the rotation classifier
      * `is_direct_session_stale_error_message` matches across native + wasm).
      */
-    startDirectChat(peer_did: string): Promise<any>;
+    startDirectChat(peer_did: string, force_new?: boolean | null): Promise<any>;
 }
 
 /**

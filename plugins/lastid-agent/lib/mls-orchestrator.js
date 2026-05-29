@@ -214,7 +214,7 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
   // return void to the wasm (the orchestrator only needs success/failure).
   const transport = {
     async register_direct_group(argJson) {
-      const { peer_did, mls_group_init_b64 } = parseArg(argJson);
+      const { peer_did, mls_group_init_b64, force_new } = parseArg(argJson);
       const created = await transportDeps.createGroupOnIdp({
         ...auth(),
         name: 'Direct chat',
@@ -222,6 +222,8 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
         groupType: 'direct',
         // Pass the peer so the IdP get-or-creates ONE canonical group per pair.
         peerDid: peer_did,
+        // Rotation self-heal forwards force_new so the IdP repoints the pair.
+        forceNew: force_new === true,
       });
       if (!created || typeof created.id !== 'string') {
         throw new Error('register_direct_group: IdP returned no group id');

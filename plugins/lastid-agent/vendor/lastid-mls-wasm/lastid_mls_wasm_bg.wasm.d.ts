@@ -23,7 +23,7 @@ export const mlsorchestrator_reconcileMemberDevices: (a: number, b: number, c: n
 export const mlsorchestrator_removeMember: (a: number, b: number, c: number, d: number) => any;
 export const mlsorchestrator_rollbackPendingCommit: (a: number, b: number, c: number) => any;
 export const mlsorchestrator_selfUpdate: (a: number, b: number, c: number) => any;
-export const mlsorchestrator_startDirectChat: (a: number, b: number, c: number) => any;
+export const mlsorchestrator_startDirectChat: (a: number, b: number, c: number, d: number) => any;
 export const __wbg_botmlsclient_free: (a: number, b: number) => void;
 export const __wbg_persistentbotmlsclient_free: (a: number, b: number) => void;
 export const bindMlsGroupIdMapping: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
