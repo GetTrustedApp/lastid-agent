@@ -249,7 +249,7 @@ async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, sig
   // no-op.
   await mls.persist();
 
-  const epoch = Number(mls.groupEpoch(groupIdB64));
+  const epoch = Number(await mls.groupEpoch(groupIdB64));
   send({
     type: 'group_chat.message',
     correlation_id: req.id,

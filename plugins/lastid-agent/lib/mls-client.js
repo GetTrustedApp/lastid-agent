@@ -62,12 +62,17 @@ export class MlsClient {
   #agentDid;
   #slotSeed;
   #scope;
+  // True when this client OWNS the wasm handle (it opened it via `open`) and
+  // may free it. False for `fromOrchestrator` wrappers, which borrow the
+  // shared orchestrator handle the listener frees exactly once on shutdown.
+  #ownsHandle;
 
-  constructor({ handle, agentDid, slotSeed, scope }) {
+  constructor({ handle, agentDid, slotSeed, scope, ownsHandle = true }) {
     this.#handle = handle;
     this.#agentDid = agentDid;
     this.#slotSeed = slotSeed;
     this.#scope = scope ?? 'main';
+    this.#ownsHandle = ownsHandle;
   }
 
   /**
@@ -83,6 +88,29 @@ export class MlsClient {
       diskKvCallbacks({ slotSeed, scope: resolvedScope }),
     );
     return new MlsClient({ handle, agentDid, slotSeed, scope: resolvedScope });
+  }
+
+  /**
+   * Wrap an already-constructed shared MLS handle (the wasm `MlsOrchestrator`
+   * from lib/mls-orchestrator.js) in the MlsClient method surface, so the
+   * dispatcher + send path drive the SAME openmls instance the orchestrator's
+   * ensure/reconcile flows use — B1 convergence: ONE instance per listener,
+   * not a separate per-consumer client.
+   *
+   * The orchestrator handle returns the SAME JSON-string shapes
+   * PersistentBotMlsClient does for every method this class wraps
+   * (processWelcome/processInbound/createGroup/addMember(s)/encrypt/…), so the
+   * wrapping is transparent. groupEpoch is async on the orchestrator — handled
+   * by the async groupEpoch above.
+   *
+   * No slotSeed/scope: durability is owned by the orchestrator's own
+   * disk-backed RawKv (it was built with the same diskKvCallbacks), so this
+   * wrapper never opens a file of its own.
+   */
+  static fromOrchestrator(handle, agentDid) {
+    if (!handle) throw new Error('MlsClient.fromOrchestrator: handle required');
+    if (!agentDid) throw new Error('MlsClient.fromOrchestrator: agentDid required');
+    return new MlsClient({ handle, agentDid, ownsHandle: false });
   }
 
   get agentDid() {
@@ -167,9 +195,15 @@ export class MlsClient {
     return await this.#handle.encryptApplicationMessage(groupIdB64, plaintextB64);
   }
 
-  /** Current MLS epoch for a group (as BigInt). Read-only; sync. */
-  groupEpoch(groupIdB64) {
-    return this.#handle.groupEpoch(groupIdB64);
+  /**
+   * Current MLS epoch for a group. ASYNC: the standalone
+   * PersistentBotMlsClient returns a sync BigInt, but the shared orchestrator
+   * handle (B1 convergence — see fromOrchestrator) returns a Promise (its
+   * groupEpoch is op-lock-serialized). `await` works for both — awaiting a
+   * BigInt just yields it — so this one signature covers both backends.
+   */
+  async groupEpoch(groupIdB64) {
+    return await this.#handle.groupEpoch(groupIdB64);
   }
 
   /**
@@ -203,8 +237,17 @@ export class MlsClient {
     /* state is already durable when the awaited mutating method resolved */
   }
 
-  /** Free the underlying wasm handle. Call when shutting down. */
+  /**
+   * Free the underlying wasm handle. Call when shutting down.
+   *
+   * NOTE: when this client was built via `fromOrchestrator`, the handle is the
+   * SHARED orchestrator — freeing it here would pull it out from under the
+   * ensure/reconcile paths. The listener frees the orchestrator once via
+   * disposeOrchestrator(ctx) on shutdown, so a fromOrchestrator-wrapped client
+   * should NOT also free it. Tracked by `#ownsHandle`.
+   */
   free() {
+    if (!this.#ownsHandle) return;
     try {
       this.#handle.free();
     } catch {
