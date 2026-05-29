@@ -214,6 +214,37 @@ test('addGroupMember: posts invitee_did + welcome (+ commit when given)', async 
   });
 });
 
+test('addGroupMember: welcomeSelf adds welcome_self to the body (single-commit own-device add)', async () => {
+  const fetchImpl = recordingFetch(res({ ok: true }));
+  await addGroupMember({
+    ...AUTH,
+    groupId: 'uuid-1',
+    inviteeDid: 'did:lastid:zOperator',
+    mlsWelcomeB64: 'WEL',
+    mlsCommitB64: 'COM',
+    welcomeSelf: true,
+    fetchImpl,
+  });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].init.body), {
+    invitee_did: 'did:lastid:zOperator',
+    mls_welcome: 'WEL',
+    mls_commit: 'COM',
+    welcome_self: true,
+  });
+});
+
+test('addGroupMember: omits welcome_self when not requested', async () => {
+  const fetchImpl = recordingFetch(res({ ok: true }));
+  await addGroupMember({
+    ...AUTH,
+    groupId: 'g',
+    inviteeDid: 'did:lastid:zOp',
+    mlsWelcomeB64: 'WEL',
+    fetchImpl,
+  });
+  assert.equal('welcome_self' in JSON.parse(fetchImpl.calls[0].init.body), false);
+});
+
 test('addGroupMember: omits mls_commit when not provided', async () => {
   const fetchImpl = recordingFetch(res({ ok: true }));
   await addGroupMember({

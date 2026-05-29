@@ -129,6 +129,19 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
         .map((d) => ({
           device_id: d.device_id,
           device_identity: d.device_identity,
+          device_name: null,
+          device_type: 'agent',
+          capabilities: [],
+          status: 'active',
+          created_at: d.last_seen ?? new Date().toISOString(),
+          last_seen: d.last_seen ?? null,
+          // An agent runtime owns exactly ONE device and it IS this running
+          // device. Flag it current so the single-commit own-device add never
+          // tries to re-add the agent's own leaf (DuplicateSignatureKey) — an
+          // agent has no sibling devices to fold in. Also completes the core
+          // DeviceInfo shape (device_type/status/capabilities/created_at/
+          // is_current_device are required for Vec<DeviceInfo> deserialize).
+          is_current_device: true,
           did: ctx.agentDid,
         }));
       return stringifyReturn(records);
@@ -229,6 +242,10 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
         inviteeDid: member_did,
         mlsWelcomeB64,
         mlsCommitB64,
+        // Single-commit "everyone at start": the core sets welcome_self when it
+        // folded the inviter's own sibling devices into this commit, so the IdP
+        // also welcomes the inviter's own DID.
+        welcomeSelf: commit?.welcome_self === true,
       });
     },
 

@@ -251,6 +251,7 @@ export async function addGroupMember({
   inviteeDid,
   mlsWelcomeB64,
   mlsCommitB64,
+  welcomeSelf,
   agentDid,
   vcCompact,
   signingKey,
@@ -261,6 +262,8 @@ export async function addGroupMember({
   if (!mlsWelcomeB64) throw new Error('addGroupMember: mlsWelcomeB64 required');
   const body = { invitee_did: inviteeDid, mls_welcome: mlsWelcomeB64 };
   if (mlsCommitB64) body.mls_commit = mlsCommitB64;
+  // Single-commit "everyone at start": also welcome the inviter's own devices.
+  if (welcomeSelf) body.welcome_self = true;
   return authedIdpFetch({
     idpUrl,
     method: 'POST',
