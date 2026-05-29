@@ -54,6 +54,7 @@ function detectRuntimeName() {
   return `lastid-agent${here}`;
 }
 import { provisionAgent } from '../lib/agent-provisioning.js';
+import { recordGroup } from '../lib/agent-groups.js';
 import { resolveScope } from '../lib/scope.js';
 import { persistAgentVc, loadAgentVc } from '../lib/keychain.js';
 import { publishAgentKeyPackage } from '../lib/mls-publish.js';
@@ -1470,6 +1471,21 @@ async function cmdListen(flags) {
         presence?.onOperatorMessage(groupId, info);
       } catch {
         /* best-effort — presence never affects messaging */
+      }
+      // Bump this group's activity so resolveActiveGroupForOperator (max
+      // updated_at) sends replies into the conversation the operator is
+      // ACTIVELY using — the group they just messaged from — not the
+      // newest-CREATED group. Native model: one thread per DID; the backing
+      // group can rotate, replies follow the live thread. recordGroup with no
+      // groupIdB64 preserves the existing mapping and only refreshes
+      // operator_did + updated_at. Fire-and-forget; never blocks messaging.
+      try {
+        const sdid = info && typeof info.senderDid === 'string' ? info.senderDid : null;
+        if (sdid && groupId) {
+          recordGroup({ scope, idpGroupId: groupId, operatorDid: sdid }).catch(() => {});
+        }
+      } catch {
+        /* best-effort — activity bump never affects messaging */
       }
     },
     requestSend: (frame) => {
