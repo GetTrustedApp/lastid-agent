@@ -21,6 +21,7 @@ import {
   usageContext,
   summarizeConstraints,
   vaultCachePath,
+  decryptedVaultViews,
 } from '../lib/vault-cache.js';
 import { encryptContent } from '../lib/agent-content-crypto.js';
 
@@ -317,4 +318,72 @@ test('resolveVaultSecret: an empty released secret → null', async () => {
   });
   assert.equal(out, null);
   assert.match(why, /empty/);
+});
+
+// decryptedVaultViews — the choke point that drives `vault_list` and the
+// CLI binding refresh. Before 2026-05-28 it returned a bare array and
+// silently swallowed every decrypt failure, which is how the sub-agent
+// slot-0-sentinel seal-key bug went unnoticed for so long: a share landed
+// on disk, decrypt failed AEAD, the catch was empty, vault_list returned
+// 0 items. The shape is now `{ items, undecryptable }` so the count of
+// open-failures is visible at every caller.
+
+test('decryptedVaultViews returns {items, undecryptable} (shape contract)', () => {
+  const { scope, dir } = freshScope();
+  try {
+    // Empty store: items=[], undecryptable=[].
+    const out = decryptedVaultViews(scope, SLOT);
+    assert.deepEqual(out.items, []);
+    assert.deepEqual(out.undecryptable, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('decryptedVaultViews surfaces undecryptable shares (the wrong-key-bug guard)', () => {
+  const { scope, dir } = freshScope();
+  try {
+    // Seal a bundle under WRONG_SLOT, store it, then try to read it back
+    // under the agent's (different) SLOT. This is the exact shape of the
+    // 2026-05-28 sub-agent seal-key-mismatch bug: ciphertext on disk, the
+    // wrong key in the decrypt loop. Pre-fix this counted as "0 items, no
+    // signal." Post-fix it shows up in `undecryptable`.
+    const WRONG_SLOT = Buffer.alloc(32, 0xaa);
+    const bundle = JSON.stringify({ item_id: 'v-mismatch', service: 'aws' });
+    const enc = encryptContent(WRONG_SLOT, Buffer.from(bundle, 'utf8'))
+      .toString('base64');
+    applyVaultRecords(scope, [
+      { id: 'v-mismatch', version: 1, status: 'active', enc_b64: enc, sig: 'x', target: 'did:a' },
+    ]);
+    const out = decryptedVaultViews(scope, SLOT);
+    assert.equal(out.items.length, 0);
+    assert.equal(out.undecryptable.length, 1);
+    assert.equal(out.undecryptable[0].id, 'v-mismatch');
+    assert.ok(typeof out.undecryptable[0].reason === 'string');
+    assert.ok(out.undecryptable[0].reason.length > 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('decryptedVaultViews mixes openable + unopenable correctly', () => {
+  const { scope, dir } = freshScope();
+  try {
+    const good = JSON.stringify({ item_id: 'v-ok', service: 'github' });
+    const goodEnc = encryptContent(SLOT, Buffer.from(good, 'utf8')).toString('base64');
+    const WRONG = Buffer.alloc(32, 0xbb);
+    const bad = JSON.stringify({ item_id: 'v-bad', service: 'aws' });
+    const badEnc = encryptContent(WRONG, Buffer.from(bad, 'utf8')).toString('base64');
+    applyVaultRecords(scope, [
+      { id: 'v-ok', version: 1, status: 'active', enc_b64: goodEnc, sig: 'x', target: 'did:a' },
+      { id: 'v-bad', version: 1, status: 'active', enc_b64: badEnc, sig: 'x', target: 'did:a' },
+    ]);
+    const out = decryptedVaultViews(scope, SLOT);
+    assert.equal(out.items.length, 1);
+    assert.equal(out.items[0].id, 'v-ok');
+    assert.equal(out.undecryptable.length, 1);
+    assert.equal(out.undecryptable[0].id, 'v-bad');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

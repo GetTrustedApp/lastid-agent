@@ -687,7 +687,8 @@ async function cmdVaultList(flags) {
   try {
     const { decryptedVaultViews } = await import('./vault-cache.js');
     const { compactCredential } = await import('./credential-awareness.js');
-    const items = decryptedVaultViews(scope, loaded.slotSeed).map(compactCredential);
+    const { items: decoded } = decryptedVaultViews(scope, loaded.slotSeed);
+    const items = decoded.map(compactCredential);
     process.stdout.write(JSON.stringify({ items }));
     process.exit(0);
   } catch (e) {

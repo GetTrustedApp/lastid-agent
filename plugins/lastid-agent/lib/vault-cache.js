@@ -97,7 +97,8 @@ export function cliBindingsPath(scope = 'main') {
 export function refreshCliBindings(scope = 'main', slotSeed, deps = {}) {
   const bindings = [];
   try {
-    for (const v of decryptedVaultViews(scope, slotSeed, deps)) {
+    const { items: decoded } = decryptedVaultViews(scope, slotSeed, deps);
+    for (const v of decoded) {
       if (v?.injection?.type !== 'env') continue;
       const binaries = Array.isArray(v.binaries)
         ? v.binaries.filter((b) => typeof b === 'string' && b.length > 0)
@@ -317,24 +318,39 @@ export function vaultListView(decoded, id = null) {
  * point shared by the `vault_list` MCP tool and the `vault-list` CLI subcommand
  * (which feeds the session-start credential awareness block). Deps are
  * injectable so the decode loop is unit-testable without real crypto.
+ *
+ * Returns `{ items, undecryptable }` (NOT a bare array) so the caller can
+ * surface the count of skipped shares. Silent skips were how the 2026-05-28
+ * sub-agent seal-key-mismatch bug went unnoticed for so long — every share
+ * was sealed under BIP85 slot 0's key, every decrypt failed AEAD, every one
+ * got swallowed here, and `vault_list` cheerfully returned 0 items as if the
+ * operator had shared nothing. A non-zero undecryptable count is a signal,
+ * not noise.
  */
 export function decryptedVaultViews(
   scope = 'main',
   slotSeed,
   { listCache = listVaultCache, decrypt = decryptContent } = {},
 ) {
-  const out = [];
+  const items = [];
+  const undecryptable = [];
   for (const sealed of listCache(scope)) {
     if (!sealed || typeof sealed.enc_b64 !== 'string' || sealed.status === 'revoked') continue;
     try {
       const bytes = decrypt(slotSeed, sealed.enc_b64);
       const decoded = JSON.parse(Buffer.from(bytes).toString('utf8'));
-      out.push(vaultListView(decoded, sealed.id));
-    } catch {
-      // Undecryptable — skip.
+      items.push(vaultListView(decoded, sealed.id));
+    } catch (err) {
+      // Record what we couldn't open so a wrong-key bug surfaces in vault_list
+      // instead of presenting as "operator shared nothing." Reason is the
+      // exception message, truncated to a single short line.
+      const reason = err instanceof Error
+        ? (err.message || 'decrypt failed').split('\n')[0].slice(0, 140)
+        : String(err).slice(0, 140);
+      undecryptable.push({ id: sealed.id, reason });
     }
   }
-  return out;
+  return { items, undecryptable };
 }
 
 /** A short "how to use this" line for the agent, from the share metadata. */

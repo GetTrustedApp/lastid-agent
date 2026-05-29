@@ -373,9 +373,15 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
     // metadata view (secret stripped by vaultListView). Plaintext exists only
     // transiently here; it is NEVER returned to the model. The credential's
     // actual use (unfurl + inject) happens in the listener at http_fetch time.
+    // `undecryptable` surfaces shares that landed on disk but couldn't be
+    // opened (wrong key / corrupt) — exposing this in the response so the
+    // model can tell the operator "share routed but seal key is wrong"
+    // instead of silently presenting an empty list (which is how the 2026-
+    // 05-28 sub-agent slot-0-sentinel bug went unnoticed).
     const { decryptedVaultViews } = await import('./vault-cache.js');
-    const items = decryptedVaultViews(scope, loadedAgent.slotSeed);
-    return { content: [{ type: 'text', text: JSON.stringify({ items }, null, 2) }] };
+    const { items, undecryptable } = decryptedVaultViews(scope, loadedAgent.slotSeed);
+    const body = undecryptable.length > 0 ? { items, undecryptable } : { items };
+    return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
   }
 
   if (name === 'lastid_send_message') {

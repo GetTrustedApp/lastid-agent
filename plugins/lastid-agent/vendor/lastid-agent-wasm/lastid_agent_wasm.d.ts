@@ -364,6 +364,16 @@ export function sdkCreateIdentity(password: string, use_biometrics: boolean): Pr
 export function sdkDecryptAgentContentForSlot(slot_index: number, enc_b64: string): Promise<Uint8Array>;
 
 /**
+ * Decrypt a sub-agent content envelope (base64 LIDE SymmetricOnly) — mirrors
+ * `sdkDecryptAgentContentForSlot` for the operator-side read-back path on
+ * sub-agent records. The operator can re-derive any of its sub-agents' seeds
+ * because it holds the human seed at the root; the sub-agent's own listener
+ * decrypts symmetrically via its stored slotSeed (which IS the sub_agent_seed
+ * persisted at sub-agent provision time).
+ */
+export function sdkDecryptAgentContentForSubAgent(parent_slot_index: number, class_slug: string, sub_index: number, enc_b64: string): Promise<Uint8Array>;
+
+/**
  * Decrypt a project-tier memory envelope (base64 LIDE SymmetricOnly) by its
  * `routing_id`. Operator read-back so the console can show project memories
  * authored from the browser or by an agent. The seed never crosses into JS.
@@ -391,6 +401,18 @@ export function sdkDeriveProjectRoutingId(project_key: string): Promise<string>;
  * base64 LIDE SymmetricOnly envelope the agent decrypts with its slot_seed.
  */
 export function sdkEncryptAgentContentForSlot(slot_index: number, content: Uint8Array): Promise<string>;
+
+/**
+ * Encrypt a rule/memory/vault record for a SUB-AGENT. Sub-agents have no
+ * BIP85 slot (their `slotIndex` is pinned to 0 as a sentinel); their content
+ * key is derived two-layer: first the parent's BIP85 slot_seed, then HKDF
+ * to the per-(class_slug, sub_index) sub_agent_seed (matches what the sub-
+ * agent listener loads as its `loadedAgent.slotSeed`). Without this branch
+ * the operator console silently seals every sub-agent record under BIP85
+ * slot 0's key, and the sub-agent's vault_list returns 0 items because the
+ * decrypt AEAD tag fails.
+ */
+export function sdkEncryptAgentContentForSubAgent(parent_slot_index: number, class_slug: string, sub_index: number, content: Uint8Array): Promise<string>;
 
 /**
  * Encrypt a project-tier memory the operator authors in the browser, for a
