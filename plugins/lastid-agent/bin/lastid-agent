@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Wrapper that lets `lastid-agent run --item <id> -- <cmd>` be invoked from
+# any PATH-aware shell — the actual entrypoint is the sibling .js file
+# (kept under that name because internal callers reference it absolutely as
+# bin/lastid-agent.js). Spawn args for sub-agent helpers prepend this bin
+# dir to PATH so the helper's Bash sees `lastid-agent` resolve here.
+exec node "$(dirname "$0")/lastid-agent.js" "$@"

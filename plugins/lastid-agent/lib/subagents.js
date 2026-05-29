@@ -43,6 +43,15 @@ const PLUGIN_MCP_SERVER_PATH = fileURLToPath(
   new URL('../bin/lastid-agent.js', import.meta.url),
 );
 
+// Plugin bin dir. Prepended to the spawned helper's PATH so `lastid-agent`
+// resolves to bin/lastid-agent (the bash wrapper that execs node on the .js
+// entrypoint). Without this, a helper that explicitly invokes `lastid-agent
+// run --item <id> -- aws ...` (rather than letting the PreToolUse rewrite
+// transparently wrap a bare `aws ...`) hits exit 127 — the rewrite uses an
+// absolute `node /path/lastid-agent.js` form, but an explicit invocation in
+// the helper's shell needs the binary on PATH. Belt-and-suspenders.
+const PLUGIN_BIN_DIR = fileURLToPath(new URL('../bin/', import.meta.url));
+
 /**
  * Universal runtime-rules suffix appended to EVERY spawned helper's
  * system prompt by invokeSubagent. Owns the rules that are the same for
@@ -348,6 +357,17 @@ export function buildSpawnArgs({ subagent, systemPromptPath, parentEnv, mcpConfi
     envExtra.LASTID_SUBAGENT_INVOCATION_ID = invocationContext.invocationId;
     envExtra.LASTID_SUBAGENT_PARENT_SCOPE = invocationContext.parentScope;
   }
+  // Prepend the plugin's bin dir to PATH so the helper's Bash resolves
+  // `lastid-agent` to bin/lastid-agent (the bash wrapper around the .js
+  // entrypoint). The PreToolUse hook rewrites a bare `aws ...` to a full
+  // `node <abs>/lastid-agent.js run --item ... -- aws ...` form which
+  // doesn't need PATH; but a helper that calls `lastid-agent run ...`
+  // explicitly does. Prepending (not appending) wins over any stale system
+  // entry; we keep the rest of parentEnv.PATH so node, aws, gh, etc. still
+  // resolve. PATH-less environments (no `path` from parent) get just our
+  // bin so the binary is still reachable.
+  const parentPath = parentEnv?.PATH ?? parentEnv?.Path ?? '';
+  envExtra.PATH = parentPath ? `${PLUGIN_BIN_DIR}:${parentPath}` : PLUGIN_BIN_DIR;
   return {
     cmd: 'claude',
     args,

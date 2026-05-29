@@ -201,8 +201,37 @@ test('buildSpawnArgs: produces the right argv + scope env (input via stdin, NOT 
     'no dangerous flags from any source',
   );
   assert.equal(out.env.LASTID_AGENT_SCOPE, 'main-echobot');
-  assert.equal(out.env.PATH, '/usr/bin'); // parent env carried through
+  // PATH must (a) include the plugin bin dir so the helper's shell resolves
+  // `lastid-agent run --item ...` (the explicit CLI proxy form), and
+  // (b) preserve the parent's PATH so `aws`, `node`, `gh`, etc. still
+  // resolve. Prepended, not appended.
+  assert.match(out.env.PATH, /\/bin\/?:\/usr\/bin$/, 'plugin bin prepended to parent PATH');
   assert.equal(out.env.SOMETHING_ELSE, 'kept');
+});
+
+test('buildSpawnArgs: PATH defaults to JUST the plugin bin dir when parent has no PATH', () => {
+  // No PATH in parent → child must still be able to resolve `lastid-agent`,
+  // otherwise the CLI proxy is unreachable. Common in stripped-down spawn
+  // contexts (CI runners, headless launchers).
+  const out = buildSpawnArgs({
+    subagent: { slug: 'x', scope: 'main-x', claude_tools: {} },
+    systemPromptPath: '/tmp/sys.md',
+    parentEnv: { SOMETHING: 'else' },
+  });
+  assert.ok(out.env.PATH, 'PATH set even when parent had none');
+  assert.match(out.env.PATH, /\/bin\/?$/, 'plugin bin dir is the only entry');
+});
+
+test('buildSpawnArgs: PATH NOT polluted by leading colon when parent PATH is empty string', () => {
+  // Guard against the `${BIN}:${PATH}` shape producing `${BIN}:` (trailing
+  // colon → POSIX interprets as $CWD on the path) when parent.PATH === ''.
+  const out = buildSpawnArgs({
+    subagent: { slug: 'x', scope: 'main-x', claude_tools: {} },
+    systemPromptPath: '/tmp/sys.md',
+    parentEnv: { PATH: '' },
+  });
+  assert.ok(!out.env.PATH.endsWith(':'), 'no trailing colon (would inject CWD into PATH)');
+  assert.ok(!out.env.PATH.startsWith(':'), 'no leading colon');
 });
 
 test('buildSpawnArgs: injects --mcp-config + --strict-mcp-config when mcpConfigPath given', () => {
