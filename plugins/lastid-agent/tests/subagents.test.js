@@ -98,20 +98,45 @@ test('buildSpawnArgs: produces the right argv + scope env (input via stdin, NOT 
     parentEnv: { PATH: '/usr/bin', SOMETHING_ELSE: 'kept' },
   });
   assert.equal(out.cmd, 'claude');
-  assert.deepEqual(out.args, [
+  // Deterministic leading prefix of argv. The tool + settings flags are
+  // asserted individually below since --settings carries a long inline-JSON
+  // value that isn't convenient to pin via full-array deepEqual.
+  assert.deepEqual(out.args.slice(0, 6), [
     '--print',
     '--verbose',
     '--system-prompt-file',
     '/tmp/sys.md',
     '--output-format',
     'stream-json',
-    '--allowed-tools',
-    // mcp__lastid-agent is ALWAYS prepended so Claude's auto-mode classifier
-    // never gates our own MCP tools (the agent must always be able to reply).
-    'mcp__lastid-agent,Read,Bash(echo:*)',
-    '--disallowed-tools',
-    'WebFetch',
   ]);
+  // Tool flags are camelCase (--allowedTools / --disallowedTools), the form
+  // current Claude Code actually honors.
+  const at = out.args.indexOf('--allowedTools');
+  assert.notEqual(at, -1, '--allowedTools present (camelCase)');
+  // mcp__lastid-agent is always prepended so the agent's own MCP tools are
+  // available in the spawned helper.
+  assert.equal(out.args[at + 1], 'mcp__lastid-agent,Read,Bash(echo:*)');
+  const dt = out.args.indexOf('--disallowedTools');
+  assert.notEqual(dt, -1, '--disallowedTools present (camelCase)');
+  assert.equal(out.args[dt + 1], 'WebFetch');
+  // The old kebab spellings are gone.
+  assert.equal(out.args.includes('--allowed-tools'), false);
+  assert.equal(out.args.includes('--disallowed-tools'), false);
+  // --settings rides an inline JSON object carrying permissions.allow and
+  // autoMode.allow. Parse it and assert the shape.
+  const si = out.args.indexOf('--settings');
+  assert.notEqual(si, -1, '--settings present');
+  const settings = JSON.parse(out.args[si + 1]);
+  assert.ok(Array.isArray(settings.permissions.allow), 'permissions.allow is an array');
+  assert.ok(
+    settings.permissions.allow.includes('mcp__lastid-agent'),
+    'permissions.allow includes mcp__lastid-agent',
+  );
+  assert.ok(Array.isArray(settings.autoMode.allow), 'autoMode.allow is an array');
+  assert.ok(
+    settings.autoMode.allow.includes('$defaults'),
+    'autoMode.allow preserves $defaults',
+  );
   // SECURITY GUARD: input must NEVER appear in argv (would enable flag
   // smuggling — an input of "--dangerously-skip-permissions" would flip
   // that flag on). Input is piped to stdin by invokeSubagent.
@@ -200,24 +225,24 @@ test('mcpConfigForSubagent: bakes invocationContext env into the server entry (b
   });
 });
 
-test('buildSpawnArgs: --allowed-tools always present (mcp__lastid-agent injected); --disallowed-tools omitted when empty/missing', () => {
+test('buildSpawnArgs: --allowedTools always present (mcp__lastid-agent injected); --disallowedTools omitted when empty/missing', () => {
   const out = buildSpawnArgs({
     subagent: { slug: 'x', scope: 'main-x', claude_tools: { allowed: [], disallowed: [] } },
     systemPromptPath: '/tmp/sys.md',
     parentEnv: {},
   });
-  // New contract: --allowed-tools is ALWAYS present because we always inject
+  // New contract: --allowedTools is ALWAYS present because we always inject
   // mcp__lastid-agent — with no user tools, its value is exactly that.
-  const i = out.args.indexOf('--allowed-tools');
-  assert.notEqual(i, -1, '--allowed-tools always present');
+  const i = out.args.indexOf('--allowedTools');
+  assert.notEqual(i, -1, '--allowedTools always present');
   assert.equal(out.args[i + 1], 'mcp__lastid-agent');
-  // --disallowed-tools still omitted when the disallowed array is empty.
-  assert.equal(out.args.includes('--disallowed-tools'), false);
+  // --disallowedTools still omitted when the disallowed array is empty.
+  assert.equal(out.args.includes('--disallowedTools'), false);
 });
 
-test('buildSpawnArgs: --allowed-tools always whitelists mcp__lastid-agent (auto-classifier bypass for our own MCP tools)', () => {
+test('buildSpawnArgs: --allowedTools always whitelists mcp__lastid-agent; --settings mirrors it in permissions.allow + autoMode.allow', () => {
   // Pin the contract explicitly so future drift trips this test rather than
-  // a live sub-agent: mcp__lastid-agent is the FIRST entry in --allowed-tools
+  // a live sub-agent: mcp__lastid-agent is the FIRST entry in --allowedTools
   // regardless of what (if any) user tools are configured.
 
   // Case 1: no claude_tools at all.
@@ -226,8 +251,8 @@ test('buildSpawnArgs: --allowed-tools always whitelists mcp__lastid-agent (auto-
     systemPromptPath: '/tmp/sys.md',
     parentEnv: {},
   });
-  const bi = bare.args.indexOf('--allowed-tools');
-  assert.notEqual(bi, -1, '--allowed-tools present with no user tools');
+  const bi = bare.args.indexOf('--allowedTools');
+  assert.notEqual(bi, -1, '--allowedTools present with no user tools');
   assert.equal(bare.args[bi + 1], 'mcp__lastid-agent');
 
   // Case 2: claude_tools.allowed missing entirely.
@@ -236,8 +261,8 @@ test('buildSpawnArgs: --allowed-tools always whitelists mcp__lastid-agent (auto-
     systemPromptPath: '/tmp/sys.md',
     parentEnv: {},
   });
-  const mi = missing.args.indexOf('--allowed-tools');
-  assert.notEqual(mi, -1, '--allowed-tools present when claude_tools absent');
+  const mi = missing.args.indexOf('--allowedTools');
+  assert.notEqual(mi, -1, '--allowedTools present when claude_tools absent');
   assert.equal(missing.args[mi + 1], 'mcp__lastid-agent');
 
   // Case 3: with user tools, mcp__lastid-agent is prepended (first entry).
@@ -246,14 +271,62 @@ test('buildSpawnArgs: --allowed-tools always whitelists mcp__lastid-agent (auto-
     systemPromptPath: '/tmp/sys.md',
     parentEnv: {},
   });
-  const wi = withTools.args.indexOf('--allowed-tools');
-  assert.notEqual(wi, -1, '--allowed-tools present with user tools');
+  const wi = withTools.args.indexOf('--allowedTools');
+  assert.notEqual(wi, -1, '--allowedTools present with user tools');
   assert.equal(withTools.args[wi + 1], 'mcp__lastid-agent,Read,Bash(echo:*)');
   assert.equal(
     withTools.args[wi + 1].split(',')[0],
     'mcp__lastid-agent',
     'mcp__lastid-agent is always the first whitelisted tool',
   );
+
+  // --settings carries the same allow-list in permissions.allow, and an
+  // autoMode.allow array that preserves $defaults plus one descriptive
+  // entry mentioning lastid-agent.
+  const si = withTools.args.indexOf('--settings');
+  assert.notEqual(si, -1, '--settings present');
+  const settings = JSON.parse(withTools.args[si + 1]);
+  assert.ok(
+    settings.permissions.allow.includes('mcp__lastid-agent'),
+    'permissions.allow includes mcp__lastid-agent',
+  );
+  assert.ok(
+    settings.autoMode.allow.includes('$defaults'),
+    'autoMode.allow preserves $defaults',
+  );
+  const prose = settings.autoMode.allow.find(
+    (e) => typeof e === 'string' && /lastid-agent/.test(e) && e !== '$defaults',
+  );
+  assert.ok(
+    typeof prose === 'string' && prose.length > 0,
+    'autoMode.allow has a descriptive entry mentioning lastid-agent',
+  );
+});
+
+test('buildSpawnArgs: --settings includes autoMode.allow prose entry trusting lastid-agent (auto-mode-classifier bypass)', () => {
+  // Pins the prose-entry contract WITHOUT asserting the exact wording, so the
+  // copy can be tweaked without breaking the test. The contract: --settings
+  // exists, parses to JSON, and its autoMode.allow array contains a non-empty
+  // string entry referencing lastid-agent (the descriptive entry that tells
+  // the auto-mode classifier our own MCP server is trusted infrastructure).
+  const out = buildSpawnArgs({
+    subagent: { slug: 'x', scope: 'main-x', claude_tools: { allowed: ['Read'] } },
+    systemPromptPath: '/tmp/sys.md',
+    parentEnv: {},
+  });
+  const si = out.args.indexOf('--settings');
+  assert.notEqual(si, -1, '--settings present');
+  const settings = JSON.parse(out.args[si + 1]);
+  assert.ok(Array.isArray(settings.autoMode?.allow), 'autoMode.allow is an array');
+  const prose = settings.autoMode.allow.find(
+    (e) => typeof e === 'string' && /lastid-agent|mcp__lastid-agent/.test(e),
+  );
+  assert.ok(
+    typeof prose === 'string' && prose.trim().length > 0,
+    'autoMode.allow contains a non-empty entry mentioning lastid-agent',
+  );
+  // It is a distinct entry, not the $defaults sentinel itself.
+  assert.notEqual(prose, '$defaults');
 });
 
 test('parseStreamJsonResult: extracts final result event', () => {

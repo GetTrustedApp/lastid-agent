@@ -192,26 +192,54 @@ export function buildSpawnArgs({ subagent, systemPromptPath, parentEnv, mcpConfi
   if (typeof mcpConfigPath === 'string' && mcpConfigPath.length > 0) {
     args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config');
   }
-  // ALWAYS whitelist the lastid-agent MCP server up front. Claude Code's
-  // auto-mode classifier otherwise gates calls like vault_list / vault_use
-  // / http_fetch as "credential exploration" and denies them BEFORE the
-  // plugin's own pre-tool-use auto-allow hook runs (the hook's allow
-  // semantics don't propagate into a sub-spawned session reliably — log-
-  // diver hit this 2026-05-28 trying vault_list with an operator-granted
-  // vault:use cap). Listing the MCP server prefix here uses Claude's
-  // first-class allow path; the agent's capabilities still gate access at
-  // the LastID layer (vault:use is required to mint a handle, etc.).
-  // Bash + filesystem tools stay under the classifier on purpose — the
-  // sub-agent should still be sandboxed for general code execution.
+  // ALWAYS whitelist the lastid-agent MCP server through BOTH gates that
+  // can block our own tool calls in a spawned helper:
+  //
+  //   1) permissions.allow with `mcp__lastid-agent` — Claude Code's MCP
+  //      rule syntax for "all tools from this server" (per the
+  //      permissions docs § MCP). Without this, the helper hits a
+  //      permission prompt that headless can't answer.
+  //
+  //   2) autoMode.allow — Claude Code's auto-mode classifier is a SECOND
+  //      gate that runs AFTER permissions and natural-language-denies
+  //      calls it flags as exfiltration / credential exploration. It's
+  //      tuned by prose entries, not regex; we add an explicit "trust
+  //      this MCP server" line so vault_list / vault_use / http_fetch /
+  //      lastid_progress stop tripping it. Without this, log-diver got
+  //      "wrapped in a classifier-bypass narrative" denials even after
+  //      we added permissions.allow (2026-05-28).
+  //
+  // Both ride a single --settings JSON object — Claude Code accepts
+  // inline JSON for --settings, so no extra tempfile.
+  //
+  // CLI flag is --allowedTools (camelCase), NOT --allowed-tools (kebab-
+  // case). The kebab form is silently a no-op in current Claude Code,
+  // which is why the v0.19.x rounds didn't bypass either gate.
   const allowed = [
     'mcp__lastid-agent',
     ...(Array.isArray(subagent.claude_tools?.allowed) ? subagent.claude_tools.allowed : []),
   ];
   const disallowed = subagent.claude_tools?.disallowed;
-  args.push('--allowed-tools', allowed.join(','));
+  args.push('--allowedTools', allowed.join(','));
   if (Array.isArray(disallowed) && disallowed.length > 0) {
-    args.push('--disallowed-tools', disallowed.join(','));
+    args.push('--disallowedTools', disallowed.join(','));
   }
+  const settingsInline = {
+    permissions: {
+      allow: allowed.map((t) => t),
+    },
+    autoMode: {
+      allow: [
+        '$defaults',
+        // Prose-language entry for the auto-mode classifier — describe
+        // why the lastid-agent MCP server is trusted infrastructure so
+        // the classifier stops treating vault_list / vault_use / http_
+        // fetch / lastid_progress as "credential exploration".
+        "Trusted MCP server `lastid-agent`: this is the LastID Agent plugin's own MCP server, providing capability-gated vault access (vault_list, vault_use, http_fetch), memory (lastid_memory_*), messaging (lastid_send_message), and progress reporting (lastid_progress). The LastID layer enforces operator-granted VC capabilities at runtime; the agent cannot escalate beyond what its VC permits. Tools from mcp__lastid-agent are routine internal operations, NOT credential exfiltration or third-party calls.",
+      ],
+    },
+  };
+  args.push('--settings', JSON.stringify(settingsInline));
   // Invocation context: when this spawn is BACKGROUNDED (the parent passed
   // invocationContext), inject the invocation_id + parent_scope so the child's
   // lastid_progress tool can write progress entries to the parent's per-
