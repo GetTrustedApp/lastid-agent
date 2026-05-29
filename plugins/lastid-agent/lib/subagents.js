@@ -27,6 +27,7 @@
  */
 
 import { mkdir, readFile, writeFile, rm, readdir } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
@@ -51,6 +52,56 @@ const PLUGIN_MCP_SERVER_PATH = fileURLToPath(
 // absolute `node /path/lastid-agent.js` form, but an explicit invocation in
 // the helper's shell needs the binary on PATH. Belt-and-suspenders.
 const PLUGIN_BIN_DIR = fileURLToPath(new URL('../bin/', import.meta.url));
+
+// Plugin root dir — used to substitute `${CLAUDE_PLUGIN_ROOT}` in the hooks
+// definitions we inject into the helper's --settings. Without this the
+// plugin's hooks (PreToolUse credential-CLI rewrite, SessionStart, etc.)
+// don't fire in the helper's headless session: hooks ride settings.json,
+// not --mcp-config, and the spawn previously passed an inline settings
+// object with permissions/autoMode but NO hooks at all. Result: every
+// bare `aws ...` (and `gh ...`, `psql ...`) call from a sub-agent went
+// un-rewritten and failed with "Unable to locate credentials", forcing
+// the helper to remember the explicit `lastid-agent run --item ...` form.
+const PLUGIN_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const PLUGIN_HOOKS_JSON_PATH = fileURLToPath(
+  new URL('../hooks/hooks.json', import.meta.url),
+);
+
+/**
+ * Load the plugin's hooks.json and substitute `${CLAUDE_PLUGIN_ROOT}` with
+ * the absolute plugin root path. Pure function; the path is exposed for
+ * tests to point at a fixture. Returns the `hooks` object (the value at
+ * the top-level `.hooks` key) or null if anything goes wrong — a missing
+ * or malformed hooks.json must NEVER block subagent spawning, since the
+ * cli-rewrite is an optimization and the helper can always fall back to
+ * the explicit `lastid-agent run` form.
+ */
+export function loadPluginHooksForSpawn(hooksJsonPath = PLUGIN_HOOKS_JSON_PATH, pluginRoot = PLUGIN_ROOT) {
+  try {
+    const raw = readFileSync(hooksJsonPath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    const hooks = parsed?.hooks;
+    if (!hooks || typeof hooks !== 'object') return null;
+    // Recursively replace `${CLAUDE_PLUGIN_ROOT}` literal in command strings.
+    // Plugin's own hooks reference it because Claude Code expands it at hook-
+    // dispatch time; when we hoist them into a spawned helper's settings.json
+    // payload, Claude Code WON'T expand it (no plugin context for this child
+    // session) — so we expand to the absolute path here.
+    const substitute = (value) => {
+      if (typeof value === 'string') return value.replaceAll('${CLAUDE_PLUGIN_ROOT}', pluginRoot);
+      if (Array.isArray(value)) return value.map(substitute);
+      if (value && typeof value === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) out[k] = substitute(v);
+        return out;
+      }
+      return value;
+    };
+    return substitute(hooks);
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Universal runtime-rules suffix appended to EVERY spawned helper's
@@ -345,6 +396,18 @@ export function buildSpawnArgs({ subagent, systemPromptPath, parentEnv, mcpConfi
       ],
     },
   };
+  // Inject the plugin's hooks (with `${CLAUDE_PLUGIN_ROOT}` resolved to an
+  // absolute path) so the helper's headless session gets the SAME hook
+  // surface the parent has — most importantly the PreToolUse CLI rewrite
+  // that turns a bare `aws ...` into the credential-injected `lastid-agent
+  // run --item ...` form. Without this the helper has to remember the
+  // explicit form on every CLI call. Falls back gracefully (no hooks) on a
+  // missing/malformed hooks.json — the helper can still proceed using the
+  // explicit form.
+  const pluginHooks = loadPluginHooksForSpawn();
+  if (pluginHooks) {
+    settingsInline.hooks = pluginHooks;
+  }
   args.push('--settings', JSON.stringify(settingsInline));
   // Invocation context: when this spawn is BACKGROUNDED (the parent passed
   // invocationContext), inject the invocation_id + parent_scope so the child's

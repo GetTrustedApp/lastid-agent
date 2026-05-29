@@ -234,6 +234,41 @@ test('buildSpawnArgs: PATH NOT polluted by leading colon when parent PATH is emp
   assert.ok(!out.env.PATH.startsWith(':'), 'no leading colon');
 });
 
+test('buildSpawnArgs: --settings carries the plugin hooks with ${CLAUDE_PLUGIN_ROOT} expanded', () => {
+  // Without the hooks injection, a helper's headless session has zero
+  // hooks — so the PreToolUse credential-CLI rewrite never fires and a
+  // bare `aws ...` falls through un-injected. The hooks ride the inline
+  // --settings object; this test pins the wiring (presence + that the
+  // `${CLAUDE_PLUGIN_ROOT}` literal got expanded to an absolute path).
+  const out = buildSpawnArgs({
+    subagent: { slug: 'x', scope: 'main-x', claude_tools: {} },
+    systemPromptPath: '/tmp/sys.md',
+    parentEnv: { PATH: '/usr/bin' },
+  });
+  const si = out.args.indexOf('--settings');
+  const settings = JSON.parse(out.args[si + 1]);
+  assert.ok(settings.hooks, 'hooks present in inline settings');
+  assert.ok(Array.isArray(settings.hooks.PreToolUse), 'PreToolUse hook registered');
+  // The PreToolUse command must be a `node <absolute>/hooks/pre-tool-use.js`
+  // form — `${CLAUDE_PLUGIN_ROOT}` resolved, no longer a literal.
+  const preCmd = settings.hooks.PreToolUse[0]?.hooks?.[0]?.command;
+  assert.ok(typeof preCmd === 'string' && preCmd.length > 0, 'PreToolUse command present');
+  assert.equal(preCmd.includes('${CLAUDE_PLUGIN_ROOT}'), false, '${CLAUDE_PLUGIN_ROOT} expanded');
+  assert.match(preCmd, /pre-tool-use\.js$/, 'points at pre-tool-use.js');
+});
+
+test('loadPluginHooksForSpawn: substitutes ${CLAUDE_PLUGIN_ROOT} recursively + returns null on missing file', async () => {
+  const { loadPluginHooksForSpawn } = await import('../lib/subagents.js');
+  const hooks = loadPluginHooksForSpawn();
+  assert.ok(hooks, 'hooks loaded');
+  // Walk the loaded shape: no command anywhere should still carry the literal.
+  const stringified = JSON.stringify(hooks);
+  assert.equal(stringified.includes('${CLAUDE_PLUGIN_ROOT}'), false, 'no unexpanded variable anywhere');
+  // Missing file path → null (must not throw — the helper falls back to
+  // the explicit `lastid-agent run` form gracefully).
+  assert.equal(loadPluginHooksForSpawn('/nope/does/not/exist.json'), null);
+});
+
 test('buildSpawnArgs: injects --mcp-config + --strict-mcp-config when mcpConfigPath given', () => {
   const out = buildSpawnArgs({
     subagent: { slug: 'echobot', scope: 'main-echobot', claude_tools: {} },
