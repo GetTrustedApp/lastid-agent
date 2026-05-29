@@ -143,8 +143,12 @@ function textToB64(text) {
  * @param {string} [args.idpUrl]      - enables self-heal (create a group when none exists).
  * @param {string} [args.vcCompact]   - agent VC SD-JWT (bearer) for IdP group calls.
  * @param {import('node:crypto').KeyObject} [args.signingKey] - agent Ed25519 (DPoP).
+ * @param {object} [args.ctx]  - the listener's shared context. Threaded into the
+ *   self-heal ensureConversation so it reuses the ONE cached orchestrator
+ *   (ctx.__mlsOrchestrator) instead of synthesizing a fresh ctx — which would
+ *   build a SECOND openmls instance over the same disk file. B1 convergence.
  */
-export async function drainOutbox({ scope, mls, agentDid, send, log, idpUrl, vcCompact, signingKey, reactToLastMessage }) {
+export async function drainOutbox({ scope, mls, agentDid, send, log, idpUrl, vcCompact, signingKey, reactToLastMessage, ctx }) {
   const path = outboxPath(scope);
   const logLine = log ?? ((l) => process.stderr.write(`${l}\n`));
   let raw;
@@ -182,7 +186,7 @@ export async function drainOutbox({ scope, mls, agentDid, send, log, idpUrl, vcC
           logLine(`[lastid-agent] outbox: reacted ${req.id} → operator ${req.operator_did}`);
         }
       } else {
-        await sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, signingKey, log: logLine });
+        await sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, signingKey, log: logLine, ctx });
         logLine(
           `[lastid-agent] outbox: sent ${req.id} → operator ${req.operator_did}`,
         );
@@ -201,7 +205,7 @@ export async function drainOutbox({ scope, mls, agentDid, send, log, idpUrl, vcC
   await rename(tmp, path);
 }
 
-async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, signingKey, log }) {
+async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, signingKey, log, ctx }) {
   // Resolve the operator's CURRENT active group at send time (not a
   // group id baked in at enqueue) so a rotated group is picked up
   // automatically. Strict operator match — we never send to anyone
@@ -226,6 +230,10 @@ async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, sig
         vcCompact,
         signingKey,
         log,
+        // Reuse the listener's ONE cached orchestrator (B1 convergence). When
+        // ctx is absent (a caller that hasn't been migrated), ensureConversation
+        // synthesizes a local ctx as before.
+        ctx,
       });
     }
     if (!resolved) {

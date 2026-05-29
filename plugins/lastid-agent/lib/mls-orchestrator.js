@@ -276,11 +276,10 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
       });
     },
 
-    async is_group_valid(argJson) {
+    async is_group_valid(_argJson) {
       // No agent-side endpoint for this today; assume valid. The
       // orchestrator only uses it to gate its rotation classifier — a
       // pessimistic `false` would force pointless rotations.
-      const _arg = parseArg(argJson);
       return stringifyReturn({ valid: true });
     },
   };
@@ -334,7 +333,12 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
 export async function getOrchestrator(ctx, { deps = {}, wasmImpl = wasm } = {}) {
   if (!ctx) throw new Error('getOrchestrator: ctx required');
   if (!ctx.agentDid) throw new Error('getOrchestrator: ctx.agentDid required');
-  if (!ctx.operatorDid) throw new Error('getOrchestrator: ctx.operatorDid required');
+  // operatorDid is NOT required to build the handle — the orchestrator is
+  // constructed with (agentDid, agentDid, …) and operatorDid is only the PEER
+  // the ensure/reconcile flows pass as a method arg. The listener builds the
+  // handle at startup (the dispatcher needs it to process inbound welcomes)
+  // before any peer interaction, so requiring operatorDid here would block the
+  // single-instance wiring for no reason.
 
   if (ctx.__mlsOrchestrator) return ctx.__mlsOrchestrator;
 

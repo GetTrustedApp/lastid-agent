@@ -1243,6 +1243,7 @@ async function cmdListen(flags) {
     { reconcileConversationDevices },
     { PresenceEmitter },
     { readActivityTs, readSignalTs },
+    { getOrchestrator, disposeOrchestrator },
   ] = await Promise.all([
     import('./agent-provisioning.js'),
     import('./mls-client.js'),
@@ -1254,6 +1255,7 @@ async function cmdListen(flags) {
     import('./reconcile-conversation.js'),
     import('./presence-emitter.js'),
     import('./presence-activity.js'),
+    import('./mls-orchestrator.js'),
   ]);
 
   // The agent's operator (parent human) — the only peer it reconciles against.
@@ -1360,11 +1362,27 @@ async function cmdListen(flags) {
       })
       .catch(() => {});
 
-  const mls = await MlsClient.open({
-    agentDid: loaded.agentDid,
-    slotSeed: loaded.slotSeed,
+  // B1 convergence: ONE MLS instance for the whole listener. We build the
+  // shared wasm orchestrator (disk-backed via diskKvCallbacks) once, then wrap
+  // it as the MlsClient the dispatcher + send path use. The SAME ctx object is
+  // threaded into drainOutbox → ensureConversation and reconcileConversationDevices
+  // below, so getOrchestrator returns this same cached handle to them — no
+  // second openmls instance. Previously the dispatcher/send opened a disk
+  // client while ensure/reconcile built a SEPARATE orchestrator on a phantom
+  // IndexedDB backend, so a group one created was invisible to the other — the
+  // multi-device welcome bug (mem_01KSNXSY4TY7DK7EJTREPNY5RH).
+  const listenerCtx = {
     scope,
-  });
+    agentDid: loaded.agentDid,
+    operatorDid,
+    idpUrl,
+    vcCompact: loaded.vcCompact,
+    signingKey,
+    slotSeed: loaded.slotSeed,
+    log: (l) => process.stderr.write(`${l}\n`),
+  };
+  const orchestrator = await getOrchestrator(listenerCtx);
+  const mls = MlsClient.fromOrchestrator(orchestrator, loaded.agentDid);
 
   if (flags['publish-keypackage'] || flags['publish-keypackage'] === undefined) {
     // Maintenance pass — fetch current inventory, top up only if
@@ -1759,6 +1777,9 @@ async function cmdListen(flags) {
     void drainOutbox({
       scope,
       mls,
+      // Same listener ctx so a self-heal ensureConversation reuses the ONE
+      // cached orchestrator (no forked instance). B1 convergence.
+      ctx: listenerCtx,
       agentDid: loaded.agentDid,
       send: (frame) => {
         const ok = ws.send(frame);
@@ -1818,6 +1839,8 @@ async function cmdListen(flags) {
     void reconcileConversationDevices({
       scope,
       mls,
+      // Same listener ctx → the cached orchestrator, not a forked one.
+      ctx: listenerCtx,
       agentDid: loaded.agentDid,
       operatorDid,
       idpUrl,
@@ -1842,7 +1865,12 @@ async function cmdListen(flags) {
     ws.stop();
     if (embedServer) { try { embedServer.close(); } catch { /* ignore */ } }
     if (vaultServer) { try { vaultServer.close(); } catch { /* ignore */ } }
-    try { mls.free(); } catch { /* ignore */ }
+    // Free the ONE shared orchestrator handle explicitly. mls is a
+    // fromOrchestrator wrapper (ownsHandle:false) so mls.free() is a no-op;
+    // disposeOrchestrator is what releases the wasm handle. Explicit free here
+    // also avoids the GC-finalize-flush rust panic at exit
+    // (mem_01KSRJR43ZARPS9CPCYPB0DND3).
+    try { disposeOrchestrator(listenerCtx); } catch { /* ignore */ }
     // Release the single-instance lock if it's still ours (a listener that
     // took over from us already claimed it — don't delete a live owner's pid).
     void releaseListenerLock({ scope }).catch(() => {});

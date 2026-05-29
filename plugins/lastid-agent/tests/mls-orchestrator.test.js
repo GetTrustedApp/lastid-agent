@@ -91,14 +91,24 @@ test('getOrchestrator coalesces concurrent callers onto the same construction', 
   assert.strictEqual(a, b);
 });
 
-test('getOrchestrator requires agentDid + operatorDid', async () => {
+test('getOrchestrator requires agentDid', async () => {
   await assert.rejects(
     () => getOrchestrator(makeCtx({ agentDid: undefined }), { wasmImpl: {} }),
     /agentDid required/,
   );
+});
+
+test('getOrchestrator requires a 32-byte slotSeed for the disk backend', async () => {
+  // The default disk backend derives the at-rest wrap key from slotSeed; a
+  // missing/short seed must fail loudly rather than silently start an
+  // unencrypted or wrong-keyed state. (A test injecting deps.makeKvCallbacks
+  // is exempt — that's the in-memory seam the other tests use.)
   await assert.rejects(
-    () => getOrchestrator(makeCtx({ operatorDid: undefined }), { wasmImpl: {} }),
-    /operatorDid required/,
+    () =>
+      getOrchestrator(makeCtx({ slotSeed: undefined }), {
+        wasmImpl: { async createMlsOrchestratorWithCallbacks() { return { free() {} }; } },
+      }),
+    /slotSeed/,
   );
 });
 
