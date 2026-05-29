@@ -1,140 +1,123 @@
 # LastID Agent Plugin
 
-Cryptographic identity for AI agents. The plugin provisions a
-LastID-issued `LastID.Agent.Base` verifiable credential the first time
-an agent runtime starts on a host — approved one-time in the operator's
-LastID wallet — then runs authenticated on every subsequent session.
+Give your Claude Code agent a verifiable cryptographic identity. Once
+provisioned, your agent can chat with you while it's idle, share its
+work-in-progress, use your vault credentials without ever seeing them,
+and remember things across sessions — all bound to a credential you
+approved in your LastID wallet.
 
-The plugin installs into:
+## Install
 
-- **Claude Code** via the marketplace below
-- **ChatGPT** (Custom Connector via Developer Mode) as an HTTP MCP server
-- **Codex CLI** as a stdio MCP server (`codex mcp add`)
-- **OpenAI Agents SDK** (Python/JS) as `MCPServerStdio`
-
-All four paths bind the same underlying `lastid-agent` CLI + MCP server.
-
----
-
-## Install in Claude Code
+In Claude Code:
 
 ```text
 /plugin marketplace add GetTrustedApp/lastid-agent
 /plugin install lastid-agent
-```
-
-On the next session start, the plugin reports provisioning status. If
-no agent credential exists yet, run:
-
-```text
 /lastid-agent:provision
 ```
 
-You'll be asked for your LastID canonical DID (`did:lastid:z…`). The
-CLI then surfaces a verification URL + user code; open the URL on the
-device that holds your LastID, approve the agent in your wallet, and
-the issued SD-JWT VC is persisted to the host keychain.
+`provision` prints a QR + URL. Scan the QR with the LastID app (or
+open the URL on a device that holds your LastID), approve the agent
+in your wallet, and the issued credential is saved to your host's
+keychain. Steady-state sessions skip provisioning automatically.
 
-## Install in ChatGPT (Custom Connector)
-
-1. Run the MCP server on a publicly reachable HTTPS endpoint:
-   ```bash
-   npx -y @lastid/agent serve --http 0.0.0.0:8787
-   ```
-2. In ChatGPT: **Settings → Connectors → Advanced → Developer mode →
-   Add custom connector** and paste your `/mcp` URL.
-
-(For local-only testing, expose the HTTP server via a tunnel — e.g.
-Cloudflare Tunnel or ngrok — and use the public URL.)
-
-## Install in Codex CLI
+Relaunch Claude with the LastID channel enabled so the agent receives
+your chats in real time even when it's idle:
 
 ```bash
-codex mcp add lastid-agent -- npx -y @lastid/agent serve
+claude --dangerously-load-development-channels plugin:lastid-agent@lastid-agent
 ```
 
-Then run `lastid-agent provision` once to register this host's agent
-with your LastID wallet.
+Channels are a Claude Code research-preview feature (requires v2.1.80+).
+The development flag is what loads the LastID channel.
 
-## Install in OpenAI Agents SDK
+## Run more than one agent
 
-Python:
+Prefix the launch with a scope. Each scope is its own agent identity,
+usable in any directory. No prefix is the default `main`:
 
-```python
-from agents.mcp import MCPServerStdio
-
-server = MCPServerStdio(
-    name="lastid-agent",
-    params={"command": "npx", "args": ["-y", "@lastid/agent", "serve"]},
-)
+```bash
+LASTID_AGENT_SCOPE=research claude
 ```
-
-JS/TS:
-
-```ts
-import { MCPServerStdio } from '@openai/agents';
-
-const server = new MCPServerStdio({
-  name: 'lastid-agent',
-  command: 'npx',
-  args: ['-y', '@lastid/agent', 'serve'],
-});
-```
-
----
 
 ## CLI
 
 ```text
-lastid-agent provision        # one-time: provision this host's agent identity
-lastid-agent status [--json]  # report provisioning state
+lastid-agent provision        # one-time: pair this host's agent to your LastID
+lastid-agent status [--json]  # report provisioning + listener state
+lastid-agent listen           # background listener (auto-started)
 lastid-agent show             # print the stored agent VC (debug)
-lastid-agent serve            # MCP server on stdio (Claude/Codex/Agents)
-lastid-agent serve --http :8787   # MCP server on HTTP (ChatGPT)
 ```
 
-Flags accepted by `provision`:
+`provision` accepts:
 
 ```text
 --parent-human-did did:lastid:z…    REQUIRED (or env LASTID_PARENT_HUMAN_DID)
 --idp <url>                         Default: https://human.lastid.co
---runtime <name>                    Default: lastid-agent-cli
+--runtime <name>                    Default: claude-code
 --project-hint <hex>                Optional SHA-256 prefix
 --scope <slug>                      Default: main
 --force                             Overwrite existing keychain entry
 ```
 
-## Tools exposed over MCP
+## What the plugin gives your agent
 
-The first release surfaces a single tool so the install + handshake
-work end-to-end across runtimes:
+### Talk to your operator
 
-- `lastid_whoami` — returns the agent's DID, parent human DID,
-  capabilities, and expiry. Reports `{ provisioned: false }` when no
-  agent credential is present.
+| Tool | Action |
+|---|---|
+| `lastid_send_message` | Send a chat message to your operator |
+| `lastid_react` | React to your operator's last message with an emoji |
+| `lastid_progress` | Post a progress update on long-running work |
+| `lastid_report_bug` | File a bug report against this plugin |
+| `lastid_whoami` | Show this agent's identity card |
 
-Memory (`lastid_memory_*`), signing (`lastid_sign`), and messaging
-(`lastid_message_*`) tools land in subsequent releases on the same MCP
-server.
+The listener daemon receives operator messages from any device (phone,
+web, desktop) and delivers them as channel events while Claude is idle.
+End-to-end encrypted via MLS — only your agent can decrypt them.
 
-## Repo layout
+### Use your operator's credentials safely
 
-```
-.claude-plugin/marketplace.json     # Claude Code marketplace index
-plugins/lastid-agent/
-  .claude-plugin/
-    plugin.json                     # plugin manifest
-    hooks.json                      # SessionStart wiring
-  .mcp.json                         # Claude Code MCP autodiscovery
-  bin/lastid-agent.js               # CLI: provision / status / show / serve
-  hooks/session-start.js            # thin CLI shell (no native keychain calls)
-  commands/provision.md             # /lastid-agent:provision slash command
-  lib/
-    agent-provisioning.js           # OID4VCI client
-    keychain.js                     # OS-keychain adapter
-    mcp-server.js                   # MCP server, stdio + HTTP
-  tests/
-package.json                        # bin: lastid-agent
+| Tool | Action |
+|---|---|
+| `vault_list` | List the vault items your operator shared with this agent |
+| `vault_use` | Request a single-use handle for one item |
+| `http_fetch` | Make an HTTP call with the handle attached at the network boundary |
+
+The plaintext credential never enters the agent's context window. The
+LastID desktop unfurls the handle at the wire and attaches it per the
+operator's policy.
+
+### Remember things across sessions
+
+| Tool | Action |
+|---|---|
+| `lastid_memory_write` | Save a memory (operator approves) |
+| `lastid_memory_draft` | Propose a memory for operator review |
+| `lastid_memory_search` | Find memories by topic |
+| `lastid_memory_get` | Fetch one memory by ID |
+| `lastid_memory_list` | List memories in this scope |
+| `lastid_memory_update` | Edit an existing memory |
+| `lastid_memory_forget` | Delete a memory |
+
+### Spawn helpers
+
+| Tool | Action |
+|---|---|
+| `lastid_list_subagents` | List the sub-agents your operator authored |
+| `lastid_invoke_subagent` | Run one with a task |
+| `lastid_subagent_list_running` | Show in-flight sub-agent jobs |
+| `lastid_subagent_result` | Fetch the result when it finishes |
+
+Sub-agents are full identities of their own (own DID, own credential,
+own capability set). Cascade-revoking the parent revokes the children
+automatically.
+
+## Slash commands
+
+```text
+/lastid-agent:provision    Pair this host's agent to your LastID
+/lastid-agent:memory-setup Walk through memory configuration
 ```
 
 ## License
