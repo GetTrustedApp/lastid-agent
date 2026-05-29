@@ -32,6 +32,10 @@ import {
   readSubagentInvocation,
   listRunningSubagentInvocations,
   appendInvocationProgress,
+  activeInvocationContextPath,
+  writeActiveInvocationContext,
+  readActiveInvocationContext,
+  clearActiveInvocationContext,
 } from '../lib/subagents.js';
 
 // ── Pure layer ────────────────────────────────────────────────────────
@@ -790,4 +794,128 @@ test('appendInvocationProgress: NEGATIVE — missing args / empty stage throw cl
     appendInvocationProgress({ parentScope: 'main-prog', invocationId: 'p-1', stage: '' }),
     /stage required/,
   );
+});
+
+// ── active-invocation context handoff (the lastid_progress anchor) ─────
+//
+// The parent writes `~/.lastid-agent/<subScope>/active-invocation.json`
+// BEFORE spawning a backgrounded child; the child's lastid_progress tool
+// reads it to discover {invocationId, parentScope} — the anchor it appends
+// progress against. The file lives under the SUB-scope (the child's own
+// LASTID_AGENT_SCOPE, the only env that survives the MCP launcher), not the
+// parent scope. The parent clears it on terminal state so a later foreground
+// invoke of the same helper can't pick up a stale anchor. tmpHome above
+// redirects $HOME so none of this touches the operator's real agent dir.
+
+test('writeActiveInvocationContext: POSITIVE — writes {invocationId, parentScope} to <subScope>/active-invocation.json', async () => {
+  const subScope = 'main-ctxwrite';
+  await writeActiveInvocationContext({
+    subScope,
+    invocationId: 'inv-write-1',
+    parentScope: 'main',
+  });
+  // File on disk under the SUB-scope dir with exactly the handoff fields.
+  const raw = await readFile(
+    join(tmpHome, '.lastid-agent', subScope, 'active-invocation.json'),
+    'utf-8',
+  );
+  const parsed = JSON.parse(raw);
+  assert.deepEqual(parsed, { invocationId: 'inv-write-1', parentScope: 'main' });
+});
+
+test('readActiveInvocationContext: POSITIVE — round-trips after write', async () => {
+  const subScope = 'main-ctxread';
+  await writeActiveInvocationContext({
+    subScope,
+    invocationId: 'inv-read-1',
+    parentScope: 'main-parent',
+  });
+  const ctx = await readActiveInvocationContext(subScope);
+  assert.deepEqual(ctx, { invocationId: 'inv-read-1', parentScope: 'main-parent' });
+});
+
+test('clearActiveInvocationContext: POSITIVE — deletes the file, subsequent read returns null', async () => {
+  const subScope = 'main-ctxclear';
+  await writeActiveInvocationContext({
+    subScope,
+    invocationId: 'inv-clear-1',
+    parentScope: 'main',
+  });
+  // Present first.
+  assert.ok(await readActiveInvocationContext(subScope));
+  // Clear, then it's gone.
+  await clearActiveInvocationContext(subScope);
+  const ctx = await readActiveInvocationContext(subScope);
+  assert.equal(ctx, null);
+});
+
+test('activeInvocationContextPath: POSITIVE — sub-scope-relative path ending in <subScope>/active-invocation.json', () => {
+  const subScope = 'main-pathshape';
+  const p = activeInvocationContextPath(subScope);
+  assert.ok(
+    p.endsWith(join('.lastid-agent', subScope, 'active-invocation.json')),
+    `path should be sub-scope-relative, got: ${p}`,
+  );
+});
+
+test('readActiveInvocationContext: NEGATIVE — missing file returns null (no throw)', async () => {
+  let ctx;
+  await assert.doesNotReject(async () => {
+    ctx = await readActiveInvocationContext('main-never-written');
+  });
+  assert.equal(ctx, null);
+});
+
+test('readActiveInvocationContext: NEGATIVE — malformed file (non-string fields) returns null', async () => {
+  const subScope = 'main-ctxbad';
+  // Valid JSON, wrong shape: invocationId is a number, not a string. The
+  // reader type-guards both fields and returns null rather than handing a
+  // half-formed anchor to lastid_progress.
+  await fsMkdir(join(tmpHome, '.lastid-agent', subScope), { recursive: true });
+  await fsWriteFile(
+    join(tmpHome, '.lastid-agent', subScope, 'active-invocation.json'),
+    JSON.stringify({ invocationId: 123 }),
+    'utf-8',
+  );
+  const ctx = await readActiveInvocationContext(subScope);
+  assert.equal(ctx, null);
+});
+
+test('REGRESSION — lastid_progress end-to-end: write context → read anchor → appendInvocationProgress → readSubagentInvocation shows the entry', async () => {
+  // This is the exact path lastid_progress runs in a backgrounded child:
+  //   1. parent seeds the running invocation state + active-invocation.json
+  //   2. child reads its anchor (invocationId + parentScope) from the file
+  //   3. child appends a progress stage against that anchor
+  //   4. parent polling readSubagentInvocation sees the progress entry
+  const parentScope = 'main-e2e';
+  const subScope = 'main-e2e-runner';
+  const invocationId = 'inv-e2e-1';
+
+  // (1) Parent state: running invocation + the per-sub-scope context file.
+  await seedInvocation(parentScope, invocationId, {
+    status: 'running',
+    invocation_id: invocationId,
+    slug: 'runner',
+    started_at: new Date().toISOString(),
+  });
+  await writeActiveInvocationContext({ subScope, invocationId, parentScope });
+
+  // (2) Child resolves its anchor purely from the sub-scope context file.
+  const anchor = await readActiveInvocationContext(subScope);
+  assert.deepEqual(anchor, { invocationId, parentScope });
+
+  // (3) Child streams a progress stage using the resolved anchor.
+  await appendInvocationProgress({
+    parentScope: anchor.parentScope,
+    invocationId: anchor.invocationId,
+    stage: 'running test suite',
+    detail: '3/3 pushes',
+  });
+
+  // (4) Parent poll observes the entry on the running invocation.
+  const state = await readSubagentInvocation({ parentScope, invocationId });
+  assert.equal(state.status, 'running');
+  assert.equal(state.progress.length, 1);
+  assert.equal(state.progress[0].stage, 'running test suite');
+  assert.equal(state.progress[0].detail, '3/3 pushes');
 });
