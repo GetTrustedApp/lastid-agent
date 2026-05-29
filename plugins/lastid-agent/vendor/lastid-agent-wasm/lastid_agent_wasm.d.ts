@@ -381,6 +381,14 @@ export function sdkDecryptAgentContentForSubAgent(parent_slot_index: number, cla
 export function sdkDecryptProjectContent(routing_id: string, enc_b64: string): Promise<Uint8Array>;
 
 /**
+ * Permanently delete a conversation (its index record + message
+ * thread). The console's "close conversation" calls this so a closed
+ * group's local state is gone and hydrate won't resurface it even if
+ * the IdP still holds the group. Idempotent.
+ */
+export function sdkDeleteConversation(conversation_id: string): Promise<void>;
+
+/**
  * POST `/v1/oid4vci/agent-provision/deny` with a reason. Used by
  * the approve page's Deny button. Caller must already have
  * fetched `/pending` (which attached the row to their DID) — the
@@ -601,6 +609,42 @@ export function sdkSealToHandle(handle_public_sec1_b64: string, handle_id: strin
  * applying. `record_json` is the canonical record object.
  */
 export function sdkSignAgentStateRecord(record_json: any): Promise<string>;
+
+/**
+ * Sign a decision JWS for a pending agent-use approval — the
+ * console-side counterpart to mobile's
+ * `submit_use_approval_decision` in
+ * `lastid-runtime/src/agent_provisioning_runtime.rs:735`. Mirrors
+ * THAT flow exactly: unseal the local SeedBundle, derive the
+ * operator's `delegation_authority` P-256 signing key, validate
+ * the (decision, ttl_secs) shape (ttl REQUIRED on approve, ABSENT
+ * on deny), build `DecisionClaims` with `iat = now`, fresh
+ * `jti = urn:uuid:...`, and `iss = canonical_did`, then call
+ * `sign_decision_jws`. Returns the compact JWS the caller POSTs
+ * to `/v1/agent-use-approvals/:id/decide` (body
+ * `{decision_jws_compact}`).
+ *
+ * The HTTP step lives in JS — this function is sign-only so the
+ * console can attach the JWS in its own SWR / audit-emitter flow.
+ *
+ * Parameters (one JSON arg keeps the wasm-bindgen surface small):
+ *   {
+ *     "approval_id":   string  (from the agent_use_approval.requested event)
+ *     "decision":      "approved" | "denied"
+ *     "agent_did":     string  (from the row)
+ *     "share_id":      string  (synthetic — caller used computeShareId already)
+ *     "ttl_secs":      number? (REQUIRED on approve, omitted/null on deny)
+ *     "kid":           string? (delegation_authority key kid; null is fine)
+ *   }
+ *
+ * Returns the compact JWS string.
+ *
+ * Throws on: bad JSON shape, ttl-decision mismatch, missing
+ * canonical_did (signup not complete), seed-bundle unlock failure,
+ * or any cryptographic error from the signer. Each error message
+ * is precise enough for the UI to surface.
+ */
+export function sdkSignDecisionJws(params_json: string): Promise<string>;
 
 /**
  * Build + sign a canonical `VaultShareAcl` (claim_version 3) granting an

@@ -943,6 +943,22 @@ function sdkDecryptProjectContent(routing_id, enc_b64) {
 exports.sdkDecryptProjectContent = sdkDecryptProjectContent;
 
 /**
+ * Permanently delete a conversation (its index record + message
+ * thread). The console's "close conversation" calls this so a closed
+ * group's local state is gone and hydrate won't resurface it even if
+ * the IdP still holds the group. Idempotent.
+ * @param {string} conversation_id
+ * @returns {Promise<void>}
+ */
+function sdkDeleteConversation(conversation_id) {
+    const ptr0 = passStringToWasm0(conversation_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkDeleteConversation(ptr0, len0);
+    return ret;
+}
+exports.sdkDeleteConversation = sdkDeleteConversation;
+
+/**
  * POST `/v1/oid4vci/agent-provision/deny` with a reason. Used by
  * the approve page's Deny button. Caller must already have
  * fetched `/pending` (which attached the row to their DID) — the
@@ -1375,6 +1391,50 @@ function sdkSignAgentStateRecord(record_json) {
     return ret;
 }
 exports.sdkSignAgentStateRecord = sdkSignAgentStateRecord;
+
+/**
+ * Sign a decision JWS for a pending agent-use approval — the
+ * console-side counterpart to mobile's
+ * `submit_use_approval_decision` in
+ * `lastid-runtime/src/agent_provisioning_runtime.rs:735`. Mirrors
+ * THAT flow exactly: unseal the local SeedBundle, derive the
+ * operator's `delegation_authority` P-256 signing key, validate
+ * the (decision, ttl_secs) shape (ttl REQUIRED on approve, ABSENT
+ * on deny), build `DecisionClaims` with `iat = now`, fresh
+ * `jti = urn:uuid:...`, and `iss = canonical_did`, then call
+ * `sign_decision_jws`. Returns the compact JWS the caller POSTs
+ * to `/v1/agent-use-approvals/:id/decide` (body
+ * `{decision_jws_compact}`).
+ *
+ * The HTTP step lives in JS — this function is sign-only so the
+ * console can attach the JWS in its own SWR / audit-emitter flow.
+ *
+ * Parameters (one JSON arg keeps the wasm-bindgen surface small):
+ *   {
+ *     "approval_id":   string  (from the agent_use_approval.requested event)
+ *     "decision":      "approved" | "denied"
+ *     "agent_did":     string  (from the row)
+ *     "share_id":      string  (synthetic — caller used computeShareId already)
+ *     "ttl_secs":      number? (REQUIRED on approve, omitted/null on deny)
+ *     "kid":           string? (delegation_authority key kid; null is fine)
+ *   }
+ *
+ * Returns the compact JWS string.
+ *
+ * Throws on: bad JSON shape, ttl-decision mismatch, missing
+ * canonical_did (signup not complete), seed-bundle unlock failure,
+ * or any cryptographic error from the signer. Each error message
+ * is precise enough for the UI to surface.
+ * @param {string} params_json
+ * @returns {Promise<string>}
+ */
+function sdkSignDecisionJws(params_json) {
+    const ptr0 = passStringToWasm0(params_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkSignDecisionJws(ptr0, len0);
+    return ret;
+}
+exports.sdkSignDecisionJws = sdkSignDecisionJws;
 
 /**
  * Build + sign a canonical `VaultShareAcl` (claim_version 3) granting an
@@ -2759,27 +2819,27 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1517, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1531, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h07eda6f9933457e4);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 1099, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 1113, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1725375cb213b3e4);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 1030, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 1044, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h0863b872d6f8b8ab);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1187, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1201, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3c6c61154a9359bf);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 589, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 602, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h23499dd81690a033);
             return ret;
         },
