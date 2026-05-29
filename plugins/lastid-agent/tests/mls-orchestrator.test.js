@@ -30,6 +30,10 @@ function makeCtx(overrides = {}) {
     idpUrl: 'https://idp.test',
     vcCompact: 'vc-compact-jwt',
     signingKey: {},
+    // 32-byte seed for the disk backend's at-rest wrap key. The fake
+    // wasmImpl factories below never invoke the KV callbacks, so no real
+    // disk I/O happens — this just satisfies getOrchestrator's slotSeed guard.
+    slotSeed: new Uint8Array(32),
     log: () => {},
     ...overrides,
   };
@@ -41,7 +45,7 @@ test('getOrchestrator constructs once per ctx and caches the handle', async () =
   const ctx = makeCtx();
   let constructed = 0;
   const wasmImpl = {
-    async createMlsOrchestrator(botDid, myDid, directory, transport, host) {
+    async createMlsOrchestratorWithCallbacks(botDid, myDid, directory, transport, host) {
       constructed += 1;
       // Stash the bundles so the test can assert they were threaded through.
       return {
@@ -70,7 +74,7 @@ test('getOrchestrator coalesces concurrent callers onto the same construction', 
   let constructing = 0;
   let constructed = 0;
   const wasmImpl = {
-    async createMlsOrchestrator() {
+    async createMlsOrchestratorWithCallbacks() {
       constructing += 1;
       // Yield so the second concurrent call observes us mid-construction.
       await new Promise((r) => setImmediate(r));
@@ -101,7 +105,7 @@ test('getOrchestrator requires agentDid + operatorDid', async () => {
 test('getOrchestrator surfaces a missing wasm factory loudly', async () => {
   await assert.rejects(
     () => getOrchestrator(makeCtx(), { wasmImpl: {} }),
-    /createMlsOrchestrator not available/,
+    /createMlsOrchestratorWithCallbacks not available/,
   );
 });
 
@@ -109,7 +113,7 @@ test('disposeOrchestrator frees the handle + clears the cache (idempotent)', asy
   const ctx = makeCtx();
   let freed = 0;
   const wasmImpl = {
-    async createMlsOrchestrator() {
+    async createMlsOrchestratorWithCallbacks() {
       return {
         free() {
           freed += 1;

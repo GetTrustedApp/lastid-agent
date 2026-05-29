@@ -45,6 +45,7 @@ import {
   evictMemberDevices,
   listOwnDevices,
 } from './mls-groups-api.js';
+import { diskKvCallbacks } from './mls-state-store.js';
 
 const localRequire = createRequire(import.meta.url);
 const wasm = localRequire('../vendor/lastid-mls-wasm/lastid_mls_wasm.js');
@@ -343,14 +344,52 @@ export async function getOrchestrator(ctx, { deps = {}, wasmImpl = wasm } = {}) 
   if (ctx.__mlsOrchestratorPending) return ctx.__mlsOrchestratorPending;
 
   const { directory, transport, host } = buildCallbackBundles({ ctx, deps });
-  const factory = typeof wasmImpl?.createMlsOrchestrator === 'function'
-    ? wasmImpl.createMlsOrchestrator.bind(wasmImpl)
-    : null;
+
+  // B1 convergence: build the orchestrator over the SAME disk-backed RawKv the
+  // MlsClient (dispatcher inbound + agent-send outbound + keypackage publish)
+  // opens — `createMlsOrchestratorWithCallbacks` with `diskKvCallbacks` against
+  // the agent's sealed mls-state.b64. The OLD path used `createMlsOrchestrator`,
+  // the IndexedDB factory, which has NO real backend in Node — so the
+  // orchestrator's startDirectChat/reconcile ran on a separate, non-durable
+  // openmls state that the send/dispatch path never saw. That instance split is
+  // the multi-device welcome bug (mem_01KSNXSY4TY7DK7EJTREPNY5RH): a group the
+  // orchestrator created was invisible to the sender, and a welcome the sender
+  // joined was invisible to reconcile. ONE instance fixes it.
+  //
+  // slotSeed is REQUIRED for the disk backend (it derives the at-rest wrap
+  // key). The deps.makeKvCallbacks seam lets tests inject an in-memory backend.
+  const factory =
+    typeof wasmImpl?.createMlsOrchestratorWithCallbacks === 'function'
+      ? wasmImpl.createMlsOrchestratorWithCallbacks.bind(wasmImpl)
+      : null;
   if (!factory) {
-    throw new Error('mls-orchestrator: wasm createMlsOrchestrator not available');
+    throw new Error(
+      'mls-orchestrator: wasm createMlsOrchestratorWithCallbacks not available',
+    );
   }
+  const makeKvCallbacks = deps.makeKvCallbacks ?? diskKvCallbacks;
+  if (!deps.makeKvCallbacks) {
+    // The disk backend needs the 32-byte slot seed; a test injecting its own
+    // backend via deps.makeKvCallbacks is exempt.
+    if (!(ctx.slotSeed instanceof Uint8Array) || ctx.slotSeed.length !== 32) {
+      throw new Error('getOrchestrator: ctx.slotSeed (32-byte Uint8Array) required for the disk backend');
+    }
+  }
+  const kvCallbacks = makeKvCallbacks({
+    slotSeed: ctx.slotSeed,
+    scope: ctx.scope,
+    log: ctx.log,
+  });
+
   ctx.__mlsOrchestratorPending = (async () => {
-    const orch = await factory(ctx.agentDid, ctx.agentDid, directory, transport, host);
+    const orch = await factory(
+      ctx.agentDid,
+      ctx.agentDid,
+      directory,
+      transport,
+      host,
+      kvCallbacks,
+    );
     ctx.__mlsOrchestrator = orch;
     return orch;
   })();
