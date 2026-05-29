@@ -1397,6 +1397,11 @@ async function cmdListen(flags) {
         vcCompact: loaded.vcCompact,
         slotSeed: loaded.slotSeed,
         scope,
+        // Mint into the listener's ONE shared MLS instance, NOT a competing
+        // client — otherwise the KP private parts the operator's welcome needs
+        // get clobbered by the orchestrator's next flush → NoMatchingKeyPackage
+        // (mem_01KSNXSY4TY7DK7EJTREPNY5RH). B1 convergence.
+        mls,
       });
       if (result.replenished) {
         process.stderr.write(

@@ -50,6 +50,16 @@ const TOPUP_THRESHOLD = 2;
  *                                   derived internally so the caller
  *                                   doesn't need to plumb it through.
  * @param {string} [args.scope]
+ * @param {import('./mls-client.js').MlsClient} [args.mls]  — the listener's
+ *   SHARED MLS handle. **MUST** be passed when a listener is running: the
+ *   KeyPackage's private credential is minted into THIS handle's openmls
+ *   state, and only this handle (which also processes inbound welcomes) can
+ *   later match it. If publish opens its OWN client while the listener's
+ *   orchestrator is live, the two instances over the same sealed file clobber
+ *   each other's flush and the private parts vanish → `NoMatchingKeyPackage`
+ *   on the operator's welcome — the multi-device delivery bug
+ *   (mem_01KSNXSY4TY7DK7EJTREPNY5RH). Omit ONLY at provision time, before any
+ *   listener exists (no concurrent instance, so a throwaway client is safe).
  *
  * @returns {Promise<{ ok: true, ref?: string }>}
  *   On the IdP success path the body includes a `ref` field; we
@@ -62,6 +72,7 @@ export async function publishAgentKeyPackage({
   vcCompact,
   slotSeed,
   scope,
+  mls: sharedMls,
 }) {
   const trimmed = String(idpUrl ?? '').replace(/\/$/, '');
   if (!trimmed) throw new Error('publishAgentKeyPackage: idpUrl required');
@@ -87,11 +98,16 @@ export async function publishAgentKeyPackage({
     x: publicJwk.x,
   });
 
-  const mls = await MlsClient.open({
-    agentDid,
-    slotSeed,
-    scope: scope ?? 'main',
-  });
+  // Reuse the listener's shared handle when given (B1 convergence — see the
+  // `mls` param doc). Only fall back to a throwaway client at provision time,
+  // when no listener (and so no competing instance) exists.
+  const mls =
+    sharedMls ??
+    (await MlsClient.open({
+      agentDid,
+      slotSeed,
+      scope: scope ?? 'main',
+    }));
 
   // Mint REGULAR_COUNT consumable KPs + 1 last-resort. Each
   // generateKeyPackage call mints a fresh KP with its own private
@@ -161,6 +177,7 @@ export async function maintainAgentKeyPackages({
   vcCompact,
   slotSeed,
   scope,
+  mls: sharedMls,
 }) {
   const trimmed = String(idpUrl ?? '').replace(/\/$/, '');
   if (!trimmed) throw new Error('maintainAgentKeyPackages: idpUrl required');
@@ -199,12 +216,15 @@ export async function maintainAgentKeyPackages({
   if (available >= TOPUP_THRESHOLD) {
     return { available, replenished: false };
   }
+  // Thread the shared handle through so the replenish mints into the
+  // listener's ONE instance, not a competing one (B1 convergence).
   const result = await publishAgentKeyPackage({
     idpUrl,
     agentDid,
     vcCompact,
     slotSeed,
     scope,
+    mls: sharedMls,
   });
   return { available, replenished: true, refs: result.refs };
 }
