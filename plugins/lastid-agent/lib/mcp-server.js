@@ -258,7 +258,7 @@ const LOCAL_VAULT_TOOL_NAMES = new Set(LOCAL_VAULT_TOOLS.map((t) => t.name));
  * vault_use drives the cross-device approval loop transparently when the share
  * requires per-use approval, the same as the desktop path.
  */
-export async function handleLocalVault({ name, args, scope, loadedAgent, signingSeed, vaultRequest: injectedVaultRequest } = {}) {
+export async function handleLocalVault({ name, args, scope, loadedAgent, vaultRequest: injectedVaultRequest } = {}) {
   const wrap = (obj, isError = false) => ({
     content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }],
     ...(isError ? { isError: true } : {}),
@@ -296,34 +296,18 @@ export async function handleLocalVault({ name, args, scope, loadedAgent, signing
     const purpose = typeof args?.purpose === 'string' && args.purpose.length > 0
       ? args.purpose
       : undefined;
-    let resp = await vaultRequest(scope, {
+    // No approval dispatch here — vault-ipc's vault_use handles the loop
+    // inside the listener (single dispatch site). Caller just awaits; gets
+    // back ok+handle (approved) or a clean error (denied / expired). The
+    // LLM never sees the approval mid-state; the tool blocks transparently
+    // while the operator decides. Bedrock [mem_fdf4ae34b140437098c90399efcde299]:
+    // one place to keep the gate in sync.
+    const resp = await vaultRequest(scope, {
       op: 'vault_use',
       item_id: args.item_id,
       purpose,
       ctx: { now_ms: Date.now(), scope: useScope },
     });
-    if (resp?.policy_approval_required === true && signingSeed) {
-      const outcome = await runApprovalLoop({
-        approvalBody: resp,
-        originalArgs: args,
-        agentDid: loadedAgent.agentDid,
-        vcCompact: loadedAgent.vcCompact,
-        signingSeed,
-      });
-      if (outcome.retryArgs) {
-        resp = await vaultRequest(scope, {
-          op: 'vault_use',
-          item_id: args.item_id,
-          ctx: { now_ms: Date.now(), scope: useScope },
-          approved: true,
-          approval_id: outcome.retryArgs.approval_id,
-        });
-      } else if (outcome.expired) {
-        return wrap({ error: 'policy_approval_expired', reason_detail: 'operator did not decide within the pending window' }, true);
-      } else if (outcome.denied) {
-        return wrap(outcome.body, true);
-      }
-    }
     return wrap(resp, resp?.error != null);
   } catch (e) {
     return wrap({ error: 'vault_local_failed', tool: name, message: e?.message ?? String(e) }, true);
@@ -921,10 +905,10 @@ async function buildServer({ scope }) {
       }
     }
     // SaaS / no-desktop path: route vault_use + http_fetch to the LOCAL listener.
-    // signingSeed was resolved by ensureDesktop() above (derived from the agent's
-    // slot_seed even when no desktop is present) so the approval loop can sign.
+    // The approval loop now lives INSIDE vault-ipc's vault_use handler
+    // (single dispatch site), so this caller no longer threads signingSeed.
     if (LOCAL_VAULT_TOOL_NAMES.has(name)) {
-      return handleLocalVault({ name, args: args ?? {}, scope, loadedAgent, signingSeed });
+      return handleLocalVault({ name, args: args ?? {}, scope, loadedAgent });
     }
     throw new Error(`unknown tool: ${name}`);
   });

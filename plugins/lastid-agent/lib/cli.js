@@ -1745,6 +1745,12 @@ async function cmdListen(flags) {
       scope,
       deps: {
         agentDid: loaded.agentDid,
+        // signingSeed + vcCompact let the listener run the cross-device
+        // approval loop INSIDE vault_use (single dispatch site — see
+        // vault-ipc.js). Callers don't need to know about the loop; they
+        // just await vault_use and get back ok+handle or a clean error.
+        signingSeed,
+        vcCompact: loaded.vcCompact,
         handles: vaultHandles,
         // Fresh OperatorStore per call so we use the latest pinned delegation
         // key (it may get pinned by a sync after the listener started).
@@ -2048,66 +2054,11 @@ async function cmdRun(flags, cmdArgv) {
     process.stderr.write(`run: vault listener unreachable (${e?.message ?? e}). Is the agent listener running?\n`);
     exit(1);
   }
-  if (used?.policy_approval_required) {
-    // Drive the cross-device approval loop in-process (mirrors the MCP
-    // server's path in mcp-server.js): POST the row to the IdP, poll for
-    // the operator's decision JWS, verify it locally, retry vault_use
-    // with approved:true. Previously the CLI just printed "go approve
-    // in your LastID, then retry" and bailed — which dropped the operator
-    // into a polling loop they had to drive by hand and broke the
-    // matching UX promise the MCP path makes. Same use-approval-loop.js
-    // helper, same approval_request body, same TTL behavior.
-    process.stderr.write(
-      'run: this credential needs operator approval — waiting for your decision (Approve/Deny in console or phone)…\n',
-    );
-    const { runApprovalLoop } = await import('./use-approval-loop.js');
-    // signingSeed for the IdP DPoP proof is the DERIVED Ed25519
-    // signing-key seed, not the raw slot_seed (mintAgentPopJwt signs
-    // with whatever bytes it's handed verbatim). Mirrors what
-    // mcp-server.js:tryConnectDesktop does — same derive helper, same
-    // input. Passing the raw slot_seed produces a valid-looking DPoP
-    // that the IdP's agent_pop verifier rejects because the agent's
-    // cnf.jwk pubkey is derived from signingSeed, not slot_seed.
-    const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
-    const { signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
-    const outcome = await runApprovalLoop({
-      approvalBody: used,
-      originalArgs: { item_id: itemId },
-      agentDid: loaded.agentDid,
-      vcCompact: loaded.vcCompact,
-      signingSeed,
-    });
-    if (outcome?.expired) {
-      process.stderr.write('run: approval window expired — operator did not decide in time\n');
-      exit(1);
-    }
-    if (outcome?.denied) {
-      process.stderr.write(
-        `run: ${outcome.body?.error ?? 'policy_approval_denied'}: ${outcome.body?.reason_detail ?? 'operator denied the approval'}\n`,
-      );
-      exit(1);
-    }
-    if (!outcome?.retryArgs) {
-      process.stderr.write('run: approval flow returned an unexpected outcome — aborting\n');
-      exit(1);
-    }
-    // Retry vault_use with the approved-flag + approval_id. The listener
-    // verifies the decision JWS via operator_delegation_jwk locally before
-    // releasing the handle, so a poisoned IdP response can't fake an
-    // approval here.
-    try {
-      used = await vaultRequest(scope, {
-        op: 'vault_use',
-        item_id: itemId,
-        approved: true,
-        approval_id: outcome.retryArgs.approval_id,
-        ctx: { now_ms: Date.now() },
-      });
-    } catch (e) {
-      process.stderr.write(`run: vault listener unreachable on approved retry (${e?.message ?? e})\n`);
-      exit(1);
-    }
-  }
+  // No approval dispatch here — vault-ipc's vault_use handles the loop
+  // inside the listener (single dispatch site). When approval is required,
+  // the await above blocks while the listener runs the loop; we get back
+  // ok+handle (approved) or a clean error (denied / expired). The CLI no
+  // longer needs to know an approval happened.
   if (!used?.ok || !used.vault_handle) {
     process.stderr.write(`run: ${used?.error ?? 'vault_use_failed'}: ${used?.reason_detail ?? used?.detail ?? ''}\n`);
     exit(1);

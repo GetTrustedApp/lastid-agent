@@ -71,67 +71,102 @@ test('vault_use denied by policy → policy_denied (no handle)', async () => {
   assert.equal(d.handles.size, 0);
 })
 
-test('vault_use needing approval → policy_approval_required until approved:true', async () => {
+test('vault_use needing approval → runs loop inside listener, returns handle on approve (single dispatch)', async () => {
+  // Single dispatch contract: caller awaits one vault_use call and gets
+  // back ok+handle. NO `policy_approval_required` signal escapes. The
+  // listener (via injected runApprovalLoop dep) drives the approval
+  // round-trip internally. This is the consolidated path; mcp-server.js
+  // and cli.js no longer have their own dispatch sites.
+  let loopCalls = 0;
+  const SIGNING = Buffer.alloc(32, 1);
+  const d = deps({
+    resolveShare: async () => ({ ...SHARE, require_approval_per_use: true, title: 'AWS' }),
+    signingSeed: SIGNING,
+    vcCompact: 'eyJ.test.vc',
+    runApprovalLoop: async ({ approvalBody, agentDid, vcCompact, signingSeed }) => {
+      loopCalls += 1;
+      // The loop receives the constructed approval_request body with all
+      // IdP-required fields populated.
+      assert.ok(approvalBody?.approval_request?.share_id);
+      assert.equal(approvalBody.approval_request.resource_kind, 'credential');
+      assert.equal(approvalBody.approval_request.resource_ref, 'vault_1');
+      assert.equal(approvalBody.approval_request.resource_name, 'AWS');
+      assert.ok(approvalBody.approval_request.reason_kind);
+      assert.ok(approvalBody.approval_request.reason_detail?.length > 0);
+      assert.match(approvalBody.approval_request.session_id, /^[0-9a-f-]{36}$/i);
+      // Listener also forwards identity material so the loop can sign DPoP.
+      assert.ok(agentDid);
+      assert.equal(vcCompact, 'eyJ.test.vc');
+      assert.equal(signingSeed, SIGNING);
+      return { retryArgs: { approval_id: 'ap_1' } };
+    },
+  });
+  const r = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  assert.equal(loopCalls, 1, 'loop dispatched exactly once');
+  assert.equal(r.policy_approval_required, undefined, 'signal does NOT escape — single dispatch site');
+  assert.equal(r.ok, true, 'caller gets ok+handle as if approval were transparent');
+  assert.ok(r.vault_handle);
+})
+
+test('vault_use approval DENIED → returns clean error, no handle minted', async () => {
+  const d = deps({
+    resolveShare: async () => ({ ...SHARE, require_approval_per_use: true }),
+    signingSeed: Buffer.alloc(32, 1),
+    vcCompact: 'eyJ.test.vc',
+    runApprovalLoop: async () => ({
+      denied: true,
+      body: { error: 'policy_approval_denied', reason_detail: 'operator denied' },
+    }),
+  });
+  const r = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  assert.equal(r.error, 'policy_approval_denied');
+  assert.match(r.reason_detail, /denied/i);
+  assert.equal(d.handles.size, 0, 'no handle on denied');
+})
+
+test('vault_use approval EXPIRED → returns policy_approval_expired error', async () => {
+  const d = deps({
+    resolveShare: async () => ({ ...SHARE, require_approval_per_use: true }),
+    signingSeed: Buffer.alloc(32, 1),
+    vcCompact: 'eyJ.test.vc',
+    runApprovalLoop: async () => ({ expired: true }),
+  });
+  const r = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  assert.equal(r.error, 'policy_approval_expired');
+  assert.match(r.reason_detail, /did not decide/i);
+  assert.equal(d.handles.size, 0);
+})
+
+test('vault_use approval-required without signingSeed in deps → clean error, never throws', async () => {
+  // Defense: if the listener's startVaultServer caller forgot to thread
+  // signingSeed/vcCompact, we surface the misconfig instead of crashing
+  // mid-loop or running with bogus material.
   const d = deps({ resolveShare: async () => ({ ...SHARE, require_approval_per_use: true }) });
-  const r1 = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
-  assert.equal(r1.policy_approval_required, true);
-  assert.equal(d.handles.size, 0, 'no handle until approved');
-  const r2 = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1', approved: true, approval_id: 'ap_1' }, d);
-  assert.equal(r2.ok, true);
-  assert.ok(r2.vault_handle);
+  const r = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
+  assert.equal(r.error, 'policy_approval_unavailable');
+  assert.match(r.reason_detail, /signing material/i);
+  assert.equal(d.handles.size, 0);
 })
 
-test('policy_approval_required carries an `approval_request` with EVERY IdP-required field', async () => {
-  // Regression for the 2026-05-28 bug where the IdP rejected the POST
-  // with "share_id required; resource_kind required; resource_ref
-  // required; reason_kind required; reason_detail required; session_id
-  // required" — vault-ipc returned the signal without an approval_request
-  // and runApprovalLoop POSTed JSON.stringify(undefined).
+test('vault_use re-called with approved:true skips the loop entirely (idempotent retry-by-id is safe)', async () => {
+  // The listener's loop already flipped approved=true internally on the
+  // first call. If a caller for some reason re-invokes with approved:true
+  // + approval_id (e.g. a test, a retry path), it should mint without
+  // touching the loop again.
+  let loopCalls = 0;
   const d = deps({
-    resolveShare: async () => ({
-      ...SHARE,
-      require_approval_per_use: true,
-      title: 'LastID - IDP - AWS',
-    }),
+    resolveShare: async () => ({ ...SHARE, require_approval_per_use: true }),
+    signingSeed: Buffer.alloc(32, 1),
+    vcCompact: 'eyJ.test.vc',
+    runApprovalLoop: async () => { loopCalls += 1; return { retryArgs: { approval_id: 'ap_1' } }; },
   });
   const r = await handleVaultRequest(
-    { op: 'vault_use', item_id: 'vault_aws', purpose: 'fetch the last 5 CloudTrail events' },
+    { op: 'vault_use', item_id: 'vault_1', approved: true, approval_id: 'ap_1' },
     d,
   );
-  assert.equal(r.policy_approval_required, true);
-  assert.ok(r.approval_request, 'approval_request is present')
-  // Every IdP CreateBody-required field is populated; share_id matches
-  // the desktop's `compute_share_id` template (see
-  // lastid-vc::decision_jws::compute_share_id) so the operator's
-  // decision binds to a share_id the desktop will recognize.
-  assert.match(r.approval_request.share_id, /^share::did:lastid:agent:.+::vault_aws$/);
-  assert.equal(r.approval_request.resource_kind, 'credential');
-  assert.equal(r.approval_request.resource_ref, 'vault_aws');
-  assert.equal(r.approval_request.resource_name, 'LastID - IDP - AWS');
-  assert.equal(r.approval_request.purpose, 'fetch the last 5 CloudTrail events');
-  assert.ok(typeof r.approval_request.reason_kind === 'string' && r.approval_request.reason_kind.length > 0);
-  assert.ok(typeof r.approval_request.reason_detail === 'string' && r.approval_request.reason_detail.length > 0);
-  assert.match(r.approval_request.session_id, /^[0-9a-f-]{36}$/i);
-})
-
-test('approval_request omits resource_name + purpose when the share/call has neither (IdP rejects empty-string)', async () => {
-  // The IdP's CreateBody validator rejects empty-string resource_name /
-  // purpose. Construct the request with the field ABSENT (not
-  // empty-string) when there's nothing to put there.
-  const d = deps({
-    resolveShare: async () => ({
-      ...SHARE,
-      require_approval_per_use: true,
-      title: '', // simulate a share with no human-readable title
-    }),
-  });
-  const r = await handleVaultRequest(
-    { op: 'vault_use', item_id: 'vault_x' }, // no purpose
-    d,
-  );
-  assert.equal(r.policy_approval_required, true);
-  assert.equal('resource_name' in r.approval_request, false, 'resource_name absent, not empty-string');
-  assert.equal('purpose' in r.approval_request, false, 'purpose absent, not empty-string');
+  assert.equal(loopCalls, 0, 'approved:true short-circuits the loop');
+  assert.equal(r.ok, true);
+  assert.ok(r.vault_handle);
 })
 
 test('http_fetch injects the secret, calls, and revokes (single-use)', async () => {

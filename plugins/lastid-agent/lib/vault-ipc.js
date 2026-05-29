@@ -68,17 +68,21 @@ export async function handleVaultRequest(req, deps) {
       return { error: 'policy_denied', reason_kind: policy.reason_kind, reason_detail: policy.reason_detail, constraint_kind: policy.constraint_kind };
     }
     if (policy.outcome === OUTCOME.APPROVAL && req.approved !== true) {
-      // The MCP drives the cross-device approval loop, then retries with
-      // approved:true once it has verified the operator's decision JWS.
+      // Single dispatch site for the cross-device approval loop. Callers
+      // (MCP handleLocalVault, CLI cmdRun, anything future) just await
+      // vault_use — they NEVER see `policy_approval_required`, never run
+      // the loop themselves. Bedrock [mem_fdf4ae34b140437098c90399efcde299]:
+      // ONE place to keep in sync. Previously the dispatch lived in
+      // mcp-server.js AND cli.js — every caller had to re-implement the
+      // "check signal → POST → poll → retry" dance, which is exactly the
+      // bifurcation that caused the duplicate-approval bug.
+      //
       // `approval_request` is the BODY runApprovalLoop POSTs to the IdP's
       // /v1/agent-use-approvals — every field below is required by the
-      // IdP's CreateBody validator. Pre-fix this object was absent and
-      // the POST shipped `JSON.stringify(undefined)` → 400 from the IdP.
-      // share_id is the same synthetic string the desktop's
-      // `compute_share_id` produces (lastid-vc::decision_jws); the IdP
-      // and the desktop both agree on this template, so the operator's
-      // decision JWS binds to a share_id the desktop will recognize on
-      // the retry path.
+      // IdP's CreateBody validator. share_id matches the desktop's
+      // `compute_share_id` template (lastid-vc::decision_jws) so the
+      // operator's decision JWS binds to a share_id the desktop will
+      // recognize on the retry path.
       const purposeIn = typeof req.purpose === 'string' && req.purpose.length > 0
         ? req.purpose
         : null;
@@ -107,16 +111,58 @@ export async function handleVaultRequest(req, deps) {
         // operator's audit chain stitches by approval_id, not session_id.
         session_id: randomUUID(),
       };
-      return {
-        policy_approval_required: true,
-        item_id: itemId,
-        resource_name: content.title,
-        reason_kind: policy.reason_kind,
-        reason_detail: policy.reason_detail,
-        constraint_kind: policy.constraint_kind,
-        require_approval_per_use: content.require_approval_per_use === true,
-        approval_request: approvalRequest,
-      };
+      // Run the loop inline. The listener (startVaultServer's caller in
+      // cli.js cmdListen) MUST inject signingSeed/agentDid/vcCompact into
+      // deps; we don't have any other source for the DPoP-signing material
+      // in this process. Tests can inject `runApprovalLoop: <fn>` as a dep
+      // override so a unit test doesn't hit the real IdP.
+      if (!deps.signingSeed || !deps.vcCompact) {
+        return {
+          error: 'policy_approval_unavailable',
+          reason_detail:
+            'listener missing signing material — approval loop cannot run without signingSeed + vcCompact in deps',
+        };
+      }
+      const runLoop = deps.runApprovalLoop
+        ?? (await import('./use-approval-loop.js')).runApprovalLoop;
+      let outcome;
+      try {
+        outcome = await runLoop({
+          approvalBody: { approval_request: approvalRequest },
+          originalArgs: { item_id: itemId },
+          agentDid,
+          vcCompact: deps.vcCompact,
+          signingSeed: deps.signingSeed,
+        });
+      } catch (err) {
+        return {
+          error: 'policy_approval_failed',
+          reason_detail: err?.message ?? String(err),
+        };
+      }
+      if (outcome?.expired) {
+        return {
+          error: 'policy_approval_expired',
+          reason_detail: 'operator did not decide within the pending window',
+        };
+      }
+      if (outcome?.denied) {
+        return {
+          error: outcome.body?.error ?? 'policy_approval_denied',
+          reason_detail: outcome.body?.reason_detail ?? 'operator denied the approval',
+        };
+      }
+      if (!outcome?.retryArgs) {
+        return {
+          error: 'policy_approval_unexpected',
+          reason_detail: 'approval loop returned no retryArgs',
+        };
+      }
+      // Approved — flip the flag + carry the approval_id forward, then
+      // fall through to the mint code below (req.approved !== true
+      // gate no longer fires). The mint path runs unchanged.
+      req.approved = true;
+      req.approval_id = outcome.retryArgs.approval_id;
     }
     // Mint an ephemeral handle keypair: the public key goes to the holder to
     // wrap the released credential to; the private key stays here and opens the
