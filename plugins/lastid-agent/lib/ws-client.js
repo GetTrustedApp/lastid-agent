@@ -66,6 +66,35 @@ const RECONNECT_MAX_MS = 30_000;
 const HEARTBEAT_MS = 25_000;
 
 /**
+ * Classifier for the SPECIFIC revocation signal on a WS upgrade
+ * response — match EXACTLY on HTTP 401 with `error: 'invalid_token',
+ * error_description: contains 'credential has been revoked'`. Any other
+ * 401 (clock skew, JTI replay, proxy 401) returns false so the normal
+ * reconnect path runs.
+ *
+ * Pure + exported so the unit test can pin behavior without a real WS.
+ *
+ * @param {number} statusCode
+ * @param {string} rawBody — the raw response body (may be non-JSON)
+ * @returns {boolean}
+ */
+export function isRevocationResponse(statusCode, rawBody) {
+  if (statusCode !== 401) return false;
+  if (typeof rawBody !== 'string' || rawBody.length === 0) return false;
+  let parsed;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch {
+    return false;
+  }
+  const errorCode = typeof parsed?.error === 'string' ? parsed.error : '';
+  const errorDescription =
+    typeof parsed?.error_description === 'string' ? parsed.error_description : '';
+  if (errorCode !== 'invalid_token') return false;
+  return /credential\s+has\s+been\s+revoked/i.test(errorDescription);
+}
+
+/**
  * Event types the dispatcher cares about. Unknown event types are
  * still forwarded to `onEvent` so the dispatcher's defensive
  * routing can probe for embedded mls_* fields — but the *known*
@@ -96,6 +125,20 @@ const KNOWN_EVENT_TYPES = new Set([
  *   Returning a Promise serializes the next event behind it (this
  *   client awaits the promise before consuming the next frame).
  * @property {(err: Error) => void} [onError]
+ * @property {(detail: { httpStatus: number, errorCode: string, errorDescription: string }) => Promise<void> | void} [onAuthRevoked]
+ *   Called EXACTLY ONCE when the WS upgrade returns the specific
+ *   revocation signal (HTTP 401 with `error: 'invalid_token',
+ *   error_description: 'Credential has been revoked'`). The client
+ *   stops the reconnect loop the moment that's matched — a revoked VC
+ *   cannot be un-revoked, so retrying forever just spams the IdP and
+ *   keeps a dead listener alive. Handler is expected to wipe local
+ *   state (lib/scope-cleanup.js) + exit the process; the client itself
+ *   makes NO assumption about that — it only stops reconnecting.
+ *
+ *   Transient 401s (clock skew, JTI replay, intermittent network
+ *   middleware) MUST NOT trigger this — only the precise
+ *   `Credential has been revoked` description matches. Anything else
+ *   continues the normal reconnect-with-backoff path.
  */
 
 export class LastIdWsClient {
@@ -190,6 +233,66 @@ export class LastIdWsClient {
       },
     });
     this.#socket = ws;
+
+    // Detect the SPECIFIC revocation signal on the WS upgrade response
+    // and short-circuit the reconnect loop. The `ws` package emits
+    // 'unexpected-response' BEFORE 'error' + 'close' when the upgrade
+    // returns a non-101 — perfect hook for reading the IdP's JSON body
+    // (a normal handshake never carries one). Match EXACTLY on
+    // {error:'invalid_token', error_description:'Credential has been
+    // revoked'}; any other 401 (clock skew, JTI replay, transient
+    // middleware quirk) falls through to the default reconnect path.
+    //
+    // The 'close' event ALWAYS fires after 'unexpected-response', so
+    // the reconnect-suppress is achieved by flipping #state to
+    // 'stopped' before close runs (close returns early on stopped).
+    ws.on('unexpected-response', (_req, res) => {
+      const status = typeof res?.statusCode === 'number' ? res.statusCode : 0;
+      if (status !== 401) return; // not a revocation; let close/reconnect drive
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf-8');
+        if (!isRevocationResponse(status, body)) return;
+
+        // Parse fields for the callback's detail payload — the
+        // classifier already proved the shape; this re-extract is just
+        // for diagnostic reporting back to the caller.
+        let parsed;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          parsed = {};
+        }
+        const errorCode = typeof parsed?.error === 'string' ? parsed.error : 'invalid_token';
+        const errorDescription =
+          typeof parsed?.error_description === 'string'
+            ? parsed.error_description
+            : 'Credential has been revoked';
+
+        process.stderr.write(
+          `[lastid-agent] ws auth REVOKED — stopping reconnect loop and triggering scope cleanup\n`,
+        );
+        // Flip state to 'stopped' BEFORE the close event fires; the
+        // close handler returns early on stopped, so no reconnect.
+        this.#state = 'stopped';
+        if (this.#reconnectTimer) {
+          clearTimeout(this.#reconnectTimer);
+          this.#reconnectTimer = undefined;
+        }
+        try {
+          this.#opts.onAuthRevoked?.({
+            httpStatus: status,
+            errorCode,
+            errorDescription,
+          });
+        } catch (err) {
+          process.stderr.write(
+            `[lastid-agent] ws onAuthRevoked handler threw: ${err?.message ?? err}\n`,
+          );
+        }
+      });
+    });
 
     ws.on('open', () => {
       this.#state = 'open';

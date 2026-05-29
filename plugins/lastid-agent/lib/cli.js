@@ -1583,6 +1583,34 @@ async function cmdListen(flags) {
       }
     },
     onError: (err) => process.stderr.write(`[lastid-agent] ws error: ${err.message}\n`),
+    // Auto-cleanup when the IdP rejects the upgrade with the SPECIFIC
+    // "Credential has been revoked" signal: the listener has nothing
+    // useful left to do (a revoked VC can't be un-revoked), so wipe
+    // local state and exit cleanly. Stops the dead-reconnect spam that
+    // hammered prod /v1/ws every ~10s for hours when an old sub-agent
+    // scope was orphaned by an edit-caps revoke + reissue cycle
+    // (validated live 2026-05-29 — `dev-testy-mctestface` listener
+    // attempt #871).
+    onAuthRevoked: async (detail) => {
+      process.stderr.write(
+        `[lastid-agent] auth revoked (${detail.httpStatus} ${detail.errorCode}): ${detail.errorDescription} — wiping scope ${scope}\n`,
+      );
+      try {
+        const { cleanupRevokedScope } = await import('./scope-cleanup.js');
+        const summary = await cleanupRevokedScope(scope);
+        process.stderr.write(
+          `[lastid-agent] scope-cleanup summary: ${JSON.stringify(summary)}\n`,
+        );
+      } catch (err) {
+        process.stderr.write(
+          `[lastid-agent] scope-cleanup orchestration failed: ${err?.message ?? err}\n`,
+        );
+      }
+      // Exit clean — no exception trace, just done. Anything supervising
+      // this listener (launchd, claude code's spawn, etc.) won't restart
+      // it because there's no scope dir left to bind to anyway.
+      process.exit(0);
+    },
   });
   wsRef = ws;
 
