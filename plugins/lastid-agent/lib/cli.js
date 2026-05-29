@@ -2004,21 +2004,47 @@ async function cmdListen(flags) {
 }
 
 /**
- * `lastid-agent run --item <id> -- <command> [args]` — the CLI credential proxy.
- * Mints a single-use vault handle (via the listener's policy-gated vault_use),
- * then asks the listener to spawn the command with the credential injected as
- * env vars and STREAM its (scrubbed) output back. The secret never enters this
- * process or the agent's context — only the listener + the child see it.
+ * `lastid-agent run --handle <token> -- <command> [args]` — the CLI
+ * credential proxy. Mirrors the http_fetch shape exactly: caller already
+ * minted the handle via `vault_use` (which is where the operator
+ * approval gate lives), CLI just SPENDS the handle. The handle's
+ * `handles.lookup` inside handleVaultExec is the validation — same
+ * function http_fetch uses, same error shape on a bad/expired/wrong-
+ * agent handle.
+ *
+ * No `--item` and no internal `vault_use` call: that path would
+ * bifurcate the gate (the rules check + approval loop would fire here
+ * AS WELL as in vault_use), making the CLI a second policy decision
+ * site. Single-shape contract: mint via vault_use, spend via run or
+ * http_fetch. The secret never enters this process or the agent's
+ * context — only the listener + the child see it.
  */
 async function cmdRun(flags, cmdArgv) {
   const scope = resolveScope(flags);
-  const itemId = typeof flags.item === 'string' ? flags.item : null;
-  if (!itemId) {
-    process.stderr.write('run: --item <id> required\n');
+  const handle = typeof flags.handle === 'string' && flags.handle.length > 0
+    ? flags.handle
+    : null;
+  if (!handle) {
+    process.stderr.write(
+      'run: --handle <token> required (mint via `vault_use` first).\n' +
+      '     The CLI does NOT call vault_use itself — that\'s the operator\n' +
+      '     approval / rules gate, owned by the MCP / wallet caller.\n',
+    );
+    exit(2);
+  }
+  if (Object.prototype.hasOwnProperty.call(flags, 'item')) {
+    // --item used to mint internally; that was the bifurcation site that
+    // produced duplicate approvals when a caller minted via vault_use AND
+    // the CLI minted again. Hard-fail so the new shape is obvious.
+    process.stderr.write(
+      'run: --item is no longer accepted. The CLI now takes --handle <token>\n' +
+      '     (mirroring http_fetch). Call vault_use first to get a handle,\n' +
+      '     then pass it via --handle.\n',
+    );
     exit(2);
   }
   if (!Array.isArray(cmdArgv) || cmdArgv.length === 0) {
-    process.stderr.write('run: command required after `--`  (e.g. lastid-agent run --item <id> -- aws s3 ls)\n');
+    process.stderr.write('run: command required after `--`  (e.g. lastid-agent run --handle <token> -- aws s3 ls)\n');
     exit(2);
   }
   const { loadAgentVc } = await import('./keychain.js');
@@ -2027,42 +2053,11 @@ async function cmdRun(flags, cmdArgv) {
     process.stderr.write('run: not provisioned — run `lastid-agent provision` first\n');
     exit(2);
   }
-  const { vaultRequest, vaultExecStream } = await import('./vault-ipc.js');
-
-  // Mint a single-use handle (runs the full policy / approval / rate gate in the
-  // listener). The secret is NOT released by this step.
-  //
-  // `--purpose "..."` is what the operator sees in the approval dialog under
-  // INTENT. The CLI is run by an agent (Claude / human), and the operator
-  // can't tell why this specific aws/gh/psql call wants the credential
-  // without it. Mobile + console both surface this; the CLI is the only
-  // path that lacked a flag, so approvals showed no INTENT section.
-  // Recommended: every wrapped command takes --purpose so every approval
-  // dialog reads "What it wants to do: <verb>".
-  const purpose = typeof flags.purpose === 'string' && flags.purpose.length > 0
-    ? flags.purpose
-    : undefined;
-  let used;
-  try {
-    used = await vaultRequest(scope, {
-      op: 'vault_use',
-      item_id: itemId,
-      purpose,
-      ctx: { now_ms: Date.now() },
-    });
-  } catch (e) {
-    process.stderr.write(`run: vault listener unreachable (${e?.message ?? e}). Is the agent listener running?\n`);
-    exit(1);
-  }
-  // No approval dispatch here — vault-ipc's vault_use handles the loop
-  // inside the listener (single dispatch site). When approval is required,
-  // the await above blocks while the listener runs the loop; we get back
-  // ok+handle (approved) or a clean error (denied / expired). The CLI no
-  // longer needs to know an approval happened.
-  if (!used?.ok || !used.vault_handle) {
-    process.stderr.write(`run: ${used?.error ?? 'vault_use_failed'}: ${used?.reason_detail ?? used?.detail ?? ''}\n`);
-    exit(1);
-  }
+  const { vaultExecStream } = await import('./vault-ipc.js');
+  // `used` shape is just { vault_handle } from here — exec validates the
+  // handle via handles.lookup (same path http_fetch uses) and errors
+  // with handle_invalid on missing/expired/wrong-agent.
+  const used = { vault_handle: handle };
 
   // Stream the child's output live; the secret is injected + scrubbed entirely
   // in the listener, so only already-clean bytes reach us.
