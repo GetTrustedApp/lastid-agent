@@ -50,6 +50,13 @@ test('operator message → read receipt + working:true (NOT typing)', () => {
   // the IdP's replay detector rejected it, silently dropping every read tick.
   assert.ok(typeof read.correlation_id === 'string' && read.correlation_id.length > 0);
   assert.notEqual(read.correlation_id, 'm1');
+  // Native wire parity (WebSocketManager.send_group_read_receipt): the receipt
+  // routes to all of the original sender's devices.
+  assert.deepEqual(read.target, { type: 'all_devices', recipient_did: OPERATOR });
+  // Native wire parity: typing frame fans out to the group + carries timestamp.
+  const typing = [...h.sent].reverse().find((x) => x.type === 'group_chat.typing');
+  assert.deepEqual(typing.target, { type: 'group' });
+  assert.equal(typeof typing.payload.timestamp, 'string');
 });
 
 test('sending → typing:true (working stays true); reply → typing:false (working STILL true)', () => {
@@ -155,6 +162,8 @@ test('reacts to the operator’s last message with the wire name + agent as reac
   // rejects the frame (REPLAY_ATTACK_DETECTED), silently dropping the badge.
   assert.ok(typeof frame.correlation_id === 'string' && frame.correlation_id.length > 0);
   assert.notEqual(frame.correlation_id, 'm1');
+  // Native wire parity (WebSocketManager.send_group_reaction): group-fanout target.
+  assert.deepEqual(frame.target, { type: 'group' });
 });
 
 test('action:remove emits group_chat.reaction_removed', () => {

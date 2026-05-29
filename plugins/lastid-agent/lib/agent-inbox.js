@@ -17,9 +17,9 @@
  * advances, so each operator message is pushed to the session
  * exactly once.
  *
- * Only `operator.message.text` envelopes surface here (the chat
- * vocabulary). Other operator.* types (memory write, rule publish)
- * are handled by their own paths, not the chat reply flow.
+ * Only canonical MessageEnvelope text chat (`t === "text"`) surfaces here.
+ * Other content types (reaction/edit/delete/system/media) and agent-control
+ * envelopes are handled by their own paths, not the chat reply flow.
  */
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
@@ -99,14 +99,12 @@ export async function readUnreadMessages({ scope } = {}) {
       continue;
     }
     const env = rec?.envelope;
-    const type = typeof env?.type === 'string' ? env.type : '';
-    if (!type.startsWith('operator.message')) continue;
-    const text =
-      typeof env?.payload?.text === 'string'
-        ? env.payload.text
-        : typeof env?.payload === 'string'
-          ? env.payload
-          : null;
+    // Canonical lastid-core MessageEnvelope: { v, t, p }. Only text chat
+    // surfaces to the operator inbox (reactions/edits/system are not "the
+    // operator typing a message").
+    const contentType = typeof env?.t === 'string' ? env.t : '';
+    if (contentType !== 'text') continue;
+    const text = typeof env?.p === 'string' ? env.p : null;
     if (!text) continue;
     const enforced = enforceInbound(store, text);
     const groupId = rec.group_id_b64 ?? rec.idp_group_id ?? '?';

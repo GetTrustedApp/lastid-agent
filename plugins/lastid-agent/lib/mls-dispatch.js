@@ -174,9 +174,9 @@ export class MlsDispatcher {
     this.#log = log ?? ((line) => process.stderr.write(`${line}\n`));
     this.#requestSend = requestSend;
     // Optional: called with the IdP group id when an inbound OPERATOR CHAT
-    // message (operator.message.text) is decrypted, so the listener can drive
-    // the received + typing presence. Only chat messages fire it — other
-    // operator.* envelopes (memory write, rule publish) are not "a chat turn".
+    // message (MessageEnvelope t === "text") is decrypted, so the listener can
+    // drive the received + typing presence. Only text chat fires it — reaction/
+    // edit/system content types are not "a chat turn".
     this.#onOperatorMessage = typeof onOperatorMessage === 'function' ? onOperatorMessage : null;
   }
 
@@ -497,20 +497,21 @@ export class MlsDispatcher {
       return;
     }
 
-    const type = typeof envelope?.type === 'string' ? envelope.type : '(missing)';
+    // Canonical lastid-core MessageEnvelope: content_type is `t`.
+    const contentType = typeof envelope?.t === 'string' ? envelope.t : '(missing)';
     const groupId = event?.payload?.group_id_b64 ?? event?.payload?.group_id ?? '?';
     await this.#appendInbox({
       received_at: new Date().toISOString(),
       group_id_b64: groupId,
       envelope,
     });
-    this.#log(`[lastid-agent] inbox: ${type} (group=${groupId})`);
+    this.#log(`[lastid-agent] inbox: ${contentType} (group=${groupId})`);
 
     // Presence: a decrypted OPERATOR CHAT message opens a received + typing
     // window for the operator. Use the IdP group id (the UUID the typing event
-    // fans out on), not the openmls group_id_b64. Only chat messages count —
-    // a memory/rule envelope isn't the operator chatting. Best-effort.
-    if (type === 'operator.message.text' && this.#onOperatorMessage) {
+    // fans out on), not the openmls group_id_b64. Only text chat counts —
+    // a reaction/edit/system envelope isn't the operator chatting. Best-effort.
+    if (contentType === 'text' && this.#onOperatorMessage) {
       const idpGroupId =
         typeof event?.payload?.group_id === 'string' ? event.payload.group_id : null;
       // For the read receipt: the operator message's id (which message was

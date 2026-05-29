@@ -28,13 +28,12 @@
  * GroupMessageSendPayload: { group_id, mls_message, epoch,
  * sender_did, message_type, message_id }.
  *
- * Envelope shape: the inner chat envelope mirrors the operator side
- * (`operator.message.text`) so a human reading the agent's reply in
- * the dock and the agent reading the operator's message use the same
- * vocabulary:
+ * Envelope shape: the canonical lastid-core MessageEnvelope — the SAME
+ * format native (mls_send_group_message) encrypts, so every LastID client
+ * renders it as a chat bubble and read-receipts / reactions key off the
+ * content_type. Fields are serde-renamed (v / t / p):
  *
- *   { version: 1, type: "operator.message.text",
- *     issued_at: <ISO>, payload: { text } }
+ *   { v: 1, t: "text", p: <text> }   // t ∈ text|media|system|reaction|edit|delete
  */
 
 import { Buffer } from 'node:buffer';
@@ -244,11 +243,14 @@ async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, sig
   }
   const { groupIdB64, idpGroupId } = resolved;
 
+  // Canonical chat wire format — lastid-core::types::mls::MessageEnvelope
+  // ({ v, t, p }), the SAME shape native (mls_send_group_message) encrypts. This
+  // is what every LastID client renders as a chat bubble and what read-receipts
+  // / reactions key off (content_type `t`). No custom envelope.
   const envelope = {
-    version: 1,
-    type: 'operator.message.text',
-    issued_at: new Date().toISOString(),
-    payload: { text: req.text },
+    v: 1,
+    t: 'text',
+    p: req.text,
   };
   const envelopeB64 = textToB64(JSON.stringify(envelope));
   const mlsMessage = await mls.encryptApplicationMessage(groupIdB64, envelopeB64);

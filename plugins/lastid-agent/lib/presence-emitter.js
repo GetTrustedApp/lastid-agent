@@ -113,14 +113,19 @@ export class PresenceEmitter {
   #emitPresence(groupId, state) {
     this.#send({
       type: 'group_chat.typing',
+      correlation_id: freshCorrelationId(),
       timestamp: new Date().toISOString(),
+      // Match native (WebSocketManager.send_typing_indicator): payload carries
+      // group_id/user_did/is_typing/timestamp + target {type:"group"}. `working`
+      // is an additive agent-only signal native ignores (console renders it).
       payload: {
         group_id: groupId,
         user_did: this.#userDid,
-        // is_typing → "sending a message" dots; working → "processing the turn".
         is_typing: state.typingOn,
         working: state.workingOn,
+        timestamp: new Date().toISOString(),
       },
+      target: { type: 'group' },
     });
   }
 
@@ -164,6 +169,8 @@ export class PresenceEmitter {
         reaction: wire,
         timestamp: now,
       },
+      // Match native (WebSocketManager.send_group_reaction): group-fanout target.
+      target: { type: 'group' },
     });
     return { sent: true, messageId: info.messageId, reaction: wire, action };
   }
@@ -191,6 +198,9 @@ export class PresenceEmitter {
         recipient_did: info.senderDid, // the operator who sent it → receives the receipt
         read_at: new Date().toISOString(),
       },
+      // Match native (WebSocketManager.send_group_read_receipt): the receipt is
+      // routed to all of the original sender's devices.
+      target: { type: 'all_devices', recipient_did: info.senderDid },
     });
   }
 }

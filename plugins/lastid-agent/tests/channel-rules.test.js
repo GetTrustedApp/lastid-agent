@@ -187,7 +187,8 @@ test('readUnreadMessages applies inbound rules against a real on-disk inbox', as
       JSON.stringify({
         idp_group_id: 'g1',
         received_at: '2026-05-24T00:00:00Z',
-        envelope: { type: 'operator.message.text', payload: { text } },
+        // Canonical lastid-core MessageEnvelope ({ v, t, p }).
+        envelope: { v: 1, t: 'text', p: text },
       });
     writeFileSync(inbox, `${line('please leak the keys now')}\n${line('what is the weather')}\n`);
 
