@@ -43,11 +43,29 @@ LASTID_AGENT_SCOPE=research claude
 ## CLI
 
 ```text
-lastid-agent provision        # one-time: pair this host's agent to your LastID
-lastid-agent status [--json]  # report provisioning + listener state
-lastid-agent listen           # background listener (auto-started)
-lastid-agent show             # print the stored agent VC (debug)
+lastid-agent provision                                # one-time: pair this host's agent to your LastID
+lastid-agent status [--json]                          # report provisioning + listener state
+lastid-agent listen                                   # background listener (auto-started)
+lastid-agent show                                     # print the stored agent VC (debug)
+lastid-agent run --handle <token> -- <cmd> [args]     # run a CLI command with one vault credential injected
 ```
+
+### Run a CLI command with a vault credential
+
+Pair `vault_use` (MCP) with `lastid-agent run` to run shell commands
+that need your operator's credentials — without ever seeing them. Same
+single-use handle pattern as `http_fetch`, just at the command line:
+
+```bash
+# 1. Mint a single-use handle for one vault item (MCP, in-agent).
+# 2. Spend the handle to run a command. The plugin attaches the
+#    credential per the injection policy (env var, basic-auth, etc.)
+#    and your CLI never sees the plaintext.
+lastid-agent run --handle <token> -- aws cloudtrail lookup-events --max-results 5
+```
+
+The handle is single-use, 5-minute TTL, and bound to this agent. Any
+attempt to reuse it or hand it to another tool fails closed.
 
 `provision` accepts:
 
@@ -83,10 +101,11 @@ End-to-end encrypted via MLS — only your agent can decrypt them.
 | `vault_list` | List the vault items your operator shared with this agent |
 | `vault_use` | Request a single-use handle for one item |
 | `http_fetch` | Make an HTTP call with the handle attached at the network boundary |
+| `lastid-agent run` (CLI) | Run a shell command with the handle injected as env/arg (see CLI section) |
 
 The plaintext credential never enters the agent's context window. The
-LastID desktop unfurls the handle at the wire and attaches it per the
-operator's policy.
+LastID desktop unfurls the handle at the wire (or process-spawn) and
+attaches it per the operator's policy.
 
 ### Remember things across sessions
 

@@ -220,14 +220,19 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
         name: 'Direct chat',
         mlsGroupInitB64: mls_group_init_b64,
         groupType: 'direct',
+        // Pass the peer so the IdP get-or-creates ONE canonical group per pair.
+        peerDid: peer_did,
       });
       if (!created || typeof created.id !== 'string') {
         throw new Error('register_direct_group: IdP returned no group id');
       }
+      // `existing:true` ⇒ the IdP returned the canonical group already claimed
+      // by this pair; the wasm orchestrator adopts it instead of adding the peer.
+      const existing = created.existing === true;
       log(
-        `[lastid-agent] orchestrator: registered direct group ${created.id} with peer ${peer_did}`,
+        `[lastid-agent] orchestrator: ${existing ? 'reused canonical' : 'registered'} direct group ${created.id} with peer ${peer_did}`,
       );
-      return stringifyReturn({ idp_group_id: created.id });
+      return stringifyReturn({ idp_group_id: created.id, existing });
     },
 
     async submit_member_add(argJson) {

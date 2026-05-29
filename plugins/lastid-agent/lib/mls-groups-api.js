@@ -211,13 +211,14 @@ export async function fetchGroupMemberDevices({
  * here — that's `addGroupMember`. Returns the IdP group descriptor; `id`
  * is the UUID later member/commit/message frames key on.
  *
- * @returns {Promise<{ id: string, mls_group_id?: string, name?: string }>}
+ * @returns {Promise<{ id: string, mls_group_id?: string, name?: string, existing?: boolean }>}
  */
 export async function createGroupOnIdp({
   idpUrl,
   name,
   mlsGroupInitB64,
   groupType = 'direct',
+  peerDid,
   agentDid,
   vcCompact,
   signingKey,
@@ -226,6 +227,11 @@ export async function createGroupOnIdp({
   if (!mlsGroupInitB64) throw new Error('createGroupOnIdp: mlsGroupInitB64 required');
   const body = { name: name ?? 'Direct chat', mls_group_init: mlsGroupInitB64 };
   if (groupType) body.group_type = groupType;
+  // Direct get-or-create: send the peer so the IdP keys ONE canonical group per
+  // {creator, peer} identity pair (the server-side convergence anchor). The
+  // response carries `existing:true` when the IdP returned an already-claimed
+  // group for the pair instead of creating a new one.
+  if (peerDid) body.peer_did = peerDid;
   return authedIdpFetch({
     idpUrl,
     method: 'POST',
