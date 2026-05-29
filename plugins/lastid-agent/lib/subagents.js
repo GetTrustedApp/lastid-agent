@@ -172,7 +172,7 @@ function parseScalar(raw) {
  * starting with `-` at the boundary, in case a future refactor reintroduces
  * a positional path before this comment gets read.
  */
-export function buildSpawnArgs({ subagent, systemPromptPath, parentEnv, mcpConfigPath }) {
+export function buildSpawnArgs({ subagent, systemPromptPath, parentEnv, mcpConfigPath, invocationContext }) {
   const args = [
     '--print',
     '--verbose',
@@ -192,18 +192,41 @@ export function buildSpawnArgs({ subagent, systemPromptPath, parentEnv, mcpConfi
   if (typeof mcpConfigPath === 'string' && mcpConfigPath.length > 0) {
     args.push('--mcp-config', mcpConfigPath, '--strict-mcp-config');
   }
-  const allowed = subagent.claude_tools?.allowed;
+  // ALWAYS whitelist the lastid-agent MCP server up front. Claude Code's
+  // auto-mode classifier otherwise gates calls like vault_list / vault_use
+  // / http_fetch as "credential exploration" and denies them BEFORE the
+  // plugin's own pre-tool-use auto-allow hook runs (the hook's allow
+  // semantics don't propagate into a sub-spawned session reliably — log-
+  // diver hit this 2026-05-28 trying vault_list with an operator-granted
+  // vault:use cap). Listing the MCP server prefix here uses Claude's
+  // first-class allow path; the agent's capabilities still gate access at
+  // the LastID layer (vault:use is required to mint a handle, etc.).
+  // Bash + filesystem tools stay under the classifier on purpose — the
+  // sub-agent should still be sandboxed for general code execution.
+  const allowed = [
+    'mcp__lastid-agent',
+    ...(Array.isArray(subagent.claude_tools?.allowed) ? subagent.claude_tools.allowed : []),
+  ];
   const disallowed = subagent.claude_tools?.disallowed;
-  if (Array.isArray(allowed) && allowed.length > 0) {
-    args.push('--allowed-tools', allowed.join(','));
-  }
+  args.push('--allowed-tools', allowed.join(','));
   if (Array.isArray(disallowed) && disallowed.length > 0) {
     args.push('--disallowed-tools', disallowed.join(','));
+  }
+  // Invocation context: when this spawn is BACKGROUNDED (the parent passed
+  // invocationContext), inject the invocation_id + parent_scope so the child's
+  // lastid_progress tool can write progress entries to the parent's per-
+  // invocation state file. Foreground invokes don't need this — the parent's
+  // own MCP call is awaiting the result anyway. Without this, lastid_progress
+  // would have no anchor to write against and would no-op silently.
+  const envExtra = { LASTID_AGENT_SCOPE: subagent.scope };
+  if (invocationContext) {
+    envExtra.LASTID_SUBAGENT_INVOCATION_ID = invocationContext.invocationId;
+    envExtra.LASTID_SUBAGENT_PARENT_SCOPE = invocationContext.parentScope;
   }
   return {
     cmd: 'claude',
     args,
-    env: { ...(parentEnv ?? {}), LASTID_AGENT_SCOPE: subagent.scope },
+    env: { ...(parentEnv ?? {}), ...envExtra },
   };
 }
 
@@ -575,6 +598,53 @@ async function writeInvocationState(parentScope, invocationId, state) {
 }
 
 /**
+ * Append a progress entry to a running backgrounded invocation's state
+ * file. Called by the child sub-agent's `lastid_progress` MCP tool to
+ * stream stage updates back to the parent without waiting on the
+ * completion push — operator-facing equivalent of "still alive, here's
+ * what I'm doing." Best-effort + IO-failure-tolerant: a write failure
+ * just loses that one update; the next one re-reads fresh state. We
+ * read-modify-write atomically (tmp + rename) so a parent poll mid-
+ * append never observes a torn file.
+ *
+ * Bounded at MAX_PROGRESS_ENTRIES so a runaway child can't grow the
+ * state file unbounded; older entries silently drop off the front when
+ * the cap is hit — the operator sees the most recent N stages, which
+ * is what matters for "is it stuck?".
+ */
+const MAX_PROGRESS_ENTRIES = 50;
+
+export async function appendInvocationProgress({ parentScope, invocationId, stage, detail }) {
+  if (!parentScope || !invocationId) {
+    throw new Error('appendInvocationProgress: parentScope + invocationId required');
+  }
+  if (typeof stage !== 'string' || stage.length === 0) {
+    throw new Error('appendInvocationProgress: stage required (non-empty string)');
+  }
+  const file = invocationFilePath(parentScope, invocationId);
+  let state;
+  try {
+    state = JSON.parse(await readFile(file, 'utf-8'));
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return; // unknown invocation — silent no-op
+    throw err;
+  }
+  // Don't append once the invocation is terminal — a late tool call from
+  // a still-finishing child shouldn't muddy the completed snapshot.
+  if (state.status !== 'running') return;
+  const entry = {
+    stage,
+    at: new Date().toISOString(),
+    ...(typeof detail === 'string' && detail.length > 0 ? { detail } : {}),
+  };
+  const existing = Array.isArray(state.progress) ? state.progress : [];
+  const next = existing.length >= MAX_PROGRESS_ENTRIES
+    ? [...existing.slice(existing.length - MAX_PROGRESS_ENTRIES + 1), entry]
+    : [...existing, entry];
+  await writeInvocationState(parentScope, invocationId, { ...state, progress: next });
+}
+
+/**
  * Read a single backgrounded invocation's state file. Returns the parsed
  * JSON or null if the file is missing (id not known to this scope, or it
  * was pruned). Callers — the MCP `lastid_subagent_result` tool — use this
@@ -680,7 +750,16 @@ export async function invokeSubagent({
     return { ok: false, error: `agent_md_unreadable: ${err.message ?? err}`, text: '' };
   }
   const sysPromptPath = join(tmpdir(), `lastid-subagent-${randomUUID()}.md`);
-  await writeFile(sysPromptPath, parsed.body, 'utf-8');
+  // When this is a BACKGROUNDED spawn, append a system-prompt directive
+  // pointing the helper at lastid_progress so it streams stage updates
+  // back instead of going silent for the full run. Operators shouldn't
+  // have to repeat this in every helper.md — the tool exists for the
+  // backgrounded case, the directive belongs with the spawn. Foreground
+  // spawns get the bare agent.md body (no behavior change there).
+  const promptBody = background
+    ? `${parsed.body}\n\n---\n\nBACKGROUND-MODE DIRECTIVE: You are running as a backgrounded sub-agent. Your parent gets a single completion notification when you finish, otherwise silence. Call \`lastid_progress({stage: "..."})\` BEFORE each step that might take more than ~2 seconds — a tool call you're about to make, a chunk of analysis, a network round-trip. Each call becomes a real-time push to the parent so they know what you're doing. Keep stages to one short verb-led phrase ("reading wallet.ts", "running test suite", "summarizing diff"). This is liveness, not narration — one stage per real step, not per thought.`
+    : parsed.body;
+  await writeFile(sysPromptPath, promptBody, 'utf-8');
 
   // One-off .mcp.json registering ONLY the lastid-agent server — so
   // the spawned child sees the same MCP tool surface the parent has
@@ -698,15 +777,20 @@ export async function invokeSubagent({
     scope: entry.scope,
     claude_tools: entry.claude_tools,
   };
+  // Allocate invocationId BEFORE buildSpawnArgs so the background path can
+  // inject it into the child's env (LASTID_SUBAGENT_INVOCATION_ID) — that's
+  // how the child's lastid_progress tool knows which state file to append
+  // its progress entries to. Foreground invokes don't need the context;
+  // the parent's awaited MCP call is the channel back.
+  const invocationId = randomUUID();
+  const startedAt = Date.now();
   const { cmd, args, env } = buildSpawnArgs({
     subagent,
     systemPromptPath: sysPromptPath,
     mcpConfigPath,
     parentEnv,
+    invocationContext: background ? { invocationId, parentScope } : undefined,
   });
-
-  const invocationId = randomUUID();
-  const startedAt = Date.now();
   if (typeof log === 'function') {
     log(`[lastid-agent] subagent invoke ${slug} → scope=${subagent.scope} input_sha256=${sha256Hex(input).slice(0, 12)}…${background ? ' (background)' : ''}`);
   }

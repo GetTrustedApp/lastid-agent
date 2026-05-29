@@ -142,7 +142,7 @@ const PLUGIN_TOOLS = [
   {
     name: 'lastid_invoke_subagent',
     description:
-      "Invoke one of your subagents (find its slug via `lastid_list_subagents`). Spawns a fresh Claude session bound to the subagent's scope + system prompt, passes `input` as the user prompt, and returns the subagent's final assistant text. Use for delegated work where the subagent has tools/grants/capabilities scoped narrower (or sometimes broader) than yours — e.g. operator authored a Deploy Bot with `gh` access you don't have. The subagent's calls are logged under ITS DID in the audit chain, cross-referenced to your invocation. Default timeout 5min; opts.timeout_ms overrides. Pass `background: true` to return immediately with an invocation_id while the helper runs detached — useful for long jobs (test suites, builds) so the parent conversation isn't blocked. Poll the result with `lastid_subagent_result({invocation_id})` or scan running ones with `lastid_subagent_list_running()`.",
+      "Invoke one of your subagents (find its slug via `lastid_list_subagents`). Spawns a fresh Claude session bound to the subagent's scope + system prompt, passes `input` as the user prompt, and returns the subagent's final assistant text. Use for delegated work where the subagent has tools/grants/capabilities scoped narrower (or sometimes broader) than yours — e.g. operator authored a Deploy Bot with `gh` access you don't have. The subagent's calls are logged under ITS DID in the audit chain, cross-referenced to your invocation. Default timeout 5min; opts.timeout_ms overrides. Pass `background: true` to return immediately with an invocation_id while the helper runs detached — useful for long jobs (test suites, builds) so the parent conversation isn't blocked. Backgrounded helpers can stream stage updates back with `lastid_progress({stage})` — you'll see them as push notifications in real time, so you know what's happening without polling. Read the final result with `lastid_subagent_result({invocation_id})` (you'll get a completion push when it lands) or scan running ones with `lastid_subagent_list_running()`.",
     requiredCapability: null,
     inputSchema: {
       type: 'object',
@@ -180,6 +180,21 @@ const PLUGIN_TOOLS = [
       properties: {
         include_all: { type: 'boolean', description: 'Also return completed/errored invocations within the retention window. Default false.' },
       },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'lastid_progress',
+    description:
+      "If you are running as a BACKGROUNDED sub-agent (the parent invoked you with `background:true`), stream a one-line stage update back to the parent so it knows what you're doing without waiting on completion. Use this BEFORE each long step (a slow tool call, a multi-second computation, a network roundtrip) so the parent sees liveness — they get a real-time push on every entry, exactly like the completion push. No-op when not running in a backgrounded invocation (foreground spawns + the parent's own session both ignore the call), so it's safe to sprinkle freely. Keep stage to a single short verb-led phrase like 'fetching CloudTrail events' or 'parsing manifest'.",
+    requiredCapability: null,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        stage: { type: 'string', description: 'One short verb-led phrase describing the stage you are about to enter.' },
+        detail: { type: 'string', description: 'Optional second-line detail (e.g. an item count, a URL host, a duration estimate).' },
+      },
+      required: ['stage'],
       additionalProperties: false,
     },
   },
@@ -539,6 +554,40 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
     return {
       content: [{ type: 'text', text: JSON.stringify({ invocations: items }, null, 2) }],
     };
+  }
+
+  if (name === 'lastid_progress') {
+    const stage = typeof _args?.stage === 'string' ? _args.stage.trim() : '';
+    const detail = typeof _args?.detail === 'string' ? _args.detail.trim() : '';
+    if (!stage) throw new Error('lastid_progress: stage required (non-empty string)');
+    // We're inside a backgrounded sub-agent ONLY when both env vars are set
+    // (injected by buildSpawnArgs's invocationContext path). Foreground spawns
+    // and the parent's own session don't see them — silent no-op there, so
+    // sprinkling lastid_progress in helper agent.md prompts is always safe.
+    const invocationId = process.env.LASTID_SUBAGENT_INVOCATION_ID;
+    const parentScope = process.env.LASTID_SUBAGENT_PARENT_SCOPE;
+    if (!invocationId || !parentScope) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ ok: true, recorded: false, reason: 'not running in a backgrounded invocation' }, null, 2) }],
+      };
+    }
+    const { appendInvocationProgress } = await import('./subagents.js');
+    try {
+      await appendInvocationProgress({
+        parentScope,
+        invocationId,
+        stage,
+        ...(detail ? { detail } : {}),
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ ok: true, recorded: true, stage }, null, 2) }],
+      };
+    } catch (err) {
+      // Best-effort — never break the child on a progress-write failure.
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }, null, 2) }],
+      };
+    }
   }
 
   if (name === 'lastid_whoami') {
@@ -929,6 +978,11 @@ function startInboxChannel({ server, scope }) {
 function startSubagentCompletionChannel({ server, scope }) {
   const POLL_MS = 2_000;
   const notified = new Set();
+  // Per-invocation count of progress entries we've already pushed, so each
+  // poll only fires for NEW entries (the child's lastid_progress tool appends
+  // to state.progress, we push the tail beyond what we've seen). Cleared
+  // when the invocation finishes (its terminal push is the cap).
+  const progressSeen = new Map();
   let busy = false;
   let seeded = false;
   const timer = setInterval(() => {
@@ -941,7 +995,7 @@ function startSubagentCompletionChannel({ server, scope }) {
           parentScope: scope,
           includeAll: true,
         });
-        // First tick: seed the seen-set with whatever's already terminal —
+        // First tick: seed the seen-sets with whatever's already on disk —
         // those landed before this server booted (or in a prior session),
         // so a notification now would just be noise.
         if (!seeded) {
@@ -949,15 +1003,49 @@ function startSubagentCompletionChannel({ server, scope }) {
             if (inv.status === 'completed' || inv.status === 'errored') {
               notified.add(inv.invocation_id);
             }
+            const len = Array.isArray(inv.progress) ? inv.progress.length : 0;
+            if (len > 0) progressSeen.set(inv.invocation_id, len);
           }
           seeded = true;
           return;
         }
         for (const inv of all) {
           if (!inv?.invocation_id) continue;
+          // Progress entries — push any new ones for RUNNING invocations.
+          // Each entry becomes its own notifications/claude/channel push,
+          // tagged with status='progress' so the parent can render them
+          // distinctly from the terminal completion push.
+          if (inv.status === 'running') {
+            const progress = Array.isArray(inv.progress) ? inv.progress : [];
+            const seen = progressSeen.get(inv.invocation_id) ?? 0;
+            if (progress.length > seen) {
+              const fresh = progress.slice(seen);
+              progressSeen.set(inv.invocation_id, progress.length);
+              for (const p of fresh) {
+                const detailLine =
+                  typeof p?.detail === 'string' && p.detail.length > 0
+                    ? ` — ${p.detail}`
+                    : '';
+                await server.notification({
+                  method: 'notifications/claude/channel',
+                  params: {
+                    content:
+                      `Sub-agent **${inv.slug ?? 'helper'}** progress: ${p?.stage ?? '(unknown stage)'}${detailLine}`,
+                    meta: {
+                      invocation_id: inv.invocation_id,
+                      slug: inv.slug ?? '',
+                      status: 'progress',
+                      stage: p?.stage ?? '',
+                    },
+                  },
+                });
+              }
+            }
+          }
           if (inv.status !== 'completed' && inv.status !== 'errored') continue;
           if (notified.has(inv.invocation_id)) continue;
           notified.add(inv.invocation_id);
+          progressSeen.delete(inv.invocation_id);
           const outcome = inv.status === 'completed' && inv.ok !== false
             ? 'completed'
             : 'errored';

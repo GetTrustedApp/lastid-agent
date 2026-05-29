@@ -31,6 +31,7 @@ import {
   mcpConfigForSubagent,
   readSubagentInvocation,
   listRunningSubagentInvocations,
+  appendInvocationProgress,
 } from '../lib/subagents.js';
 
 // ── Pure layer ────────────────────────────────────────────────────────
@@ -101,7 +102,9 @@ test('buildSpawnArgs: produces the right argv + scope env (input via stdin, NOT 
     '--output-format',
     'stream-json',
     '--allowed-tools',
-    'Read,Bash(echo:*)',
+    // mcp__lastid-agent is ALWAYS prepended so Claude's auto-mode classifier
+    // never gates our own MCP tools (the agent must always be able to reply).
+    'mcp__lastid-agent,Read,Bash(echo:*)',
     '--disallowed-tools',
     'WebFetch',
   ]);
@@ -166,14 +169,60 @@ test('mcpConfigForSubagent: returns the canonical lastid-agent server entry', ()
   assert.equal(srv.args[1], 'serve');
 });
 
-test('buildSpawnArgs: omits tool flags when arrays are empty/missing', () => {
+test('buildSpawnArgs: --allowed-tools always present (mcp__lastid-agent injected); --disallowed-tools omitted when empty/missing', () => {
   const out = buildSpawnArgs({
     subagent: { slug: 'x', scope: 'main-x', claude_tools: { allowed: [], disallowed: [] } },
     systemPromptPath: '/tmp/sys.md',
     parentEnv: {},
   });
-  assert.equal(out.args.includes('--allowed-tools'), false);
+  // New contract: --allowed-tools is ALWAYS present because we always inject
+  // mcp__lastid-agent — with no user tools, its value is exactly that.
+  const i = out.args.indexOf('--allowed-tools');
+  assert.notEqual(i, -1, '--allowed-tools always present');
+  assert.equal(out.args[i + 1], 'mcp__lastid-agent');
+  // --disallowed-tools still omitted when the disallowed array is empty.
   assert.equal(out.args.includes('--disallowed-tools'), false);
+});
+
+test('buildSpawnArgs: --allowed-tools always whitelists mcp__lastid-agent (auto-classifier bypass for our own MCP tools)', () => {
+  // Pin the contract explicitly so future drift trips this test rather than
+  // a live sub-agent: mcp__lastid-agent is the FIRST entry in --allowed-tools
+  // regardless of what (if any) user tools are configured.
+
+  // Case 1: no claude_tools at all.
+  const bare = buildSpawnArgs({
+    subagent: { slug: 'x', scope: 'main-x', claude_tools: {} },
+    systemPromptPath: '/tmp/sys.md',
+    parentEnv: {},
+  });
+  const bi = bare.args.indexOf('--allowed-tools');
+  assert.notEqual(bi, -1, '--allowed-tools present with no user tools');
+  assert.equal(bare.args[bi + 1], 'mcp__lastid-agent');
+
+  // Case 2: claude_tools.allowed missing entirely.
+  const missing = buildSpawnArgs({
+    subagent: { slug: 'x', scope: 'main-x' },
+    systemPromptPath: '/tmp/sys.md',
+    parentEnv: {},
+  });
+  const mi = missing.args.indexOf('--allowed-tools');
+  assert.notEqual(mi, -1, '--allowed-tools present when claude_tools absent');
+  assert.equal(missing.args[mi + 1], 'mcp__lastid-agent');
+
+  // Case 3: with user tools, mcp__lastid-agent is prepended (first entry).
+  const withTools = buildSpawnArgs({
+    subagent: { slug: 'x', scope: 'main-x', claude_tools: { allowed: ['Read', 'Bash(echo:*)'] } },
+    systemPromptPath: '/tmp/sys.md',
+    parentEnv: {},
+  });
+  const wi = withTools.args.indexOf('--allowed-tools');
+  assert.notEqual(wi, -1, '--allowed-tools present with user tools');
+  assert.equal(withTools.args[wi + 1], 'mcp__lastid-agent,Read,Bash(echo:*)');
+  assert.equal(
+    withTools.args[wi + 1].split(',')[0],
+    'mcp__lastid-agent',
+    'mcp__lastid-agent is always the first whitelisted tool',
+  );
 });
 
 test('parseStreamJsonResult: extracts final result event', () => {
@@ -608,5 +657,110 @@ test('listRunningSubagentInvocations: NEGATIVE — missing parentScope throws', 
   await assert.rejects(
     listRunningSubagentInvocations({}),
     /parentScope required/,
+  );
+});
+
+// ── appendInvocationProgress — backgrounded sub-agent progress channel ──
+//
+// The child sub-agent's `lastid_progress` MCP tool streams stage updates
+// into the running invocation's state file so the parent sees "still
+// alive, here's what I'm doing" between the spawn and the completion push.
+// We seed state files with the same seedInvocation() helper the listing
+// tests use — no real spawn — and assert the read-modify-write semantics,
+// the MAX_PROGRESS_ENTRIES cap, and the silent no-op guards.
+
+test('appendInvocationProgress: POSITIVE — one entry lands, status stays running', async () => {
+  await seedInvocation('main-prog', 'p-1', {
+    status: 'running', invocation_id: 'p-1', slug: 'a',
+    started_at: new Date().toISOString(),
+  });
+  await appendInvocationProgress({
+    parentScope: 'main-prog', invocationId: 'p-1', stage: 'fetching',
+  });
+  const state = await readSubagentInvocation({ parentScope: 'main-prog', invocationId: 'p-1' });
+  assert.equal(state.status, 'running');
+  assert.ok(Array.isArray(state.progress));
+  assert.equal(state.progress.length, 1);
+  assert.equal(state.progress[0].stage, 'fetching');
+  assert.match(state.progress[0].at, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(state.progress[0].detail, undefined);
+});
+
+test('appendInvocationProgress: POSITIVE — two entries land in order with detail preserved', async () => {
+  await seedInvocation('main-prog', 'p-2', {
+    status: 'running', invocation_id: 'p-2', slug: 'a',
+    started_at: new Date().toISOString(),
+  });
+  await appendInvocationProgress({
+    parentScope: 'main-prog', invocationId: 'p-2', stage: 'step-1', detail: 'reading config',
+  });
+  await appendInvocationProgress({
+    parentScope: 'main-prog', invocationId: 'p-2', stage: 'step-2', detail: 'writing output',
+  });
+  const state = await readSubagentInvocation({ parentScope: 'main-prog', invocationId: 'p-2' });
+  assert.equal(state.progress.length, 2);
+  assert.deepEqual(state.progress.map((p) => p.stage), ['step-1', 'step-2']);
+  assert.equal(state.progress[0].detail, 'reading config');
+  assert.equal(state.progress[1].detail, 'writing output');
+});
+
+test('appendInvocationProgress: EDGE — capped at MAX_PROGRESS_ENTRIES (60 → last 50, FIFO)', async () => {
+  await seedInvocation('main-prog', 'p-cap', {
+    status: 'running', invocation_id: 'p-cap', slug: 'a',
+    started_at: new Date().toISOString(),
+  });
+  for (let i = 1; i <= 60; i++) {
+    await appendInvocationProgress({
+      parentScope: 'main-prog', invocationId: 'p-cap', stage: `stage-${i}`,
+    });
+  }
+  const state = await readSubagentInvocation({ parentScope: 'main-prog', invocationId: 'p-cap' });
+  // Bounded to 50; the oldest 10 (stage-1 … stage-10) drop off the front.
+  assert.equal(state.progress.length, 50);
+  assert.equal(state.progress[0].stage, 'stage-11');
+  assert.equal(state.progress[49].stage, 'stage-60');
+});
+
+test('appendInvocationProgress: NEGATIVE — unknown invocation file is a silent no-op', async () => {
+  let result;
+  await assert.doesNotReject(async () => {
+    result = await appendInvocationProgress({
+      parentScope: 'main-prog', invocationId: 'never-spawned', stage: 'x',
+    });
+  });
+  assert.equal(result, undefined);
+  // Nothing was created on disk.
+  const state = await readSubagentInvocation({ parentScope: 'main-prog', invocationId: 'never-spawned' });
+  assert.equal(state, null);
+});
+
+test('appendInvocationProgress: NEGATIVE — terminal invocation drops the append', async () => {
+  const now = new Date().toISOString();
+  await seedInvocation('main-prog', 'p-done', {
+    status: 'completed', invocation_id: 'p-done', slug: 'a', started_at: now,
+    progress: [{ stage: 'earlier', at: now }],
+    audit: { completed_at: now },
+  });
+  await appendInvocationProgress({
+    parentScope: 'main-prog', invocationId: 'p-done', stage: 'too-late',
+  });
+  const state = await readSubagentInvocation({ parentScope: 'main-prog', invocationId: 'p-done' });
+  // Unchanged: the completed snapshot keeps only its original progress entry.
+  assert.equal(state.progress.length, 1);
+  assert.equal(state.progress[0].stage, 'earlier');
+});
+
+test('appendInvocationProgress: NEGATIVE — missing args / empty stage throw clearly', async () => {
+  await assert.rejects(
+    appendInvocationProgress({ invocationId: 'p-1', stage: 'x' }),
+    /parentScope \+ invocationId required/,
+  );
+  await assert.rejects(
+    appendInvocationProgress({ parentScope: 'main-prog', stage: 'x' }),
+    /parentScope \+ invocationId required/,
+  );
+  await assert.rejects(
+    appendInvocationProgress({ parentScope: 'main-prog', invocationId: 'p-1', stage: '' }),
+    /stage required/,
   );
 });
