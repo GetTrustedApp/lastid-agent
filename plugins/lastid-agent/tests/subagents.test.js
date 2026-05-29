@@ -167,6 +167,33 @@ test('mcpConfigForSubagent: returns the canonical lastid-agent server entry', ()
   // First arg = absolute path to bin/lastid-agent.js; second arg = 'serve'.
   assert.match(srv.args[0], /bin\/lastid-agent\.js$/);
   assert.equal(srv.args[1], 'serve');
+  // Foreground contract: no invocationContext → no per-server env block. The
+  // parent's own MCP call is awaiting the result, so lastid_progress has no
+  // backgrounded anchor to write against and the env vars would be inert.
+  assert.equal(srv.env, undefined, 'no env block when invocationContext absent');
+});
+
+test('mcpConfigForSubagent: bakes invocationContext env into the server entry (background sub-agent env propagation)', () => {
+  // Regression pin for the 2026-05-28 bug: the MCP server process is spawned
+  // BY Claude Code, so the env set on the `claude` child does NOT propagate to
+  // the MCP server stdio child. The ONLY reliable channel for invocation
+  // context is the mcp.json's per-server `env` block — without it,
+  // lastid_progress sees its env vars unset and silently no-ops
+  // (recorded:false) in every backgrounded child.
+  const cfg = mcpConfigForSubagent({
+    invocationContext: { invocationId: 'abc-123', parentScope: 'main' },
+  });
+  const srv = cfg.mcpServers['lastid-agent'];
+  // Server identity is unchanged — env is purely additive.
+  assert.equal(srv.command, 'node');
+  assert.equal(srv.type, 'stdio');
+  assert.match(srv.args[0], /bin\/lastid-agent\.js$/);
+  assert.equal(srv.args[1], 'serve');
+  // The contract under test: invocation context is baked into env verbatim.
+  assert.deepEqual(srv.env, {
+    LASTID_SUBAGENT_INVOCATION_ID: 'abc-123',
+    LASTID_SUBAGENT_PARENT_SCOPE: 'main',
+  });
 });
 
 test('buildSpawnArgs: --allowed-tools always present (mcp__lastid-agent injected); --disallowed-tools omitted when empty/missing', () => {

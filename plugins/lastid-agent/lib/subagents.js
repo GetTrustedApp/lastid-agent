@@ -241,13 +241,27 @@ export function buildSpawnArgs({ subagent, systemPromptPath, parentEnv, mcpConfi
  * portability; we resolve it absolutely here (PLUGIN_MCP_SERVER_PATH)
  * so the spawned child doesn't need that env var set.
  */
-export function mcpConfigForSubagent() {
+export function mcpConfigForSubagent({ invocationContext } = {}) {
+  // The MCP server process is spawned BY Claude Code (not by us), so the
+  // env we set on the `claude` child doesn't propagate into the MCP
+  // server's process. To pass invocation context (so lastid_progress
+  // knows which state file to append to), bake the values into the
+  // mcp.json's per-server `env` field. Without this, lastid_progress
+  // sees the env vars unset and silently no-ops with
+  // recorded:false — the bug log-diver hit 2026-05-28.
+  const env = invocationContext
+    ? {
+        LASTID_SUBAGENT_INVOCATION_ID: invocationContext.invocationId,
+        LASTID_SUBAGENT_PARENT_SCOPE: invocationContext.parentScope,
+      }
+    : undefined;
   return {
     mcpServers: {
       'lastid-agent': {
         command: 'node',
         args: [PLUGIN_MCP_SERVER_PATH, 'serve'],
         type: 'stdio',
+        ...(env ? { env } : {}),
       },
     },
   };
@@ -765,10 +779,20 @@ export async function invokeSubagent({
   // the spawned child sees the same MCP tool surface the parent has
   // (and nothing else, via --strict-mcp-config). Written next to the
   // system prompt; cleaned up below in the same finally-shaped path.
+  // Allocate invocationId BEFORE writing the mcp.json — the background
+  // path bakes the invocation_id + parent_scope INTO the mcp.json's per-
+  // server env block so the MCP server child (spawned by Claude Code, not
+  // by us) actually sees them. The spawn env on the `claude` process
+  // doesn't propagate to MCP server stdio children, so this is the only
+  // reliable channel for handing invocation context into lastid_progress.
+  const invocationId = randomUUID();
+  const startedAt = Date.now();
+  const invocationContext = background ? { invocationId, parentScope } : undefined;
+
   const mcpConfigPath = join(tmpdir(), `lastid-subagent-mcp-${randomUUID()}.json`);
   await writeFile(
     mcpConfigPath,
-    JSON.stringify(mcpConfigForSubagent(), null, 2),
+    JSON.stringify(mcpConfigForSubagent({ invocationContext }), null, 2),
     'utf-8',
   );
 
@@ -777,19 +801,12 @@ export async function invokeSubagent({
     scope: entry.scope,
     claude_tools: entry.claude_tools,
   };
-  // Allocate invocationId BEFORE buildSpawnArgs so the background path can
-  // inject it into the child's env (LASTID_SUBAGENT_INVOCATION_ID) — that's
-  // how the child's lastid_progress tool knows which state file to append
-  // its progress entries to. Foreground invokes don't need the context;
-  // the parent's awaited MCP call is the channel back.
-  const invocationId = randomUUID();
-  const startedAt = Date.now();
   const { cmd, args, env } = buildSpawnArgs({
     subagent,
     systemPromptPath: sysPromptPath,
     mcpConfigPath,
     parentEnv,
-    invocationContext: background ? { invocationId, parentScope } : undefined,
+    invocationContext,
   });
   if (typeof log === 'function') {
     log(`[lastid-agent] subagent invoke ${slug} → scope=${subagent.scope} input_sha256=${sha256Hex(input).slice(0, 12)}…${background ? ' (background)' : ''}`);
