@@ -1,7 +1,7 @@
 {
   "name": "lastid-agent",
   "description": "Provisions a LastID-issued agent credential on first session start. Approved by the operator in their LastID wallet; the issued SD-JWT VC + Ed25519 seed are persisted to the host keychain. Steady-state sessions skip provisioning.",
-  "version": "0.20.3",
+  "version": "0.20.4",
   "author": {
     "name": "LastID",
     "url": "https://lastid.co"

@@ -2045,12 +2045,21 @@ async function cmdRun(flags, cmdArgv) {
       'run: this credential needs operator approval — waiting for your decision (Approve/Deny in console or phone)…\n',
     );
     const { runApprovalLoop } = await import('./use-approval-loop.js');
+    // signingSeed for the IdP DPoP proof is the DERIVED Ed25519
+    // signing-key seed, not the raw slot_seed (mintAgentPopJwt signs
+    // with whatever bytes it's handed verbatim). Mirrors what
+    // mcp-server.js:tryConnectDesktop does — same derive helper, same
+    // input. Passing the raw slot_seed produces a valid-looking DPoP
+    // that the IdP's agent_pop verifier rejects because the agent's
+    // cnf.jwk pubkey is derived from signingSeed, not slot_seed.
+    const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
+    const { signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
     const outcome = await runApprovalLoop({
       approvalBody: used,
       originalArgs: { item_id: itemId },
       agentDid: loaded.agentDid,
       vcCompact: loaded.vcCompact,
-      signingSeed: loaded.slotSeed,
+      signingSeed,
     });
     if (outcome?.expired) {
       process.stderr.write('run: approval window expired — operator did not decide in time\n');
