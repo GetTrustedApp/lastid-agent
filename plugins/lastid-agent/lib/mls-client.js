@@ -130,8 +130,25 @@ export class MlsClient {
    * Accept an MLS Welcome that adds this agent to a group. Returns
    * the parsed JoinedGroupInfo { group_id_b64, member_count, epoch }.
    */
-  async processWelcome(welcomeB64) {
-    return JSON.parse(await this.#handle.processWelcome(welcomeB64));
+  async processWelcome(welcomeB64, idpGroupId) {
+    // Pass the IdP group UUID so the wasm seeds the idp→openmls id mapping at
+    // join time (the welcome alone only carries the openmls id). Without it a
+    // later reconcileMemberDevices(idpUuid) can't resolve the group and crashes
+    // base64-decoding the UUID — leaving the operator's other devices unadded.
+    return JSON.parse(await this.#handle.processWelcome(welcomeB64, idpGroupId ?? null));
+  }
+
+  /**
+   * Seed the IdP-UUID → openmls-id mapping for a group joined in a PRIOR
+   * session, so reconcile/group_handle can resolve it by IdP UUID instead of
+   * crashing base64-decoding the UUID. Backfill for groups joined before
+   * processWelcome started seeding it inline. Idempotent; no-op if the handle
+   * doesn't expose it (older vendored wasm) so a stale artifact degrades
+   * gracefully rather than throwing at startup.
+   */
+  async bindGroupIdMapping(idpGroupId, openmlsB64) {
+    if (typeof this.#handle.bindGroupIdMapping !== 'function') return;
+    await this.#handle.bindGroupIdMapping(idpGroupId, openmlsB64);
   }
 
   /**

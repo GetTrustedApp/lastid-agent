@@ -170,6 +170,20 @@ export class MlsOrchestrator {
      */
     addMembers(group_id_b64: string, key_packages_b64_json: string): Promise<any>;
     /**
+     * Seed the IdP-UUID → openmls-id mapping for a group this client ALREADY
+     * joined in a prior session (so `group_handle(idp_uuid)` resolves instead
+     * of treating the UUID as the openmls id and crashing `InvalidByte(8,45)`).
+     *
+     * `processWelcome(welcome, idp_id)` seeds this at join; THIS method is the
+     * backfill for groups joined BEFORE that fix landed — the host calls it
+     * once per persisted (idp_group_id, openmls_b64) pair at startup. Writes
+     * the same key `group_handle` reads, through the orchestrator's OWN
+     * backend (the free `bindMlsGroupIdMapping` opens IndexedDB — browser only;
+     * this works on the Node/callback backend the agent runs). Idempotent.
+     * No-op when the two ids are equal (no mapping needed).
+     */
+    bindGroupIdMapping(idp_group_id: string, openmls_b64: string): Promise<any>;
+    /**
      * Commit every pending queued proposal. Resolves to JSON `CommitResult`.
      */
     commitPendingProposals(group_id_b64: string): Promise<any>;
@@ -231,8 +245,22 @@ export class MlsOrchestrator {
     /**
      * Process an MLS Welcome and join the new group. Resolves to JSON
      * `JoinedGroupInfo`.
+     *
+     * `idp_group_id` (optional) is the IdP group UUID the welcome arrived on
+     * — the WS frame's `payload.group_id`. The openmls welcome only carries
+     * the openmls-internal id, so the join alone can't know the IdP UUID;
+     * the JS host (which sees the WS frame) passes it in. When present we seed
+     * the IdP-UUID → openmls-id mapping right after the join, the wasm twin of
+     * native `MLSGroup::update_idp_group_id` rebinding the group to its IdP id
+     * at join time. Without this, a later `reconcileMemberDevices(idp_uuid)` /
+     * `group_handle(idp_uuid)` finds no mapping, falls back to treating the
+     * UUID as the openmls id, and base64-decoding the UUID panics
+     * `InvalidByte(8, 45)` — the bug that left the operator's other devices
+     * unwelcomed because the agent's reconcile crashed before adding them.
+     * Pass `null`/omit only for callers that genuinely don't have an IdP id
+     * (the openmls id is then the only id the group is known by).
      */
-    processWelcome(welcome_b64: string): Promise<any>;
+    processWelcome(welcome_b64: string, idp_group_id?: string | null): Promise<any>;
     /**
      * Run one pass of
      * [`lastid_mls_core::reconcile::reconcile_group_device_membership_once`]

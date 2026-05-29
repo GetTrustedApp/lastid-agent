@@ -591,6 +591,30 @@ class MlsOrchestrator {
         return ret;
     }
     /**
+     * Seed the IdP-UUID → openmls-id mapping for a group this client ALREADY
+     * joined in a prior session (so `group_handle(idp_uuid)` resolves instead
+     * of treating the UUID as the openmls id and crashing `InvalidByte(8,45)`).
+     *
+     * `processWelcome(welcome, idp_id)` seeds this at join; THIS method is the
+     * backfill for groups joined BEFORE that fix landed — the host calls it
+     * once per persisted (idp_group_id, openmls_b64) pair at startup. Writes
+     * the same key `group_handle` reads, through the orchestrator's OWN
+     * backend (the free `bindMlsGroupIdMapping` opens IndexedDB — browser only;
+     * this works on the Node/callback backend the agent runs). Idempotent.
+     * No-op when the two ids are equal (no mapping needed).
+     * @param {string} idp_group_id
+     * @param {string} openmls_b64
+     * @returns {Promise<any>}
+     */
+    bindGroupIdMapping(idp_group_id, openmls_b64) {
+        const ptr0 = passStringToWasm0(idp_group_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(openmls_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_bindGroupIdMapping(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
      * Commit every pending queued proposal. Resolves to JSON `CommitResult`.
      * @param {string} group_id_b64
      * @returns {Promise<any>}
@@ -732,13 +756,30 @@ class MlsOrchestrator {
     /**
      * Process an MLS Welcome and join the new group. Resolves to JSON
      * `JoinedGroupInfo`.
+     *
+     * `idp_group_id` (optional) is the IdP group UUID the welcome arrived on
+     * — the WS frame's `payload.group_id`. The openmls welcome only carries
+     * the openmls-internal id, so the join alone can't know the IdP UUID;
+     * the JS host (which sees the WS frame) passes it in. When present we seed
+     * the IdP-UUID → openmls-id mapping right after the join, the wasm twin of
+     * native `MLSGroup::update_idp_group_id` rebinding the group to its IdP id
+     * at join time. Without this, a later `reconcileMemberDevices(idp_uuid)` /
+     * `group_handle(idp_uuid)` finds no mapping, falls back to treating the
+     * UUID as the openmls id, and base64-decoding the UUID panics
+     * `InvalidByte(8, 45)` — the bug that left the operator's other devices
+     * unwelcomed because the agent's reconcile crashed before adding them.
+     * Pass `null`/omit only for callers that genuinely don't have an IdP id
+     * (the openmls id is then the only id the group is known by).
      * @param {string} welcome_b64
+     * @param {string | null} [idp_group_id]
      * @returns {Promise<any>}
      */
-    processWelcome(welcome_b64) {
+    processWelcome(welcome_b64, idp_group_id) {
         const ptr0 = passStringToWasm0(welcome_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.mlsorchestrator_processWelcome(this.__wbg_ptr, ptr0, len0);
+        var ptr1 = isLikeNone(idp_group_id) ? 0 : passStringToWasm0(idp_group_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len1 = WASM_VECTOR_LEN;
+        const ret = wasm.mlsorchestrator_processWelcome(this.__wbg_ptr, ptr0, len0, ptr1, len1);
         return ret;
     }
     /**
@@ -1747,17 +1788,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1005, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1012, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 828, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 835, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 813, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 820, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb211d42f6d42ba37);
             return ret;
         },

@@ -81,6 +81,90 @@ export async function recordGroup({ scope, idpGroupId, groupIdB64, operatorDid, 
   await writeFile(path, `${JSON.stringify(all, null, 2)}\n`, 'utf-8');
 }
 
+/**
+ * One-time startup repair of the persisted group map.
+ *
+ * Two problems this heals, both from before processWelcome seeded the
+ * idp→openmls mapping inline:
+ *
+ *  1. CORRUPT records — `group_id_b64` holds a base64-encoded UUID (36 raw
+ *     bytes with hyphens) instead of the 32-byte openmls id. These can never
+ *     load (openmls base64-decode hits the UUID's hyphen → InvalidByte(8,45))
+ *     and there's no way to recover the real openmls id, so we DROP them. The
+ *     next send/welcome re-establishes a fresh group cleanly.
+ *  2. VALID-but-unmapped records — a real 32-byte openmls id that was never
+ *     pushed into the wasm client's idp→openmls map (the agent only ever
+ *     recorded it to groups.json). On a fresh process the map is empty, so
+ *     `group_handle(idpUuid)` would mis-treat the UUID as the openmls id and
+ *     crash. We re-seed the mapping via `mls.bindGroupIdMapping` so reconcile
+ *     resolves the group.
+ *
+ * `mls.bindGroupIdMapping` is the MlsClient wrapper over the orchestrator
+ * handle's bindGroupIdMapping (writes the same key group_handle reads, through
+ * the listener's one shared backend). Best-effort + idempotent: a per-record
+ * failure is logged and skipped, never aborts startup.
+ *
+ * @returns {Promise<{ seeded: number, dropped: number, scanned: number }>}
+ */
+export async function repairGroupIdMappings({ scope, mls, log }) {
+  const logLine = log ?? (() => {});
+  const all = await readAll(scope);
+  const entries = Object.entries(all);
+  let seeded = 0;
+  let dropped = 0;
+  let mutated = false;
+
+  for (const [idpGroupId, v] of entries) {
+    const b64 = v?.group_id_b64;
+    if (!b64) continue;
+
+    // A real openmls id decodes to exactly 32 bytes. A base64'd UUID decodes
+    // to 36 bytes (and the bytes are ASCII hyphens/hex). Anything not 32 bytes
+    // is corrupt and unrecoverable → drop it.
+    let byteLen = -1;
+    try {
+      byteLen = Buffer.from(b64, 'base64').length;
+    } catch {
+      byteLen = -1;
+    }
+    if (byteLen !== 32) {
+      delete all[idpGroupId];
+      mutated = true;
+      dropped += 1;
+      logLine(
+        `[lastid-agent] groups repair: dropped corrupt record ${idpGroupId} ` +
+          `(group_id_b64 decoded to ${byteLen} bytes, not a 32-byte openmls id)`,
+      );
+      continue;
+    }
+
+    // Valid openmls id — re-seed the idp→openmls mapping into the live MLS
+    // client so reconcile can resolve this group by its IdP UUID this session.
+    if (mls && typeof mls.bindGroupIdMapping === 'function') {
+      try {
+        await mls.bindGroupIdMapping(idpGroupId, b64);
+        seeded += 1;
+      } catch (err) {
+        logLine(
+          `[lastid-agent] groups repair: bindGroupIdMapping ${idpGroupId} failed: ${err?.message ?? err}`,
+        );
+      }
+    }
+  }
+
+  if (mutated) {
+    const path = groupsPath(scope);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, `${JSON.stringify(all, null, 2)}\n`, 'utf-8');
+  }
+  if (seeded || dropped) {
+    logLine(
+      `[lastid-agent] groups repair: scanned ${entries.length}, seeded ${seeded} mapping(s), dropped ${dropped} corrupt`,
+    );
+  }
+  return { seeded, dropped, scanned: entries.length };
+}
+
 /** Operator device ids the agent has recorded as added to a group ([] if none/unknown). */
 export async function getGroupDeviceIds({ scope, idpGroupId }) {
   const all = await readAll(scope);

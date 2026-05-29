@@ -1385,6 +1385,25 @@ async function cmdListen(flags) {
   const orchestrator = await getOrchestrator(listenerCtx);
   const mls = MlsClient.fromOrchestrator(orchestrator, loaded.agentDid);
 
+  // One-time repair of the persisted group map: re-seed the idp→openmls
+  // mapping for every valid group into the live MLS client (the agent only
+  // recorded these to groups.json, never into the wasm client — so on a fresh
+  // process reconcile(idpUuid) couldn't resolve them and crashed), and drop
+  // records whose group_id_b64 is a base64'd UUID (unrecoverable, from before
+  // the create-path fix). Best-effort; logs its own outcome.
+  try {
+    const { repairGroupIdMappings } = await import('./agent-groups.js');
+    await repairGroupIdMappings({
+      scope,
+      mls,
+      log: (l) => process.stderr.write(`${l}\n`),
+    });
+  } catch (err) {
+    process.stderr.write(
+      `[lastid-agent] groups repair failed (non-fatal): ${err?.message ?? err}\n`,
+    );
+  }
+
   if (flags['publish-keypackage'] || flags['publish-keypackage'] === undefined) {
     // Maintenance pass — fetch current inventory, top up only if
     // below the threshold. Avoids re-publishing on every session

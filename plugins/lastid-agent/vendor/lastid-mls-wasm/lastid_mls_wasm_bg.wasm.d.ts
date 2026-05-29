@@ -6,6 +6,7 @@ export const createMlsOrchestrator: (a: number, b: number, c: number, d: number,
 export const createMlsOrchestratorWithCallbacks: (a: number, b: number, c: number, d: number, e: any, f: any, g: any, h: any) => any;
 export const mlsorchestrator_addMember: (a: number, b: number, c: number, d: number, e: number) => any;
 export const mlsorchestrator_addMembers: (a: number, b: number, c: number, d: number, e: number) => any;
+export const mlsorchestrator_bindGroupIdMapping: (a: number, b: number, c: number, d: number, e: number) => any;
 export const mlsorchestrator_commitPendingProposals: (a: number, b: number, c: number) => any;
 export const mlsorchestrator_createGroup: (a: number, b: number, c: number) => any;
 export const mlsorchestrator_destroyGroup: (a: number, b: number, c: number, d: number, e: number) => any;
@@ -17,7 +18,7 @@ export const mlsorchestrator_generateKeyPackage: (a: number) => any;
 export const mlsorchestrator_groupEpoch: (a: number, b: number, c: number) => any;
 export const mlsorchestrator_maybeRotateDirectGroup: (a: number, b: number, c: number, d: number, e: number) => any;
 export const mlsorchestrator_processInbound: (a: number, b: number, c: number) => any;
-export const mlsorchestrator_processWelcome: (a: number, b: number, c: number) => any;
+export const mlsorchestrator_processWelcome: (a: number, b: number, c: number, d: number, e: number) => any;
 export const mlsorchestrator_reconcileMemberDevices: (a: number, b: number, c: number) => any;
 export const mlsorchestrator_removeMember: (a: number, b: number, c: number, d: number) => any;
 export const mlsorchestrator_rollbackPendingCommit: (a: number, b: number, c: number) => any;

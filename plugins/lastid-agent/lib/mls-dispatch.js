@@ -352,7 +352,16 @@ export class MlsDispatcher {
       return;
     }
     try {
-      const info = await this.#mls.processWelcome(welcomeB64);
+      // The IdP group UUID rides the WS frame (the welcome bytes only carry the
+      // openmls id). Pass it INTO processWelcome so the wasm seeds the
+      // idp→openmls mapping at join — otherwise reconcileMemberDevices(idpUuid)
+      // later can't resolve this group and crashes decoding the UUID as base64,
+      // which is why the operator's other devices never got added.
+      const idpGroupId =
+        typeof event?.payload?.group_id === 'string'
+          ? event.payload.group_id
+          : null;
+      const info = await this.#mls.processWelcome(welcomeB64, idpGroupId);
       await this.#mls.persist();
       this.#log(
         `[lastid-agent] joined MLS group ${info.group_id_b64} (members=${info.member_count})`,
@@ -360,13 +369,7 @@ export class MlsDispatcher {
 
       // Record the IdP-UUID ↔ openmls-id link + the operator (peer)
       // DID so the outbound send path can resolve "reply to this
-      // group" later. This is the only place we observe both ids
-      // together — the welcome event carries the IdP UUID, the join
-      // gave us the openmls id.
-      const idpGroupId =
-        typeof event?.payload?.group_id === 'string'
-          ? event.payload.group_id
-          : null;
+      // group" later.
       if (idpGroupId) {
         await recordGroup({
           scope: this.#scope,
