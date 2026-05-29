@@ -28,15 +28,7 @@
  * because MLS group state is per-client (not derivable from the keypair).
  */
 import { createRequire } from 'node:module';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
-import {
-  createCipheriv,
-  createDecipheriv,
-  randomBytes,
-  hkdfSync,
-} from 'node:crypto';
+import { diskKvCallbacks } from './mls-state-store.js';
 
 const localRequire = createRequire(import.meta.url);
 const wasm = localRequire('../vendor/lastid-mls-wasm/lastid_mls_wasm.js');
@@ -51,61 +43,8 @@ try {
   // module instance is fine.
 }
 
-const STATE_FILE_NAME = 'mls-state.b64';
-const STATE_NONCE_LEN = 12;
-const HKDF_SALT = Buffer.from('lastid/agent/mls-state/v1');
-
-/**
- * Path the plugin saves MLS state to, keyed by `scope` (matches the
- * `--scope` flag from cli.js — defaults to `main`).
- */
-function stateFilePath(scope) {
-  return join(homedir(), '.lastid-agent', scope ?? 'main', STATE_FILE_NAME);
-}
-
-/**
- * Derive the AES-256-GCM at-rest key from the agent's slot_seed.
- * The slot_seed is the 32-byte BIP85-derived secret the wallet
- * sealed at provision time; the plugin already holds it in the
- * keychain (alongside the VC) and treats it as "if you have this
- * you ARE the agent." Using it as the wrap-key for MLS state is
- * the cheapest correct posture — host-disk leak ≠ MLS state leak,
- * but a slot_seed leak already loses you the agent.
- */
-function deriveWrapKey(slotSeed) {
-  if (!(slotSeed instanceof Uint8Array) || slotSeed.length !== 32) {
-    throw new Error('mls-client: slotSeed must be a 32-byte Uint8Array');
-  }
-  return Buffer.from(
-    hkdfSync('sha256', slotSeed, HKDF_SALT, Buffer.from('aes-256-gcm wrap'), 32),
-  );
-}
-
-function sealStateBlob(slotSeed, stateB64) {
-  const key = deriveWrapKey(slotSeed);
-  const nonce = randomBytes(STATE_NONCE_LEN);
-  const cipher = createCipheriv('aes-256-gcm', key, nonce);
-  const plaintext = Buffer.from(stateB64, 'utf-8');
-  const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  // Wire shape: 1-byte version || 12 nonce || 16 tag || ciphertext
-  return Buffer.concat([Buffer.from([1]), nonce, tag, ct]).toString('base64');
-}
-
-function openStateBlob(slotSeed, blobB64) {
-  const blob = Buffer.from(blobB64, 'base64');
-  if (blob.length < 1 + STATE_NONCE_LEN + 16 || blob[0] !== 1) {
-    throw new Error('mls-client: state blob has unexpected version/length');
-  }
-  const nonce = blob.subarray(1, 1 + STATE_NONCE_LEN);
-  const tag = blob.subarray(1 + STATE_NONCE_LEN, 1 + STATE_NONCE_LEN + 16);
-  const ct = blob.subarray(1 + STATE_NONCE_LEN + 16);
-  const key = deriveWrapKey(slotSeed);
-  const decipher = createDecipheriv('aes-256-gcm', key, nonce);
-  decipher.setAuthTag(tag);
-  const pt = Buffer.concat([decipher.update(ct), decipher.final()]);
-  return pt.toString('utf-8');
-}
+// Seal/load/flush + scope-path logic now lives in mls-state-store.js so the
+// orchestrator opens the SAME sealed file as this client (B1 convergence).
 
 /**
  * High-level MLS client. One instance per agent runtime; outlives
@@ -139,28 +78,10 @@ export class MlsClient {
    */
   static async open({ agentDid, slotSeed, scope }) {
     const resolvedScope = scope ?? 'main';
-    const path = stateFilePath(resolvedScope);
-    const loadBlob = async () => {
-      try {
-        const blob = await readFile(path, 'utf-8');
-        return openStateBlob(slotSeed, blob.trim());
-      } catch (err) {
-        if (err.code === 'ENOENT') return null;
-        process.stderr.write(
-          `[lastid-agent] mls: failed to load prior state (${err.message}); starting fresh\n`,
-        );
-        return null;
-      }
-    };
-    const flushBlob = async (stateB64) => {
-      const sealed = sealStateBlob(slotSeed, stateB64);
-      await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, sealed, 'utf-8');
-    };
-    const handle = await wasm.createPersistentBotClientWithCallbacks(agentDid, {
-      loadBlob,
-      flushBlob,
-    });
+    const handle = await wasm.createPersistentBotClientWithCallbacks(
+      agentDid,
+      diskKvCallbacks({ slotSeed, scope: resolvedScope }),
+    );
     return new MlsClient({ handle, agentDid, slotSeed, scope: resolvedScope });
   }
 
