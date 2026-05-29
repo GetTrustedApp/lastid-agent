@@ -36,7 +36,63 @@ import {
   writeActiveInvocationContext,
   readActiveInvocationContext,
   clearActiveInvocationContext,
+  formatHelperRuntimeRules,
 } from '../lib/subagents.js';
+
+// ── formatHelperRuntimeRules: helper prelude ──────────────────────────
+
+test('[POSITIVE] formatHelperRuntimeRules: covers both injection paths (vault + CLI proxy)', () => {
+  const prelude = formatHelperRuntimeRules();
+  // HTTP injection path tools
+  assert.match(prelude, /vault_list/);
+  assert.match(prelude, /vault_use/);
+  assert.match(prelude, /http_fetch/);
+  // CLI proxy path
+  assert.match(prelude, /CLI proxy/);
+});
+
+test('[POSITIVE] formatHelperRuntimeRules: attributes actions to the helper (audit chain + YOUR DID)', () => {
+  const prelude = formatHelperRuntimeRules();
+  assert.match(prelude, /audit chain/);
+  assert.match(prelude, /YOUR DID/);
+});
+
+test('[POSITIVE] formatHelperRuntimeRules({background:true}): adds lastid_progress section', () => {
+  const prelude = formatHelperRuntimeRules({ background: true });
+  assert.match(prelude, /lastid_progress/);
+  assert.match(prelude, /BEFORE each step/);
+});
+
+test('[NEGATIVE] formatHelperRuntimeRules: foreground omits lastid_progress', () => {
+  const prelude = formatHelperRuntimeRules();
+  assert.doesNotMatch(prelude, /lastid_progress/);
+  // and explicitly the default-arg form too
+  assert.doesNotMatch(formatHelperRuntimeRules({}), /lastid_progress/);
+});
+
+test('[POSITIVE] formatHelperRuntimeRules: universal credential-hygiene rules present', () => {
+  const prelude = formatHelperRuntimeRules();
+  assert.match(prelude, /Never fabricate, guess, or paste/);
+  // "no env vars, no files" fallback ban
+  assert.match(prelude, /environment variables/);
+  assert.match(prelude, /read files/);
+});
+
+test('[REGRESSION] formatHelperRuntimeRules: pins the explicit `lastid-agent run` CLI-proxy contract (regression — no auto-rewrite in spawned helpers)', () => {
+  const prelude = formatHelperRuntimeRules();
+  // The explicit proxy invocation form must be documented verbatim.
+  assert.ok(prelude.includes('lastid-agent run --item'));
+  // A concrete example proving the `--` command separator is in the docs.
+  assert.ok(prelude.includes('-- aws s3 ls'));
+  // Must warn that calling the binary directly (e.g. `aws s3 ls`) is NOT
+  // auto-rewritten in the spawned-helper session and will fail.
+  assert.match(prelude, /auto-rewritten/);
+});
+
+test('[REGRESSION] formatHelperRuntimeRules: starts with --- so it appends cleanly after agent.md body', () => {
+  assert.ok(formatHelperRuntimeRules().startsWith('---'));
+  assert.ok(formatHelperRuntimeRules({ background: true }).startsWith('---'));
+});
 
 // ── Pure layer ────────────────────────────────────────────────────────
 

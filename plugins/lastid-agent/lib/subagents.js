@@ -43,6 +43,103 @@ const PLUGIN_MCP_SERVER_PATH = fileURLToPath(
   new URL('../bin/lastid-agent.js', import.meta.url),
 );
 
+/**
+ * Universal runtime-rules suffix appended to EVERY spawned helper's
+ * system prompt by invokeSubagent. Owns the rules that are the same for
+ * any helper any operator builds — credential handling, audit
+ * attribution, and (when background) the lastid_progress directive —
+ * so operators don't have to re-state them in every helper.md.
+ *
+ * Mirrors the credential + audit lines the parent's SessionStart hook
+ * (hooks/session-start.js buildOperatingContext) emits, kept slim for
+ * the helper case: no identity card (loaded separately via
+ * lastid_whoami), no memory guidance (helper-specific), no parent's
+ * sub-agent-spawning notes (irrelevant to a leaf helper).
+ *
+ * PURE. Tested directly in subagents.test.js.
+ */
+export function formatHelperRuntimeRules({ background = false } = {}) {
+  const lines = [
+    '---',
+    '',
+    '## How credentials work here (universal — applies to every operator-shared item)',
+    '',
+    'The operator may share vault items with you (API keys, OAuth tokens,',
+    'basic-auth credentials). You will NEVER see the underlying credential',
+    'value. There are two paths the operator may have configured for each',
+    'share — `vault_list` tells you which:',
+    '',
+    '**CLI proxy (preferred for tools that have a CLI)** — the share has',
+    '`binaries: [...]` set in its `vault_list` metadata. Run the binary',
+    'through the proxy via Bash explicitly:',
+    '',
+    '    lastid-agent run --item <item_id> -- aws s3 ls',
+    '    lastid-agent run --item <item_id> -- gh pr view 123',
+    '    lastid-agent run --item <item_id> -- psql -c "select 1"',
+    '',
+    'The proxy mints a single-use handle, asks the listener to spawn',
+    'your command with the credential injected as env vars in the child,',
+    'and streams the (scrubbed) stdout back. The secret never enters',
+    'your context AND never enters your tool-call inputs. You MUST',
+    'invoke `lastid-agent run` explicitly — calling `aws s3 ls` directly',
+    'won\'t be auto-rewritten in your session and will fail with',
+    'unauthorized credentials. Use this whenever the share lists',
+    '`binaries` and the target tool has a CLI.',
+    '',
+    '**HTTP injection (when there\'s no CLI, or the share lacks `binaries`)**:',
+    '1. `vault_list` — discover items the operator has shared with you.',
+    '   You see titles, services, hosts, granted actions, and injection',
+    '   metadata. You do NOT see the credential value.',
+    '2. `vault_use(item_id)` — mint a single-use, short-lived (5 min)',
+    '   opaque handle for a specific item. The response includes an',
+    '   "injection summary" telling you how the credential will be',
+    '   attached (header, bearer, query param, basic auth, oauth_bearer).',
+    '3. `http_fetch(url, vault_handle)` — make the outbound request.',
+    '   The listener unfurls the handle at the network boundary, attaches',
+    '   the credential per the injection summary, and returns the response.',
+    '   The credential value never enters your context window.',
+    '',
+    'Rules you MUST follow:',
+    '- Never fabricate, guess, or paste a credential value. You do not have',
+    '  one to paste.',
+    '- If a task requires a credential not in `vault_list`, tell the parent',
+    '  exactly which item you need (service + purpose) and stop. Do NOT',
+    '  fall back to environment variables, do NOT read files, do NOT',
+    '  improvise.',
+    '- Handles are single-use. Mint a fresh handle per request via',
+    '  `vault_use` — do not try to reuse one.',
+    '- If a credential-related error (401, 403) comes back, report it. Do',
+    '  not silently retry with a different credential.',
+    '',
+    '## What lands in the audit chain',
+    '',
+    'Every tool call you make appends a record to the operator\'s blake3-',
+    'linked, device-key-signed audit chain — attributed to YOUR DID, not',
+    'your parent\'s. The chain records the tool name, input shape, result,',
+    'and key metadata (item_id, url host, response status, injection',
+    'kind). The operator views this in the desktop\'s Agents → Activity',
+    'tab. Be precise + intentional — your actions are evidence under your',
+    'own identity.',
+  ];
+  if (background) {
+    lines.push(
+      '',
+      '## Background-mode progress directive',
+      '',
+      'You are running as a BACKGROUNDED sub-agent. Your parent gets a',
+      'single completion notification when you finish, otherwise silence.',
+      'Call `lastid_progress({stage: "..."})` BEFORE each step that might',
+      'take more than ~2 seconds — a tool call you\'re about to make, a',
+      'chunk of analysis, a network round-trip. Each call becomes a real-',
+      'time push to the parent so they know what you\'re doing. Keep stages',
+      'to one short verb-led phrase ("reading wallet.ts", "running test',
+      'suite", "summarizing diff"). This is liveness, not narration — one',
+      'stage per real step, not per thought.',
+    );
+  }
+  return lines.join('\n');
+}
+
 // ── Pure layer ───────────────────────────────────────────────────────────
 
 /**
@@ -839,15 +936,13 @@ export async function invokeSubagent({
     return { ok: false, error: `agent_md_unreadable: ${err.message ?? err}`, text: '' };
   }
   const sysPromptPath = join(tmpdir(), `lastid-subagent-${randomUUID()}.md`);
-  // When this is a BACKGROUNDED spawn, append a system-prompt directive
-  // pointing the helper at lastid_progress so it streams stage updates
-  // back instead of going silent for the full run. Operators shouldn't
-  // have to repeat this in every helper.md — the tool exists for the
-  // backgrounded case, the directive belongs with the spawn. Foreground
-  // spawns get the bare agent.md body (no behavior change there).
-  const promptBody = background
-    ? `${parsed.body}\n\n---\n\nBACKGROUND-MODE DIRECTIVE: You are running as a backgrounded sub-agent. Your parent gets a single completion notification when you finish, otherwise silence. Call \`lastid_progress({stage: "..."})\` BEFORE each step that might take more than ~2 seconds — a tool call you're about to make, a chunk of analysis, a network round-trip. Each call becomes a real-time push to the parent so they know what you're doing. Keep stages to one short verb-led phrase ("reading wallet.ts", "running test suite", "summarizing diff"). This is liveness, not narration — one stage per real step, not per thought.`
-    : parsed.body;
+  // Append a runtime-rules prelude to EVERY spawned helper's system
+  // prompt: credential handling, audit attribution, and (when this is a
+  // backgrounded invoke) the lastid_progress directive. These rules are
+  // UNIVERSAL — the same for any helper any operator builds — so the
+  // plugin owns them, not the helper.md. Operators shouldn't have to
+  // re-explain vault semantics in every helper they author.
+  const promptBody = `${parsed.body}\n\n${formatHelperRuntimeRules({ background })}`;
   await writeFile(sysPromptPath, promptBody, 'utf-8');
 
   // One-off .mcp.json registering ONLY the lastid-agent server — so
