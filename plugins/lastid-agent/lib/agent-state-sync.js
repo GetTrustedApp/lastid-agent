@@ -168,8 +168,19 @@ export async function syncAgentState({
   const sinceSelfProt = store.cursorFor('self_protection');
   const sinceSubagent = store.cursorFor('subagent');
   const [rules, memories, vault, auditPolicy, selfProtection, subagents] = await Promise.all([
-    fetchKind({ idpUrl, path: RULES_PATH, since: sinceRule, agentDid, vcCompact, signingKey, fetchImpl }),
-    fetchKind({ idpUrl, path: MEMORIES_PATH, since: sinceMemory, agentDid, vcCompact, signingKey, fetchImpl }),
+    // Rules + memories also fail soft to empty — an agent provisioned WITHOUT
+    // rule:read or memory:read (e.g. a narrow-scoped sub-agent like log-diver
+    // with only vault:use) gets a 403 from those endpoints. An uncaught reject
+    // here would explode the entire Promise.all and silently strand vault +
+    // subagent + audit_policy pulls (Log Diver vault-share invisible bug,
+    // 2026-05-28). Per-kind cursor stays put so the kind self-heals if the
+    // operator later grants the cap.
+    fetchKind({ idpUrl, path: RULES_PATH, since: sinceRule, agentDid, vcCompact, signingKey, fetchImpl }).catch(
+      () => ({ records: [], cursor: sinceRule, operatorJwk: null }),
+    ),
+    fetchKind({ idpUrl, path: MEMORIES_PATH, since: sinceMemory, agentDid, vcCompact, signingKey, fetchImpl }).catch(
+      () => ({ records: [], cursor: sinceMemory, operatorJwk: null }),
+    ),
     // Vault shares. We store them SEALED (no decrypt here) — the listener
     // verifies + unfurls only at inject time. A failed vault fetch must not
     // break rules/memories, so fail soft to empty AND return the unchanged

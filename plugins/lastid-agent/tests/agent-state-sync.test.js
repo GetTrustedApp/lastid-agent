@@ -85,12 +85,23 @@ function jsonResp(obj) {
 /** Fake IdP: serves records with cursor > ?since per kind, plus the kind's high-water cursor. */
 function makeFakeIdp({ rules = [], memories = [], vault = [], failStatus = null, failVault = false }) {
   const seen = [];
+  // `failStatus` is overloaded for backwards compat:
+  //   - a number (e.g. 503) fails ALL kinds (the original global behavior), or
+  //   - a per-kind map keyed by path segment ({ rules: 403, vault: 503 }) that
+  //     fails ONLY the named kinds while the others serve normally — used to
+  //     exercise the per-kind fail-soft contract.
+  const failMap = failStatus && typeof failStatus === 'object' ? failStatus : null;
+  const failAll = failStatus && typeof failStatus !== 'object' ? failStatus : null;
   const fetchImpl = async (url, opts) => {
     seen.push({ url, headers: opts.headers });
-    if (failStatus) {
-      return { ok: false, status: failStatus, json: async () => ({}), text: async () => 'server error' };
-    }
     const u = new URL(url);
+    const seg = u.pathname.split('/').pop(); // 'rules' | 'memories' | 'vault' | …
+    if (failAll) {
+      return { ok: false, status: failAll, json: async () => ({}), text: async () => 'server error' };
+    }
+    if (failMap && failMap[seg]) {
+      return { ok: false, status: failMap[seg], json: async () => ({}), text: async () => 'server error' };
+    }
     // Vault-ONLY transport failure (exercises the fail-soft path): rules /
     // memories still succeed while vault 503s.
     if (failVault && u.pathname.endsWith('/vault')) {
@@ -220,13 +231,53 @@ test('an undecryptable record is skipped, the rest of the batch still applies', 
   assert.equal(store.cursor, 2); // advanced past the bad record
 });
 
-test('a non-OK response throws', async () => {
+test('a non-OK response from one kind fails soft, others proceed', async () => {
   const store = freshStore();
-  const idp = makeFakeIdp({ failStatus: 503 });
-  await assert.rejects(
-    syncAgentState({ ...auth, store, fetchImpl: idp.fetchImpl }),
-    /fetch failed: 503/,
-  );
+  // Rules 503 while memories serve normally. Under the OLD contract any kind's
+  // non-OK exploded the whole Promise.all and rejected the sync; the NEW
+  // contract isolates each kind — the sync RESOLVES, memories apply, and the
+  // failing kind's cursor stays put so it re-pulls next sync.
+  const idp = makeFakeIdp({
+    rules: [rule('r1', { tool: 'Bash', pattern: 'a', severity: 'warn' }, 5)],
+    memories: [memory('m1', { claim: 'x' }, 9)],
+    failStatus: { rules: 503 },
+  });
+  const res = await syncAgentState({ ...auth, store, fetchImpl: idp.fetchImpl });
+  // Applied count reflects only the kind that succeeded (the one memory).
+  assert.equal(res.applied, 1);
+  assert.equal(store.listMemories().length, 1);
+  assert.equal(store.listRules().length, 0, 'the failing kind applied nothing');
+  // The failing kind's cursor stays at 0 (re-fetchable); the healthy kind advanced.
+  assert.equal(store.cursorFor('rule'), 0);
+  assert.equal(store.cursorFor('memory'), 9);
+});
+
+test('REGRESSION: rules 403 (agent lacks rule:read) does NOT strand vault shares (log-diver bug 2026-05-28)', async () => {
+  // A sub-agent narrow-scoped to `vault:use` only (e.g. log-diver) gets a 403
+  // from /rules. Under the old contract that 403 rejected the entire
+  // Promise.all, so the vault fetch never landed and the operator's shared
+  // credential was invisible to the agent. Per-kind fail-soft isolates it: the
+  // rules failure is swallowed and the vault share is delivered as normal.
+  const store = freshStore();
+  const scope = `rules-403-${randomUUID()}`;
+  const vaultDir = join(homedir(), '.lastid-agent', scope);
+  const idp = makeFakeIdp({
+    vault: [vaultShare('v1', 4)],
+    failStatus: { rules: 403 }, // agent lacks rule:read
+  });
+  try {
+    const res = await syncAgentState({ ...auth, store, scope, fetchImpl: idp.fetchImpl });
+    // The sync resolved despite the rules 403.
+    assert.ok(res, 'sync resolved despite rules 403');
+    // The vault share reached the local vault cache — true end-to-end delivery,
+    // proving the rules failure did NOT kill the vault sync.
+    const cached = JSON.parse(readFileSync(join(vaultDir, 'vault-shares.json'), 'utf8'));
+    assert.ok(cached['v1'], 'vault share v1 applied to the local vault cache (not stranded by rules 403)');
+    assert.equal(store.cursorFor('vault'), 4, 'vault cursor advanced independently');
+    assert.equal(store.cursorFor('rule'), 0, 'rules failed soft — its cursor stays put for retry');
+  } finally {
+    rmSync(vaultDir, { recursive: true, force: true });
+  }
 });
 
 test('decodeRecord: active decrypts (with bytes), revoked passes through', () => {
