@@ -23,6 +23,7 @@ import { unlink, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { evalShareForUse, OUTCOME } from './vault-policy.js';
 import { defaultRateTracker } from './vault-rate.js';
 import { exchangeClientCredentials } from './oauth-exchange.js';
@@ -69,6 +70,43 @@ export async function handleVaultRequest(req, deps) {
     if (policy.outcome === OUTCOME.APPROVAL && req.approved !== true) {
       // The MCP drives the cross-device approval loop, then retries with
       // approved:true once it has verified the operator's decision JWS.
+      // `approval_request` is the BODY runApprovalLoop POSTs to the IdP's
+      // /v1/agent-use-approvals — every field below is required by the
+      // IdP's CreateBody validator. Pre-fix this object was absent and
+      // the POST shipped `JSON.stringify(undefined)` → 400 from the IdP.
+      // share_id is the same synthetic string the desktop's
+      // `compute_share_id` produces (lastid-vc::decision_jws); the IdP
+      // and the desktop both agree on this template, so the operator's
+      // decision JWS binds to a share_id the desktop will recognize on
+      // the retry path.
+      const purposeIn = typeof req.purpose === 'string' && req.purpose.length > 0
+        ? req.purpose
+        : null;
+      const approvalRequest = {
+        share_id: `share::${agentDid}::${itemId}`,
+        resource_kind: 'credential',
+        resource_ref: itemId,
+        // The IdP rejects an empty string for resource_name but accepts
+        // its absence — only include when the share has a title.
+        ...(content.title ? { resource_name: content.title } : {}),
+        ...(purposeIn ? { purpose: purposeIn } : {}),
+        reason_kind: policy.reason_kind,
+        // The `one_time_use_required` branch of vault-policy returns no
+        // reason_detail (the share itself is the "why"). The IdP's
+        // CreateBody validator REQUIRES a non-empty reason_detail, so
+        // default to a human-readable summary when policy didn't carry
+        // one. constraint_failed paths always provide their own detail.
+        reason_detail:
+          typeof policy.reason_detail === 'string' && policy.reason_detail.length > 0
+            ? policy.reason_detail
+            : 'Operator requires approval for each use of this share.',
+        ...(policy.constraint_kind ? { constraint_kind: policy.constraint_kind } : {}),
+        // session_id is a per-use anchor so a re-request after a denial
+        // is a fresh row in the operator's history (not a re-decision on
+        // the same approval). Per-vault_use UUID is the simplest fit; the
+        // operator's audit chain stitches by approval_id, not session_id.
+        session_id: randomUUID(),
+      };
       return {
         policy_approval_required: true,
         item_id: itemId,
@@ -77,6 +115,7 @@ export async function handleVaultRequest(req, deps) {
         reason_detail: policy.reason_detail,
         constraint_kind: policy.constraint_kind,
         require_approval_per_use: content.require_approval_per_use === true,
+        approval_request: approvalRequest,
       };
     }
     // Mint an ephemeral handle keypair: the public key goes to the holder to

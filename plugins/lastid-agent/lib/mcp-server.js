@@ -289,9 +289,17 @@ export async function handleLocalVault({ name, args, scope, loadedAgent, signing
     // denies. Built from the sticky last-project + this cwd's git fingerprint.
     const { buildVaultUseScope } = await import('./vault-scope.js');
     const useScope = buildVaultUseScope({ scope });
+    // `purpose` is the agent's stated intent for this specific call
+    // (shown to the operator in the approval dialog). Plain string when
+    // the model passed one; the listener stores it on the IdP's pending
+    // row via the `approval_request.purpose` field.
+    const purpose = typeof args?.purpose === 'string' && args.purpose.length > 0
+      ? args.purpose
+      : undefined;
     let resp = await vaultRequest(scope, {
       op: 'vault_use',
       item_id: args.item_id,
+      purpose,
       ctx: { now_ms: Date.now(), scope: useScope },
     });
     if (resp?.policy_approval_required === true && signingSeed) {

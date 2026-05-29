@@ -81,6 +81,59 @@ test('vault_use needing approval → policy_approval_required until approved:tru
   assert.ok(r2.vault_handle);
 })
 
+test('policy_approval_required carries an `approval_request` with EVERY IdP-required field', async () => {
+  // Regression for the 2026-05-28 bug where the IdP rejected the POST
+  // with "share_id required; resource_kind required; resource_ref
+  // required; reason_kind required; reason_detail required; session_id
+  // required" — vault-ipc returned the signal without an approval_request
+  // and runApprovalLoop POSTed JSON.stringify(undefined).
+  const d = deps({
+    resolveShare: async () => ({
+      ...SHARE,
+      require_approval_per_use: true,
+      title: 'LastID - IDP - AWS',
+    }),
+  });
+  const r = await handleVaultRequest(
+    { op: 'vault_use', item_id: 'vault_aws', purpose: 'fetch the last 5 CloudTrail events' },
+    d,
+  );
+  assert.equal(r.policy_approval_required, true);
+  assert.ok(r.approval_request, 'approval_request is present')
+  // Every IdP CreateBody-required field is populated; share_id matches
+  // the desktop's `compute_share_id` template (see
+  // lastid-vc::decision_jws::compute_share_id) so the operator's
+  // decision binds to a share_id the desktop will recognize.
+  assert.match(r.approval_request.share_id, /^share::did:lastid:agent:.+::vault_aws$/);
+  assert.equal(r.approval_request.resource_kind, 'credential');
+  assert.equal(r.approval_request.resource_ref, 'vault_aws');
+  assert.equal(r.approval_request.resource_name, 'LastID - IDP - AWS');
+  assert.equal(r.approval_request.purpose, 'fetch the last 5 CloudTrail events');
+  assert.ok(typeof r.approval_request.reason_kind === 'string' && r.approval_request.reason_kind.length > 0);
+  assert.ok(typeof r.approval_request.reason_detail === 'string' && r.approval_request.reason_detail.length > 0);
+  assert.match(r.approval_request.session_id, /^[0-9a-f-]{36}$/i);
+})
+
+test('approval_request omits resource_name + purpose when the share/call has neither (IdP rejects empty-string)', async () => {
+  // The IdP's CreateBody validator rejects empty-string resource_name /
+  // purpose. Construct the request with the field ABSENT (not
+  // empty-string) when there's nothing to put there.
+  const d = deps({
+    resolveShare: async () => ({
+      ...SHARE,
+      require_approval_per_use: true,
+      title: '', // simulate a share with no human-readable title
+    }),
+  });
+  const r = await handleVaultRequest(
+    { op: 'vault_use', item_id: 'vault_x' }, // no purpose
+    d,
+  );
+  assert.equal(r.policy_approval_required, true);
+  assert.equal('resource_name' in r.approval_request, false, 'resource_name absent, not empty-string');
+  assert.equal('purpose' in r.approval_request, false, 'purpose absent, not empty-string');
+})
+
 test('http_fetch injects the secret, calls, and revokes (single-use)', async () => {
   let seen = null;
   const d = deps({
