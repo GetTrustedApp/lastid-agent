@@ -2033,8 +2033,55 @@ async function cmdRun(flags, cmdArgv) {
     exit(1);
   }
   if (used?.policy_approval_required) {
-    process.stderr.write('run: this credential needs operator approval per use. Approve it in your LastID, then retry.\n');
-    exit(1);
+    // Drive the cross-device approval loop in-process (mirrors the MCP
+    // server's path in mcp-server.js): POST the row to the IdP, poll for
+    // the operator's decision JWS, verify it locally, retry vault_use
+    // with approved:true. Previously the CLI just printed "go approve
+    // in your LastID, then retry" and bailed — which dropped the operator
+    // into a polling loop they had to drive by hand and broke the
+    // matching UX promise the MCP path makes. Same use-approval-loop.js
+    // helper, same approval_request body, same TTL behavior.
+    process.stderr.write(
+      'run: this credential needs operator approval — waiting for your decision (Approve/Deny in console or phone)…\n',
+    );
+    const { runApprovalLoop } = await import('./use-approval-loop.js');
+    const outcome = await runApprovalLoop({
+      approvalBody: used,
+      originalArgs: { item_id: itemId },
+      agentDid: loaded.agentDid,
+      vcCompact: loaded.vcCompact,
+      signingSeed: loaded.slotSeed,
+    });
+    if (outcome?.expired) {
+      process.stderr.write('run: approval window expired — operator did not decide in time\n');
+      exit(1);
+    }
+    if (outcome?.denied) {
+      process.stderr.write(
+        `run: ${outcome.body?.error ?? 'policy_approval_denied'}: ${outcome.body?.reason_detail ?? 'operator denied the approval'}\n`,
+      );
+      exit(1);
+    }
+    if (!outcome?.retryArgs) {
+      process.stderr.write('run: approval flow returned an unexpected outcome — aborting\n');
+      exit(1);
+    }
+    // Retry vault_use with the approved-flag + approval_id. The listener
+    // verifies the decision JWS via operator_delegation_jwk locally before
+    // releasing the handle, so a poisoned IdP response can't fake an
+    // approval here.
+    try {
+      used = await vaultRequest(scope, {
+        op: 'vault_use',
+        item_id: itemId,
+        approved: true,
+        approval_id: outcome.retryArgs.approval_id,
+        ctx: { now_ms: Date.now() },
+      });
+    } catch (e) {
+      process.stderr.write(`run: vault listener unreachable on approved retry (${e?.message ?? e})\n`);
+      exit(1);
+    }
   }
   if (!used?.ok || !used.vault_handle) {
     process.stderr.write(`run: ${used?.error ?? 'vault_use_failed'}: ${used?.reason_detail ?? used?.detail ?? ''}\n`);
