@@ -29,6 +29,7 @@
  */
 import { createRequire } from 'node:module';
 import { diskKvCallbacks } from './mls-state-store.js';
+import { deriveAgentDeviceId } from './agent-provisioning.js';
 
 const localRequire = createRequire(import.meta.url);
 const wasm = localRequire('../vendor/lastid-mls-wasm/lastid_mls_wasm.js');
@@ -83,9 +84,18 @@ export class MlsClient {
    */
   static async open({ agentDid, slotSeed, scope }) {
     const resolvedScope = scope ?? 'main';
+    // Stamp this agent's device_id into every credential this client builds so
+    // peers can map our leaf→device (matches the orchestrator handle + the
+    // device_id the IdP key-package store is keyed by). Falls back to a bare-DID
+    // credential if the seed isn't a valid 32-byte buffer.
+    const deviceId =
+      slotSeed instanceof Uint8Array && slotSeed.length === 32
+        ? deriveAgentDeviceId(Buffer.from(slotSeed))
+        : undefined;
     const handle = await wasm.createPersistentBotClientWithCallbacks(
       agentDid,
       diskKvCallbacks({ slotSeed, scope: resolvedScope }),
+      deviceId,
     );
     return new MlsClient({ handle, agentDid, slotSeed, scope: resolvedScope });
   }

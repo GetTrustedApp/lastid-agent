@@ -555,16 +555,23 @@ export class MemoryStore {
   stickyNotesForAnchor(repoKey, relPath, nowMs = Date.now()) {
     if (typeof relPath !== 'string' || relPath.length === 0) return [];
     const ts = (m) => Date.parse(m.updated_at ?? m.created_at ?? '') || 0;
-    return this.activeMemories(nowMs)
-      .filter(
-        (m) =>
-          m.kind === 'sticky' &&
-          m.anchor &&
-          m.anchor.rel_path === relPath &&
-          // repo_key matches when both carry one; missing on either side is permissive.
-          !(m.anchor.repo_key && repoKey && m.anchor.repo_key !== repoKey),
-      )
-      .sort((x, y) => ts(y) - ts(x));
+    const matches = this.activeMemories(nowMs).filter(
+      (m) =>
+        m.kind === 'sticky' &&
+        m.anchor &&
+        m.anchor.rel_path === relPath &&
+        // repo_key matches when both carry one; missing on either side is permissive.
+        !(m.anchor.repo_key && repoKey && m.anchor.repo_key !== repoKey),
+    );
+    // Newest first. Tiebreak on insertion index (DESC) — `activeMemories`
+    // preserves write order — so two notes created within the SAME millisecond
+    // still order deterministically newest→oldest. Without it, equal timestamps
+    // + a stable sort keep insertion order (oldest first) and the result flaps
+    // run-to-run.
+    return matches
+      .map((m, i) => [m, i])
+      .sort(([, ix], [, iy]) => ts(matches[iy]) - ts(matches[ix]) || iy - ix)
+      .map(([m]) => m);
   }
 
   /**

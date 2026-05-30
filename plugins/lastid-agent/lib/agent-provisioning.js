@@ -50,6 +50,7 @@ import {
   hkdfSync,
 } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { agentDeviceIdFromEd25519Jwk } from './agent-device-id.js';
 
 // Production IdP by default. Override per-host via the
 // `LASTID_IDP_URL` env var or per-invocation via the CLI's
@@ -438,6 +439,21 @@ export function deriveAgentEd25519Keypair(slotSeed) {
     },
     signingSeed,
   };
+}
+
+/**
+ * Derive this agent runtime's stable `ad-<hash>` device_id from its 32-byte
+ * slot seed. The single source for the device_id across the MLS layer — the
+ * KeyPackage publish (`mls-publish`), the shared orchestrator handle, and the
+ * MlsClient fallback all call this so the value stamped into the MLS
+ * credential matches the one the IdP key-package store is keyed by.
+ *
+ * @param {Buffer} slotSeed 32-byte BIP85 slot seed
+ * @returns {string} e.g. `ad-1a2b…`
+ */
+export function deriveAgentDeviceId(slotSeed) {
+  const { publicJwk } = deriveAgentEd25519Keypair(slotSeed);
+  return agentDeviceIdFromEd25519Jwk(publicJwk);
 }
 
 /**

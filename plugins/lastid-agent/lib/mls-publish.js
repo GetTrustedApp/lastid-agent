@@ -114,17 +114,23 @@ export async function publishAgentKeyPackage({
   // credential held in the wasm state; persist once at the end so
   // every credential ends up in the sealed state file (skipping
   // persist would invalidate all of them on the next restart).
+  // cred_version: 2 — the agent's MLS handle is built with its device_id, so
+  // every credential it mints is the structured (v2) form. Declaring it lets
+  // the IdP one-time-purge this device's legacy v1 (bare-DID) packages on the
+  // first v2 publish (self-limiting server-side).
   const items = [];
   for (let i = 0; i < REGULAR_COUNT; i++) {
     items.push({
       key_package: await mls.generateKeyPackage(),
       device_id: deviceId,
+      cred_version: 2,
     });
   }
   items.push({
     key_package: await mls.generateKeyPackage(),
     device_id: deviceId,
     is_last_resort: true,
+    cred_version: 2,
   });
   // generateKeyPackage already auto-flushes via the storage-provider's
   // flushBlob callback; persist() is a kept-for-compat no-op.

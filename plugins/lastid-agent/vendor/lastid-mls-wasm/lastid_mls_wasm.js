@@ -1223,14 +1223,17 @@ exports.computeMemberReconcilePlan = computeMemberReconcilePlan;
  * @param {any} directory
  * @param {any} transport
  * @param {any} host
+ * @param {string | null} [device_id]
  * @returns {Promise<MlsOrchestrator>}
  */
-function createMlsOrchestrator(bot_did, my_did, directory, transport, host) {
+function createMlsOrchestrator(bot_did, my_did, directory, transport, host, device_id) {
     const ptr0 = passStringToWasm0(bot_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(my_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.createMlsOrchestrator(ptr0, len0, ptr1, len1, directory, transport, host);
+    var ptr2 = isLikeNone(device_id) ? 0 : passStringToWasm0(device_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    const ret = wasm.createMlsOrchestrator(ptr0, len0, ptr1, len1, directory, transport, host, ptr2, len2);
     return ret;
 }
 exports.createMlsOrchestrator = createMlsOrchestrator;
@@ -1254,14 +1257,17 @@ exports.createMlsOrchestrator = createMlsOrchestrator;
  * @param {any} transport
  * @param {any} host
  * @param {any} callbacks
+ * @param {string | null} [device_id]
  * @returns {Promise<MlsOrchestrator>}
  */
-function createMlsOrchestratorWithCallbacks(bot_did, my_did, directory, transport, host, callbacks) {
+function createMlsOrchestratorWithCallbacks(bot_did, my_did, directory, transport, host, callbacks, device_id) {
     const ptr0 = passStringToWasm0(bot_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(my_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.createMlsOrchestratorWithCallbacks(ptr0, len0, ptr1, len1, directory, transport, host, callbacks);
+    var ptr2 = isLikeNone(device_id) ? 0 : passStringToWasm0(device_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len2 = WASM_VECTOR_LEN;
+    const ret = wasm.createMlsOrchestratorWithCallbacks(ptr0, len0, ptr1, len1, directory, transport, host, callbacks, ptr2, len2);
     return ret;
 }
 exports.createMlsOrchestratorWithCallbacks = createMlsOrchestratorWithCallbacks;
@@ -1277,12 +1283,15 @@ exports.createMlsOrchestratorWithCallbacks = createMlsOrchestratorWithCallbacks;
  * handles sharing IDB state — useful for tests, an antipattern
  * in production (one client per bot_did per tab).
  * @param {string} bot_did
+ * @param {string | null} [device_id]
  * @returns {Promise<PersistentBotMlsClient>}
  */
-function createPersistentBotClient(bot_did) {
+function createPersistentBotClient(bot_did, device_id) {
     const ptr0 = passStringToWasm0(bot_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.createPersistentBotClient(ptr0, len0);
+    var ptr1 = isLikeNone(device_id) ? 0 : passStringToWasm0(device_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len1 = WASM_VECTOR_LEN;
+    const ret = wasm.createPersistentBotClient(ptr0, len0, ptr1, len1);
     return ret;
 }
 exports.createPersistentBotClient = createPersistentBotClient;
@@ -1313,12 +1322,15 @@ exports.createPersistentBotClient = createPersistentBotClient;
  * JS host doesn't see which backend it's on.
  * @param {string} bot_did
  * @param {any} callbacks
+ * @param {string | null} [device_id]
  * @returns {Promise<PersistentBotMlsClient>}
  */
-function createPersistentBotClientWithCallbacks(bot_did, callbacks) {
+function createPersistentBotClientWithCallbacks(bot_did, callbacks, device_id) {
     const ptr0 = passStringToWasm0(bot_did, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.createPersistentBotClientWithCallbacks(ptr0, len0, callbacks);
+    var ptr1 = isLikeNone(device_id) ? 0 : passStringToWasm0(device_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len1 = WASM_VECTOR_LEN;
+    const ret = wasm.createPersistentBotClientWithCallbacks(ptr0, len0, callbacks, ptr1, len1);
     return ret;
 }
 exports.createPersistentBotClientWithCallbacks = createPersistentBotClientWithCallbacks;
@@ -1789,17 +1801,17 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1031, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1022, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h6bbf4240b2ac3152);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 854, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 845, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hf8dc1552a3079bbe);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 839, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 830, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hb211d42f6d42ba37);
             return ret;
         },

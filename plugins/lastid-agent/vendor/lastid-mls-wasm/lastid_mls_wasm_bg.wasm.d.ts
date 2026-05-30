@@ -2,8 +2,8 @@
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
 export const __wbg_mlsorchestrator_free: (a: number, b: number) => void;
-export const createMlsOrchestrator: (a: number, b: number, c: number, d: number, e: any, f: any, g: any) => any;
-export const createMlsOrchestratorWithCallbacks: (a: number, b: number, c: number, d: number, e: any, f: any, g: any, h: any) => any;
+export const createMlsOrchestrator: (a: number, b: number, c: number, d: number, e: any, f: any, g: any, h: number, i: number) => any;
+export const createMlsOrchestratorWithCallbacks: (a: number, b: number, c: number, d: number, e: any, f: any, g: any, h: any, i: number, j: number) => any;
 export const mlsorchestrator_addMember: (a: number, b: number, c: number, d: number, e: number) => any;
 export const mlsorchestrator_addMembers: (a: number, b: number, c: number, d: number, e: number) => any;
 export const mlsorchestrator_bindGroupIdMapping: (a: number, b: number, c: number, d: number, e: number) => any;
@@ -51,8 +51,8 @@ export const botmlsclient_snapshotBaseline: (a: number) => [number, number];
 export const botmlsclient_takeDiffJson: (a: number) => [number, number, number, number];
 export const ciphersuiteSupportJson: () => [number, number, number, number];
 export const computeMemberReconcilePlan: (a: number, b: number) => [number, number, number, number];
-export const createPersistentBotClient: (a: number, b: number) => any;
-export const createPersistentBotClientWithCallbacks: (a: number, b: number, c: any) => any;
+export const createPersistentBotClient: (a: number, b: number, c: number, d: number) => any;
+export const createPersistentBotClientWithCallbacks: (a: number, b: number, c: any, d: number, e: number) => any;
 export const persistentbotmlsclient_addMember: (a: number, b: number, c: number, d: number, e: number) => any;
 export const persistentbotmlsclient_addMembers: (a: number, b: number, c: number, d: number, e: number) => any;
 export const persistentbotmlsclient_botDid: (a: number) => [number, number];

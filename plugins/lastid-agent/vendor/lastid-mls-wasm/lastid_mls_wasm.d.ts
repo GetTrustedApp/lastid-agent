@@ -452,7 +452,7 @@ export function ciphersuiteSupportJson(): string;
  */
 export function computeMemberReconcilePlan(input_json: string): string;
 
-export function createMlsOrchestrator(bot_did: string, my_did: string, directory: any, transport: any, host: any): Promise<MlsOrchestrator>;
+export function createMlsOrchestrator(bot_did: string, my_did: string, directory: any, transport: any, host: any, device_id?: string | null): Promise<MlsOrchestrator>;
 
 /**
  * Node-side orchestrator constructor: same shape as `createMlsOrchestrator`
@@ -468,7 +468,7 @@ export function createMlsOrchestrator(bot_did: string, my_did: string, directory
  * can unify the backend (mirroring how the browser's `IndexedDbRawKv::open`
  * is process-cached).
  */
-export function createMlsOrchestratorWithCallbacks(bot_did: string, my_did: string, directory: any, transport: any, host: any, callbacks: any): Promise<MlsOrchestrator>;
+export function createMlsOrchestratorWithCallbacks(bot_did: string, my_did: string, directory: any, transport: any, host: any, callbacks: any, device_id?: string | null): Promise<MlsOrchestrator>;
 
 /**
  * Open or rehydrate a persistent MLS client for `bot_did`. If
@@ -481,7 +481,7 @@ export function createMlsOrchestratorWithCallbacks(bot_did: string, my_did: stri
  * handles sharing IDB state — useful for tests, an antipattern
  * in production (one client per bot_did per tab).
  */
-export function createPersistentBotClient(bot_did: string): Promise<PersistentBotMlsClient>;
+export function createPersistentBotClient(bot_did: string, device_id?: string | null): Promise<PersistentBotMlsClient>;
 
 /**
  * Open or rehydrate a persistent MLS client for `bot_did` with host-
@@ -508,7 +508,7 @@ export function createPersistentBotClient(bot_did: string): Promise<PersistentBo
  * processWelcome, encryptApplicationMessage, …) works identically. The
  * JS host doesn't see which backend it's on.
  */
-export function createPersistentBotClientWithCallbacks(bot_did: string, callbacks: any): Promise<PersistentBotMlsClient>;
+export function createPersistentBotClientWithCallbacks(bot_did: string, callbacks: any, device_id?: string | null): Promise<PersistentBotMlsClient>;
 
 /**
  * Install a panic hook that pipes Rust panics to the JS console. Call once.
