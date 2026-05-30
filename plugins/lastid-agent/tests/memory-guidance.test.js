@@ -91,6 +91,17 @@ test('forbids storing transient task state as durable memory', () => {
   assert.match(t, /stable fact\/decision\/rule/);
 });
 
+test('makes sticky notes a first-class reflex (USE on long work + RESOLVE never ignore)', () => {
+  const t = text();
+  assert.match(t, /STICKY NOTES/);
+  assert.match(t, /kind:"sticky"/);
+  // the USE reflex (scribble while working)
+  assert.match(t, /scribble a note on the file/);
+  // the RESOLVE reflex (deal with it, don't ignore)
+  assert.match(t, /RESOLVE them, never ignore/);
+  assert.match(t, /lastid_memory_forget/);
+});
+
 test('nudges ToolSearch to close the tool-loading friction gap', () => {
   const t = text();
   assert.match(t, /ToolSearch/);

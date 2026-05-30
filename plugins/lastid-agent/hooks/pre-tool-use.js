@@ -31,7 +31,8 @@ import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applyRewrite } from '../lib/operator-store.js';
-import { projectKeyForPath, operativePathFromToolInput } from '../lib/project-key.js';
+import { projectKeyForPath, operativePathFromToolInput, anchorForPath } from '../lib/project-key.js';
+import { MemoryStore } from '../lib/memory-store.js';
 import { writeLastProject } from '../lib/project-sticky.js';
 import { recordRuleHit } from '../lib/rule-metrics.js';
 import { hostMemoryWriteWarning } from '../lib/memory-guidance.js';
@@ -354,6 +355,30 @@ if (toolName && AMBIENT_RETRIEVE_TOOLS.has(toolName)) {
   }
 }
 
+// ─── 1d. Sticky-note surfacing (Read / Edit) ───────────────────────
+//
+// JIT working memory: when the agent opens a file that has OPEN sticky notes
+// anchored to it, surface them + the resolve reflex. Pure-local (a store read
+// + a git-root walk — no network, no embeddings) so it's cheap on every
+// Read/Edit, unlike the ambient semantic recall above (which Read/Edit skip).
+// Best-effort: never blocks the tool.
+if (toolName === 'Read' || toolName === 'Edit') {
+  try {
+    const opPath = operativePathFromToolInput(toolInput);
+    const anchor = opPath ? anchorForPath(opPath) : null;
+    if (anchor && anchor.rel_path) {
+      const notes = new MemoryStore(activeScope).stickyNotesForAnchor(
+        anchor.repo_key,
+        anchor.rel_path,
+      );
+      const block = renderStickyNotes(notes);
+      if (block) contextParts.push(block);
+    }
+  } catch {
+    /* best-effort — never block a Read/Edit on sticky surfacing */
+  }
+}
+
 // NOTE: the rewrite logic lives in operator-store.js::applyRewrite (imported
 // above) so the PreToolUse rewriter and the matcher (patternMatches) share
 // ONE pattern grammar. Previously a local copy here only honoured the
@@ -438,6 +463,29 @@ if (additionalContext) {
 process.exit(0);
 
 // ---
+
+/**
+ * Render OPEN sticky notes for a file into an additionalContext block, with the
+ * RESOLVE reflex inline (the surfaced text itself nags so a note can't be
+ * silently skipped). Newest-first, capped. Returns null when there are none.
+ */
+function renderStickyNotes(notes, cap = 5) {
+  if (!Array.isArray(notes) || notes.length === 0) return null;
+  const shown = notes.slice(0, cap);
+  const lines = shown.map((n) => `- [${n.id}] ${String(n.claim ?? '').trim()}`);
+  const more =
+    notes.length > shown.length
+      ? `\n  …and ${notes.length - shown.length} more sticky note(s) on this file.`
+      : '';
+  return (
+    '📌 Sticky notes on this file (your working memory). RESOLVE each — do NOT ' +
+    'ignore: DO the thing then `lastid_memory_forget` it, or forget it if it is ' +
+    'no longer relevant (promote it to a durable memory first if it must outlive ' +
+    'this task):\n' +
+    lines.join('\n') +
+    more
+  );
+}
 
 function readStdin() {
   try {

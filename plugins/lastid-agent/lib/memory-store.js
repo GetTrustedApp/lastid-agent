@@ -360,6 +360,18 @@ export class MemoryStore {
       subject: Array.isArray(c.subject) ? c.subject : [],
       claim: c.claim,
       ...(typeof c.summary === 'string' ? { summary: c.summary } : {}),
+      // Re-hydrate a sticky note's file anchor from the decrypted content so a
+      // synced-down copy surfaces on the right file (kind='sticky').
+      ...(c.anchor &&
+      typeof c.anchor === 'object' &&
+      typeof c.anchor.rel_path === 'string'
+        ? {
+            anchor: {
+              repo_key: typeof c.anchor.repo_key === 'string' ? c.anchor.repo_key : null,
+              rel_path: c.anchor.rel_path,
+            },
+          }
+        : {}),
       source: { kind: SOURCE_KINDS.includes(c.source_kind) ? c.source_kind : 'inferred' },
       confidence: typeof c.confidence === 'number' ? c.confidence : 0.6,
       sensitivity: SENSITIVITIES.includes(c.sensitivity) ? c.sensitivity : 'low',

@@ -11,8 +11,11 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { MemoryStore } from '../lib/memory-store.js';
 import { searchMemories } from '../lib/memory-tools.js';
+import { anchorForPath } from '../lib/project-key.js';
+import { memorySyncContent } from '../lib/agent-memory-publish.js';
 
 function freshStore() {
   return new MemoryStore('test', join(tmpdir(), `sticky-${randomUUID()}.json`), {
@@ -92,4 +95,37 @@ test('sticky notes are EXCLUDED from semantic recall (searchMemories), facts are
   const ids = hits.map((h) => h.memory_id);
   assert.ok(!ids.includes(sticky.id), 'the sticky note is NOT in semantic results');
   assert.ok(ids.includes(fact.id), 'the fact IS recalled');
+});
+
+test('anchorForPath resolves a repo file to a repo-RELATIVE anchor (posix, portable)', () => {
+  const self = fileURLToPath(import.meta.url);
+  const a = anchorForPath(self);
+  assert.ok(a && typeof a.repo_key === 'string' && a.repo_key.length > 0, 'repo_key present');
+  assert.ok(!a.rel_path.startsWith('/'), 'rel_path is relative, not absolute');
+  assert.ok(!a.rel_path.includes('\\'), 'rel_path uses posix separators');
+  assert.ok(a.rel_path.endsWith('tests/sticky-notes.test.js'), 'rel_path points at this file');
+});
+
+test('anchorForPath on a non-repo path → null repo_key + absolute rel_path', () => {
+  const a = anchorForPath('/tmp/lastid-nonrepo-xyz-0000/foo.txt');
+  assert.equal(a.repo_key, null);
+  assert.equal(a.rel_path, '/tmp/lastid-nonrepo-xyz-0000/foo.txt');
+});
+
+test('a sticky note round-trips its anchor through sync (memorySyncContent → applySync)', () => {
+  const s = freshStore();
+  const m = s.write(stickyInput());
+  const content = memorySyncContent(m);
+  assert.deepEqual(content.anchor, { repo_key: REPO, rel_path: REL }, 'anchor rides in synced content');
+  // Simulate a sync-down on a FRESH store (another session / device / console).
+  const s2 = freshStore();
+  const applied = s2.applySync(
+    { id: m.id, target: s2.agentDid, version: 1, status: 'active', content },
+    'agent',
+  );
+  assert.equal(applied, true);
+  assert.deepEqual(s2.get(m.id).anchor, { repo_key: REPO, rel_path: REL }, 're-hydrated anchor');
+  const hits = s2.stickyNotesForAnchor(REPO, REL);
+  assert.equal(hits.length, 1, 'synced-down sticky surfaces on its anchor');
+  assert.equal(hits[0].id, m.id);
 });

@@ -19,7 +19,7 @@ import { makeEmbedder, cosine, embedMemory, EMBED_DIM, SEMANTIC_FLOOR } from './
 import { enqueueAuditEvent } from './audit-spool.js';
 import { publishAgentMemory } from './agent-memory-publish.js';
 import { readLastProject } from './project-sticky.js';
-import { projectKeyForPath } from './project-key.js';
+import { projectKeyForPath, anchorForPath } from './project-key.js';
 
 const DEFAULT_IDP_URL = 'https://human.lastid.co';
 
@@ -61,6 +61,11 @@ const writeInputSchema = {
     sensitivity: { type: 'string', enum: SENS_ENUM, description: 'Auto-escalated if content looks secret.' },
     bedrock: { type: 'boolean', description: 'Always-inject on every turn if true.' },
     expires_at: { type: 'string', description: 'RFC3339 hard expiry (optional).' },
+    path: {
+      type: 'string',
+      description:
+        "STICKY NOTES ONLY (kind:'sticky'): the file this working note is anchored to. Pass the path you're working on; the note surfaces just-in-time the next time you Read that file, persists across sessions, and is resolved to a repo-relative anchor automatically. Ignored for other kinds.",
+    },
   },
   // source_kind intentionally NOT required: it's defaulted from the tool name
   // in handleMemoryTool (write→user_explicit, draft→inferred), so a missing or
@@ -327,6 +332,16 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
   // host/owner/repo. Any agent-supplied project_key is dropped.
   if (name === 'lastid_memory_write' || name === 'lastid_memory_draft') {
     if ('project_key' in args) delete args.project_key;
+    // Sticky notes are the agent's file-anchored working scratch: resolve the
+    // `path` arg to a repo-relative anchor and pin them AGENT-tier (private
+    // working notes, surfaced to the operator on console) — never project-tier,
+    // so the project-tier defaulting below short-circuits on tier='agent'.
+    if (args.kind === 'sticky') {
+      const anchor =
+        typeof args.path === 'string' && args.path.length > 0 ? anchorForPath(args.path) : null;
+      args = { ...args, tier: 'agent', ...(anchor ? { anchor } : {}) };
+      if ('path' in args) delete args.path;
+    }
     // source_kind is implied by the tool, so the agent never needs to pass it
     // (and a missing/dropped arg can't fail the save): an explicit write is
     // operator-instructed (user_explicit); a draft is agent-inferred

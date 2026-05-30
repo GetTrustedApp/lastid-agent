@@ -1,6 +1,6 @@
 {
   "name": "lastid-agent-runtime",
-  "version": "0.22.4",
+  "version": "0.22.5",
   "private": true,
   "description": "Runtime package for the lastid-agent plugin (deps installed on-demand by bin/lastid-agent.js on first run).",
   "type": "module",

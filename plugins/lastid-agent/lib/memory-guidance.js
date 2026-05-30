@@ -93,6 +93,22 @@ export function memoryGuidanceLines() {
     'speculative inferences, or anything you would not want surfaced',
     "back as ground truth. The operator's bandwidth for reviewing",
     'drafts is finite; high signal only.',
+    '',
+    'STICKY NOTES — your file-anchored WORKING memory (kind:"sticky"). This is',
+    'where transient TASK STATE lives (it does NOT belong in durable memory).',
+    'A sticky note persists across sessions and surfaces JUST-IN-TIME when you',
+    'Read the file it is anchored to — so it costs nothing until your hands are',
+    'on that file. Two reflexes, both first-class:',
+    '- USE them: on a long or multi-session task, scribble a note on the file you',
+    '  are working — lastid_memory_write({kind:"sticky", path:"<file>",',
+    '  claim:"left off at X because Y; next Z"}). A dead session is then no longer',
+    '  a lost task — the next session re-orients from the note when it opens the',
+    '  file. Also good for tagging findings while researching.',
+    '- RESOLVE them, never ignore: when a sticky note surfaces, your FIRST reflex',
+    '  is to deal with it — DO the thing then `lastid_memory_forget` it, or forget',
+    '  it if no longer relevant. If it must outlive the task, PROMOTE it to a',
+    '  durable memory first, then forget the sticky. They are cheap and meant to',
+    '  be torn up; one you keep ignoring is the failure mode.',
   ];
 }
 

@@ -41,6 +41,10 @@ export function memorySyncContent(m) {
     // only has the plaintext routing_id) recovers which repo to scope it to
     // after decrypting. Absent for global/agent memories.
     ...(m.tier === 'project' && m.project_key ? { project_key: m.project_key } : {}),
+    // Sticky-note file anchor rides INSIDE the ciphertext so a synced-down copy
+    // (another session/device, or console) re-hydrates with the same
+    // repo-relative anchor and surfaces on the right file.
+    ...(m.anchor && typeof m.anchor === 'object' ? { anchor: m.anchor } : {}),
   };
 }
 

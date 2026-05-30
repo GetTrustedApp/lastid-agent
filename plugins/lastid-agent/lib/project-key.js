@@ -18,7 +18,7 @@
  * its config) and is exercised against temp-dir fixtures.
  */
 import { readFileSync, existsSync, statSync } from 'node:fs';
-import { dirname, join, resolve, basename, isAbsolute } from 'node:path';
+import { dirname, join, resolve, basename, isAbsolute, relative, sep } from 'node:path';
 
 /**
  * Normalize a git remote URL to a stable, machine-independent project key of
@@ -168,6 +168,39 @@ export function projectKeyForPath(startPath, { maxDepth = 64 } = {}) {
     dir = parent;
   }
   return null;
+}
+
+/**
+ * Resolve a file path to a sticky-note ANCHOR: { repo_key, rel_path }. Same
+ * git-root walk as projectKeyForPath, but also captures the repo ROOT so the
+ * path is stored REPO-RELATIVE — portable to console + other checkouts, unlike
+ * this machine's absolute path. Write-time and read-time both call this, so the
+ * keying matches exactly. Not in a git repo → { repo_key: null, rel_path:
+ * <absolute> } (still usable locally on this machine, just not portable).
+ */
+export function anchorForPath(startPath, { maxDepth = 64 } = {}) {
+  if (typeof startPath !== 'string' || startPath.length === 0) return null;
+  const fileAbs = resolve(startPath);
+  let dir = fileAbs;
+  try {
+    if (existsSync(dir) && statSync(dir).isFile()) dir = dirname(dir);
+  } catch {
+    dir = dirname(dir);
+  }
+  for (let i = 0; i < maxDepth; i++) {
+    const gitEntry = join(dir, '.git');
+    if (existsSync(gitEntry)) {
+      const cfg = configPathFromGitEntry(gitEntry);
+      let key = cfg ? normalizeRemoteUrl(originUrlFromConfig(readFileSafe(cfg))) : null;
+      if (!key) key = `local/${basename(dir).toLowerCase()}`;
+      const rel = relative(dir, fileAbs).split(sep).join('/');
+      return { repo_key: key, rel_path: rel || basename(fileAbs) };
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return { repo_key: null, rel_path: fileAbs };
 }
 
 function readFileSafe(p) {
