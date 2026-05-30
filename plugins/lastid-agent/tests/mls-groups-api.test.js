@@ -13,6 +13,7 @@ import {
   authedIdpFetch,
   fetchPeerKeyPackages,
   listOwnDevices,
+  fetchActiveDevicesForDid,
   createGroupOnIdp,
   addGroupMember,
 } from '../lib/mls-groups-api.js';
@@ -135,6 +136,43 @@ test('listOwnDevices: self-resolves via GET /v1/trust/:agentDid/devices (the dur
       active: true,
     },
   ]);
+});
+
+test('fetchActiveDevicesForDid: resolves a PEER did at GET /v1/trust/:did/devices, signs auth with the AGENT did, maps active flag', async () => {
+  // Used by reconcile to gate peer devices on the IdP's authoritative active
+  // set (the same resolveDurableActiveDeviceIdsForDid the eligibility check
+  // uses). The path carries the PEER did; the DPoP/Bearer auth is still the
+  // agent's (authorized via the owned-agent ownership carve-out on the route).
+  const peerDid = 'did:lastid:zOperator';
+  const fetchImpl = recordingFetch(
+    res({
+      peer_did: peerDid,
+      devices: [
+        { device_id: 'device-live', last_seen: null, active: true },
+        { device_id: 'device-revoked', last_seen: null, active: false },
+        { device_id: 'device-default' }, // missing active flag → defaults true
+      ],
+    }),
+  );
+  const out = await fetchActiveDevicesForDid({ ...AUTH, did: peerDid, fetchImpl });
+  assert.equal(
+    fetchImpl.calls[0].url,
+    'https://idp.test/v1/trust/did%3Alastid%3AzOperator/devices',
+  );
+  // DPoP proof is signed for the agent (kid = agent did), not the peer.
+  assert.match(fetchImpl.calls[0].init.headers.DPoP, /^eyJ/);
+  assert.deepEqual(out, [
+    { device_id: 'device-live', device_identity: 'device-live', last_seen: null, active: true },
+    { device_id: 'device-revoked', device_identity: 'device-revoked', last_seen: null, active: false },
+    { device_id: 'device-default', device_identity: 'device-default', last_seen: null, active: true },
+  ]);
+});
+
+test('fetchActiveDevicesForDid: requires did and agentDid', async () => {
+  await assert.rejects(
+    () => fetchActiveDevicesForDid({ ...AUTH, did: undefined, fetchImpl: recordingFetch(res({})) }),
+    /did required/,
+  );
 });
 
 test('listOwnDevices: empty device set → [] (agent not active/registered, no throw)', async () => {

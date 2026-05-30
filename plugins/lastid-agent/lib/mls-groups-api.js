@@ -113,36 +113,36 @@ export async function fetchPeerKeyPackages({
 }
 
 /**
- * GET /v1/trust/:agent_did/devices — resolve the agent's OWN active device(s)
- * through the SAME durable resolver every other participant uses to resolve a
- * peer (IdP `handleGetPeerDevices` → `resolveDurableActiveDeviceIdsForDid` →
- * `deriveAgentDeviceIds`). Self-reads are authorized because the auth
- * middleware lets a principal enumerate its own devices (subjectDid ===
- * targetDid).
- *
- * This deliberately replaces the old `/v1/identity/devices` call: that is a V1
- * master_fingerprint path and 400s for agents (a child of a v2-only identity
- * has no v2 identity/device row of its own). Routing self-resolution through
- * the peer endpoint keeps ONE resolution source for the agent — what the agent
- * sees of itself is byte-identical to what the operator's phone/desktop/console
- * see of it — so reconcile can never desync on a device-id mismatch. The agent
- * owns exactly one device and has no P-256 prekey; `device_identity` ==
- * `device_id`. The endpoint returns `active` per device (no `status` string).
+ * GET /v1/trust/:did/devices — resolve a principal's active device(s) through
+ * the IdP's durable resolver (`handleGetPeerDevices` →
+ * `resolveDurableActiveDeviceIdsForDid` → `deriveAgentDeviceIds`). This is the
+ * SAME source the reconcile endpoint gates target devices on
+ * (group-device-membership-service.ts: eligibleDeviceIds =
+ * resolveDurableActiveDeviceIdsForDid(memberDid)), so anything resolved here
+ * agrees byte-for-byte with what the IdP will accept — ONE resolution source,
+ * no desync. `did` may be the agent's OWN did (self-read, authorized because a
+ * principal may enumerate its own devices) or a PEER's (the operator's), which
+ * is authorized via the owned-agent ownership carve-out on the route. The
+ * endpoint reports `active` per device (no `status` string) and never returns a
+ * revoked device as active; `device_identity` mirrors `device_id` (the trust
+ * endpoint carries no separate identity field).
  *
  * @returns {Promise<Array<{ device_id: string, device_identity: string, last_seen: string|null, active: boolean }>>}
  */
-export async function listOwnDevices({
+export async function fetchActiveDevicesForDid({
   idpUrl,
+  did,
   agentDid,
   vcCompact,
   signingKey,
   fetchImpl,
 }) {
-  if (!agentDid) throw new Error('listOwnDevices: agentDid required');
+  if (!did) throw new Error('fetchActiveDevicesForDid: did required');
+  if (!agentDid) throw new Error('fetchActiveDevicesForDid: agentDid required');
   const body = await authedIdpFetch({
     idpUrl,
     method: 'GET',
-    path: `/v1/trust/${encodeURIComponent(agentDid)}/devices`,
+    path: `/v1/trust/${encodeURIComponent(did)}/devices`,
     agentDid,
     vcCompact,
     signingKey,
@@ -154,8 +154,6 @@ export async function listOwnDevices({
       const deviceId = typeof d?.device_id === 'string' ? d.device_id : '';
       return {
         device_id: deviceId,
-        // Agents own one device whose id IS its identity — the trust endpoint
-        // does not carry a separate device_identity field.
         device_identity: deviceId,
         last_seen: typeof d?.last_seen === 'string' ? d.last_seen : null,
         // Endpoint marks each returned device active; treat a missing flag as
@@ -164,6 +162,33 @@ export async function listOwnDevices({
       };
     })
     .filter((d) => d.device_id.length > 0);
+}
+
+/**
+ * The agent's OWN active device(s) — the self-read specialization of
+ * `fetchActiveDevicesForDid` (did === agentDid). Kept as a named helper because
+ * the reconcile orchestrator's `own_devices` path resolves through it; the
+ * agent owns exactly one device whose id IS its identity. Replaces the old V1
+ * `/v1/identity/devices` master_fingerprint path (which 400s for agents).
+ *
+ * @returns {Promise<Array<{ device_id: string, device_identity: string, last_seen: string|null, active: boolean }>>}
+ */
+export async function listOwnDevices({
+  idpUrl,
+  agentDid,
+  vcCompact,
+  signingKey,
+  fetchImpl,
+}) {
+  if (!agentDid) throw new Error('listOwnDevices: agentDid required');
+  return fetchActiveDevicesForDid({
+    idpUrl,
+    did: agentDid,
+    agentDid,
+    vcCompact,
+    signingKey,
+    fetchImpl,
+  });
 }
 
 /**

@@ -44,6 +44,7 @@ import {
   reconcileMemberDevicesAdd,
   evictMemberDevices,
   listOwnDevices,
+  fetchActiveDevicesForDid,
 } from './mls-groups-api.js';
 import { diskKvCallbacks } from './mls-state-store.js';
 
@@ -88,6 +89,7 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
   const directoryDeps = {
     fetchPeerKeyPackages: deps.fetchPeerKeyPackages ?? fetchPeerKeyPackages,
     listOwnDevices: deps.listOwnDevices ?? listOwnDevices,
+    fetchActiveDevicesForDid: deps.fetchActiveDevicesForDid ?? fetchActiveDevicesForDid,
     fetchGroupMemberDevices: deps.fetchGroupMemberDevices ?? fetchGroupMemberDevices,
   };
   const transportDeps = {
@@ -102,15 +104,30 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
   const directory = {
     async peer_active_device_ids(argJson) {
       const { peer_did } = parseArg(argJson);
-      // The IdP returns one key package per device (per_device=true) —
-      // we already use this to enumerate the operator's live devices in
-      // reconcile-conversation.js. Map to device-ids only.
+      // A peer device is a valid reconcile target only if it is BOTH addable
+      // (has a published key package) AND eligible per the IdP's authoritative
+      // active set — GET /v1/trust/:did/devices, the SAME resolver
+      // (resolveDurableActiveDeviceIdsForDid) the reconcile endpoint gates on
+      // (group-device-membership-service.ts: eligibleDeviceIds). The IdP can
+      // still serve a stale key package for a revoked/rotated device; without
+      // this intersection that device is sent as a reconcile target and the IdP
+      // rejects the WHOLE batch DEVICE_NOT_ELIGIBLE, blocking the operator's
+      // live devices from converging. Intersecting is subtractive only — it
+      // never surfaces a device the key-package path didn't already.
       const { keyPackages } = await directoryDeps.fetchPeerKeyPackages({
         ...auth(),
         targetDid: peer_did,
         perDevice: true,
       });
-      const ids = keyPackages.map((kp) => kp.deviceId).filter(Boolean);
+      const kpIds = keyPackages.map((kp) => kp.deviceId).filter(Boolean);
+      const activeList = await directoryDeps.fetchActiveDevicesForDid({
+        ...auth(),
+        did: peer_did,
+      });
+      const activeSet = new Set(
+        activeList.filter((d) => d.active).map((d) => d.device_id),
+      );
+      const ids = kpIds.filter((id) => activeSet.has(id));
       return stringifyReturn(ids);
     },
 

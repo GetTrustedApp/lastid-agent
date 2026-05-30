@@ -142,7 +142,7 @@ test('disposeOrchestrator frees the handle + clears the cache (idempotent)', asy
 
 // ─── buildCallbackBundles: directory ───────────────────────────────────────
 
-test('directory.peer_active_device_ids returns the live device id list', async () => {
+test('directory.peer_active_device_ids returns key-package devices that are ALSO in the IdP active set', async () => {
   const ctx = makeCtx();
   const { directory } = buildCallbackBundles({
     ctx,
@@ -156,9 +156,18 @@ test('directory.peer_active_device_ids returns the live device id list', async (
           keyPackages: [
             { keyPackageB64: 'KP-A', ref: 'r1', deviceId: 'devA' },
             { keyPackageB64: 'KP-B', ref: 'r2', deviceId: 'devB' },
-            { keyPackageB64: 'KP-Z', ref: 'r3', deviceId: null }, // dropped
+            { keyPackageB64: 'KP-Z', ref: 'r3', deviceId: null }, // dropped (no id)
           ],
         };
+      },
+      async fetchActiveDevicesForDid({ did, agentDid }) {
+        // Gates on the SAME endpoint the IdP eligibility uses, for the peer.
+        assert.equal(did, ctx.operatorDid);
+        assert.equal(agentDid, ctx.agentDid);
+        return [
+          { device_id: 'devA', device_identity: 'devA', last_seen: null, active: true },
+          { device_id: 'devB', device_identity: 'devB', last_seen: null, active: true },
+        ];
       },
     },
   });
@@ -166,6 +175,61 @@ test('directory.peer_active_device_ids returns the live device id list', async (
     JSON.stringify({ peer_did: ctx.operatorDid }),
   );
   assert.deepEqual(JSON.parse(json), ['devA', 'devB']);
+});
+
+test('directory.peer_active_device_ids DROPS a revoked device whose stale key package the IdP still serves (DEVICE_NOT_ELIGIBLE guard)', async () => {
+  const ctx = makeCtx();
+  const { directory } = buildCallbackBundles({
+    ctx,
+    deps: {
+      async fetchPeerKeyPackages() {
+        return {
+          keyPackages: [
+            { keyPackageB64: 'KP-A', ref: 'r1', deviceId: 'devA' },
+            { keyPackageB64: 'KP-B', ref: 'r2', deviceId: 'devB' },
+            // Revoked/rotated device — its stale KP is still served, but it is
+            // NOT in the IdP active set, so it must not become a reconcile target.
+            { keyPackageB64: 'KP-OLD', ref: 'r3', deviceId: 'devRevoked' },
+          ],
+        };
+      },
+      async fetchActiveDevicesForDid() {
+        return [
+          { device_id: 'devA', device_identity: 'devA', last_seen: null, active: true },
+          { device_id: 'devB', device_identity: 'devB', last_seen: null, active: true },
+          // Endpoint reports the revoked device explicitly inactive.
+          { device_id: 'devRevoked', device_identity: 'devRevoked', last_seen: null, active: false },
+        ];
+      },
+    },
+  });
+  const json = await directory.peer_active_device_ids(
+    JSON.stringify({ peer_did: ctx.operatorDid }),
+  );
+  assert.deepEqual(JSON.parse(json), ['devA', 'devB']);
+});
+
+test('directory.peer_active_device_ids is subtractive: an active device with NO key package is not surfaced', async () => {
+  const ctx = makeCtx();
+  const { directory } = buildCallbackBundles({
+    ctx,
+    deps: {
+      async fetchPeerKeyPackages() {
+        return { keyPackages: [{ keyPackageB64: 'KP-A', ref: 'r1', deviceId: 'devA' }] };
+      },
+      async fetchActiveDevicesForDid() {
+        return [
+          { device_id: 'devA', device_identity: 'devA', last_seen: null, active: true },
+          // Active per the IdP but no KP yet — not addable, so not surfaced.
+          { device_id: 'devC', device_identity: 'devC', last_seen: null, active: true },
+        ];
+      },
+    },
+  });
+  const json = await directory.peer_active_device_ids(
+    JSON.stringify({ peer_did: ctx.operatorDid }),
+  );
+  assert.deepEqual(JSON.parse(json), ['devA']);
 });
 
 test('directory.fetch_peer_key_packages filters by requested device_ids', async () => {
