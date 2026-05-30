@@ -1,0 +1,95 @@
+/**
+ * Sticky notes — the file-anchored working/RAM memory layer (v1).
+ * See docs/sticky-notes-spec.md + mem_01KSX20E.
+ *
+ * Phase 1 (store layer): the new `sticky` kind, its repo-relative `anchor`,
+ * the JIT path lookup the Read hook uses, and the invariant that sticky notes
+ * are EXCLUDED from semantic recall (they surface only via the anchor).
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { MemoryStore } from '../lib/memory-store.js';
+import { searchMemories } from '../lib/memory-tools.js';
+
+function freshStore() {
+  return new MemoryStore('test', join(tmpdir(), `sticky-${randomUUID()}.json`), {
+    agentDid: 'did:lastid:agent:zTest',
+    parentHumanDid: 'did:lastid:zOperator',
+  });
+}
+
+const REPO = 'github.com/GetTrustedApp/lastid-agent';
+const REL = 'plugins/lastid-agent/lib/memory-store.js';
+
+function stickyInput(overrides = {}) {
+  return {
+    kind: 'sticky',
+    tier: 'agent',
+    source_kind: 'inferred',
+    subject: ['sticky'],
+    claim: 'left off at the KP purge; next: live reconcile',
+    anchor: { repo_key: REPO, rel_path: REL },
+    ...overrides,
+  };
+}
+
+test('sticky note stores its repo-relative anchor (not an absolute path)', () => {
+  const s = freshStore();
+  const m = s.write(stickyInput());
+  assert.equal(m.kind, 'sticky');
+  assert.deepEqual(m.anchor, { repo_key: REPO, rel_path: REL });
+});
+
+test('stickyNotesForAnchor returns OPEN notes for the matching path, newest first', () => {
+  const s = freshStore();
+  const a = s.write(stickyInput({ claim: 'older note' }));
+  const b = s.write(stickyInput({ claim: 'newer note' }));
+  const hits = s.stickyNotesForAnchor(REPO, REL);
+  assert.equal(hits.length, 2);
+  assert.equal(hits[0].id, b.id); // newest first (v1 stickiness = recency)
+  assert.equal(hits[1].id, a.id);
+});
+
+test('stickyNotesForAnchor: repo_key matches when both carry one; mismatch excluded; rel_path must match', () => {
+  const s = freshStore();
+  s.write(stickyInput());
+  // Different repo (both carry a key) → excluded.
+  assert.equal(s.stickyNotesForAnchor('github.com/other/repo', REL).length, 0);
+  // Missing repo_key on the query side is permissive → still matches.
+  assert.equal(s.stickyNotesForAnchor(null, REL).length, 1);
+  // Different file → none.
+  assert.equal(s.stickyNotesForAnchor(REPO, 'plugins/lastid-agent/lib/other.js').length, 0);
+});
+
+test('resolving (forget) a sticky note rips it up — no longer surfaced', () => {
+  const s = freshStore();
+  const m = s.write(stickyInput());
+  assert.equal(s.stickyNotesForAnchor(REPO, REL).length, 1);
+  s.forget(m.id); // "rip up" — soft-forget flips status off active
+  assert.equal(s.stickyNotesForAnchor(REPO, REL).length, 0);
+});
+
+test('a NON-sticky memory carrying the same path is NOT surfaced by stickyNotesForAnchor', () => {
+  const s = freshStore();
+  s.write({ ...stickyInput(), kind: 'fact' });
+  assert.equal(s.stickyNotesForAnchor(REPO, REL).length, 0);
+});
+
+test('sticky notes are EXCLUDED from semantic recall (searchMemories), facts are not', async () => {
+  const s = freshStore();
+  const sticky = s.write(stickyInput({ claim: 'reconcile KP purge eligibility note' }));
+  const fact = s.write({
+    kind: 'fact',
+    tier: 'agent',
+    source_kind: 'inferred',
+    subject: ['reconcile'],
+    claim: 'reconcile KP purge eligibility fact',
+  });
+  const hits = await searchMemories(s, 'reconcile KP purge eligibility', { limit: 8 });
+  const ids = hits.map((h) => h.memory_id);
+  assert.ok(!ids.includes(sticky.id), 'the sticky note is NOT in semantic results');
+  assert.ok(ids.includes(fact.id), 'the fact IS recalled');
+});

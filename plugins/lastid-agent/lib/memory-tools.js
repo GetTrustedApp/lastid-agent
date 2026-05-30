@@ -27,7 +27,7 @@ const CAP_WRITE = { resource: 'memory:write:global', action: 'Write' };
 const CAP_DRAFT = { resource: 'memory:draft:global', action: 'Draft' };
 const CAP_READ = { resource: 'memory:read:global', action: 'Read' };
 
-const KIND_ENUM = ['fact', 'preference', 'decision', 'open_loop', 'episodic', 'artifact', 'rule'];
+const KIND_ENUM = ['fact', 'preference', 'decision', 'open_loop', 'episodic', 'artifact', 'rule', 'sticky'];
 const SENS_ENUM = ['low', 'medium', 'high', 'restricted'];
 const SOURCE_ENUM = ['user_explicit', 'inferred', 'tool_observation', 'imported'];
 
@@ -219,6 +219,10 @@ export async function searchMemories(store, query, { limit = 8, excludeBedrock =
     // repo's project drafts (usableDrafts scopes them). The hit carries
     // `draft: true` so the renderer marks it — usable, but lower-trust.
     if (includeDrafts) c = c.concat(store.usableDrafts(projectKey));
+    // Sticky notes are the working/RAM layer — surfaced ONLY by the Read hook
+    // for the file they anchor, NEVER by semantic recall (they'd be noise and
+    // would pollute topical ranking). Always excluded here.
+    c = c.filter((m) => m.kind !== 'sticky');
     if (excludeBedrock) c = c.filter((m) => m.bedrock !== true);
     // Project-tier memories are eligible for topical ranking ONLY when the
     // agent is working in their repo (project_key === the active projectKey);

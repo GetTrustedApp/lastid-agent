@@ -42,6 +42,11 @@ export const MEMORY_KINDS = [
   'episodic',
   'artifact',
   'rule',
+  // Working/RAM layer: a file-anchored, JIT-surfaced working note (see
+  // docs/sticky-notes-spec.md). Path-keyed via `anchor`; surfaced ONLY when the
+  // agent touches that file (Read hook), EXCLUDED from semantic recall;
+  // resolve-or-rip lifecycle (fix / not-relevant), persists across sessions.
+  'sticky',
 ];
 // 'project' = shared across all the operator's agents, scoped to one git
 // remote (project_key); injected only when an agent is working in that repo.
@@ -73,6 +78,7 @@ const DECAY_BY_KIND = {
   decision: 'slow',
   open_loop: 'medium',
   episodic: 'medium',
+  sticky: 'medium',
 };
 
 const CLAIM_MAX = 4000;
@@ -255,6 +261,21 @@ export class MemoryStore {
       related: Array.isArray(input.related) ? input.related : [],
       ...(input.references && typeof input.references === 'object'
         ? { references: input.references }
+        : {}),
+      // Sticky-note file anchor: { repo_key, rel_path } — repo-RELATIVE so it is
+      // portable to console (NOT this machine's absolute path). Surfaced by the
+      // Read hook via stickyNotesForAnchor; ignored for non-sticky kinds.
+      ...(input.anchor &&
+      typeof input.anchor === 'object' &&
+      typeof input.anchor.rel_path === 'string' &&
+      input.anchor.rel_path.length > 0
+        ? {
+            anchor: {
+              repo_key:
+                typeof input.anchor.repo_key === 'string' ? input.anchor.repo_key : null,
+              rel_path: input.anchor.rel_path,
+            },
+          }
         : {}),
       embedding: null,
       embedding_model_version: null,
@@ -508,6 +529,30 @@ export class MemoryStore {
         !isExpired(m, nowMs) &&
         (m.tier === 'agent' || (m.tier === 'project' && m.project_key === projectKey)),
     );
+  }
+
+  /**
+   * Open (active) sticky notes anchored to a file — the JIT lookup the Read
+   * hook uses to surface "context when your hands need it". Matches the
+   * repo-relative anchor: same `rel_path`, and same `repo_key` when BOTH sides
+   * carry one (a null repo_key on either side matches loosely, so a note
+   * survives an unresolved repo). Newest first — the v1 stickiness proxy
+   * (recency; a surface_count fold-in comes with the hook). Excludes expired +
+   * resolved (status !== 'active', e.g. forgotten = "ripped up").
+   */
+  stickyNotesForAnchor(repoKey, relPath, nowMs = Date.now()) {
+    if (typeof relPath !== 'string' || relPath.length === 0) return [];
+    const ts = (m) => Date.parse(m.updated_at ?? m.created_at ?? '') || 0;
+    return this.activeMemories(nowMs)
+      .filter(
+        (m) =>
+          m.kind === 'sticky' &&
+          m.anchor &&
+          m.anchor.rel_path === relPath &&
+          // repo_key matches when both carry one; missing on either side is permissive.
+          !(m.anchor.repo_key && repoKey && m.anchor.repo_key !== repoKey),
+      )
+      .sort((x, y) => ts(y) - ts(x));
   }
 
   /**
