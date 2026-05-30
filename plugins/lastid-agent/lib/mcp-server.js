@@ -58,17 +58,36 @@ const PLUGIN_TOOLS = [
   {
     name: 'lastid_send_message',
     description:
-      'Send a message to the human you work with (your operator). The message is end-to-end encrypted and shows up in their LastID chat — console dock and phone. Just provide the text; you do not need to know anything about groups or keys. Returns once the message is queued for delivery.',
+      "Send a message to the human you work with (your operator). The message is end-to-end encrypted and shows up in their LastID chat — console dock and phone. Two modes:\n• Short replies (≤1000 chars, no formatting needed): pass `text`. Use this for almost everything — acks, quick updates, one-paragraph answers.\n• Long-form answers (analysis, code, lists, tables, anything past ~3 sentences): pass `markdown: {tldr, body}` instead. `tldr` is a single-line plain-text caption ≤140 chars that stands alone — it's what the operator sees in the bubble list before they tap to read more. `body` is CommonMark; renders in a full-screen sheet on tap. If you don't supply a tldr the message is rejected — don't make the operator scroll through a wall of unformatted text in the chat list to find what you meant.\nYou don't need to know anything about groups or keys. Returns once the message is queued for delivery.",
     requiredCapability: { resource: 'message:send', action: 'Send' },
     inputSchema: {
       type: 'object',
       properties: {
         text: {
           type: 'string',
-          description: 'What you want to say to your operator.',
+          description:
+            'Short plain-text reply. Use for ≤1000-char messages. Exclusive with `markdown`.',
+        },
+        markdown: {
+          type: 'object',
+          description:
+            'Long-form reply with a plain-text caption (tldr) and a CommonMark body. Use for answers past ~3 sentences or with code/lists/tables. Exclusive with `text`.',
+          properties: {
+            tldr: {
+              type: 'string',
+              description:
+                'Single-line plain-text caption shown in the bubble list. Must stand alone. ≤140 chars after trim. No markdown syntax here.',
+            },
+            body: {
+              type: 'string',
+              description:
+                'CommonMark body shown in the expand sheet when the operator taps "Read more".',
+            },
+          },
+          required: ['tldr', 'body'],
+          additionalProperties: false,
         },
       },
-      required: ['text'],
       additionalProperties: false,
     },
   },
@@ -378,9 +397,53 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
 
   if (name === 'lastid_send_message') {
     const text = typeof _args?.text === 'string' ? _args.text : '';
-    if (!text) {
-      throw new Error('lastid_send_message requires text');
+    const markdown =
+      _args?.markdown && typeof _args.markdown === 'object' ? _args.markdown : null;
+    if (text && markdown) {
+      throw new Error(
+        'lastid_send_message: pass either `text` or `markdown`, not both — pick one mode per call',
+      );
     }
+    if (!text && !markdown) {
+      throw new Error(
+        'lastid_send_message: pass either `text` (short reply) or `markdown: {tldr, body}` (long reply)',
+      );
+    }
+    const {
+      PLAIN_TEXT_SOFT_CAP_CHARS,
+      MARKDOWN_TLDR_MAX_CHARS,
+      enqueueSend,
+      enqueueMarkdownSend,
+    } = await import('./agent-send.js');
+    if (text && text.length > PLAIN_TEXT_SOFT_CAP_CHARS) {
+      throw new Error(
+        `lastid_send_message: text is ${text.length} chars, max ${PLAIN_TEXT_SOFT_CAP_CHARS}. Use \`markdown: {tldr, body}\` for longer answers so the operator gets a scannable caption (tldr ≤${MARKDOWN_TLDR_MAX_CHARS} chars) and the full body in an expandable sheet, instead of a wall of unformatted text in the bubble list.`,
+      );
+    }
+    if (markdown) {
+      const tldrRaw = typeof markdown.tldr === 'string' ? markdown.tldr : '';
+      const bodyRaw = typeof markdown.body === 'string' ? markdown.body : '';
+      const tldrTrimmed = tldrRaw.trim();
+      if (tldrTrimmed.length === 0) {
+        throw new Error(
+          'lastid_send_message: markdown.tldr is empty — provide a single-line plain-text caption that stands alone (the operator only sees the tldr in the bubble list before tapping to expand)',
+        );
+      }
+      if (/[\r\n]/.test(tldrTrimmed)) {
+        throw new Error(
+          'lastid_send_message: markdown.tldr must be a single line — newlines belong in `body`',
+        );
+      }
+      if (tldrTrimmed.length > MARKDOWN_TLDR_MAX_CHARS) {
+        throw new Error(
+          `lastid_send_message: markdown.tldr is ${tldrTrimmed.length} chars, max ${MARKDOWN_TLDR_MAX_CHARS}. Shorten it — the tldr is the only thing the operator sees in the bubble list.`,
+        );
+      }
+      if (bodyRaw.length === 0) {
+        throw new Error('lastid_send_message: markdown.body is empty');
+      }
+    }
+
     // Redact secret-shaped content before the message leaves the agent. The
     // operator's chat is end-to-end synced to all their devices, so a raw API
     // key / token the agent emitted must never ride along. This runs
@@ -388,7 +451,21 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
     // applies; it reuses the shared redactSecrets scrubber — the same patterns
     // as the audit + bug-report redaction.
     const { redactSecrets } = await import('./bug-report.js');
-    const { text: safeText, count: redactedCount } = redactSecrets(text);
+    let safeText = '';
+    let safeTldr = '';
+    let safeBody = '';
+    let redactedCount = 0;
+    if (text) {
+      const r = redactSecrets(text);
+      safeText = r.text;
+      redactedCount = r.count;
+    } else {
+      const tldrR = redactSecrets(markdown.tldr.trim());
+      const bodyR = redactSecrets(markdown.body);
+      safeTldr = tldrR.text;
+      safeBody = bodyR.text;
+      redactedCount = tldrR.count + bodyR.count;
+    }
     // Resolve the operator (the agent's parent human) from the VC.
     // The LLM never sees a DID or a group id — it just says text.
     // (loadedAgent + message:send already verified by the gate above.)
@@ -397,14 +474,20 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
       throw new Error('agent VC has no parent_human_did — cannot resolve operator');
     }
     const { resolveActiveGroupForOperator } = await import('./agent-groups.js');
-    const { enqueueSend } = await import('./agent-send.js');
     // No throw when there's no group: enqueue regardless. The listener
     // (single MLS-state writer) self-heals on drain — if no conversation
     // exists it creates one and invites the operator's devices, then
     // delivers this message. Enqueue keyed by operator DID so the drain
     // resolves the live group at send time.
     const group = await resolveActiveGroupForOperator({ scope, operatorDid });
-    const id = await enqueueSend({ scope, operatorDid, text: safeText });
+    const id = text
+      ? await enqueueSend({ scope, operatorDid, text: safeText })
+      : await enqueueMarkdownSend({
+          scope,
+          operatorDid,
+          tldr: safeTldr,
+          body: safeBody,
+        });
     const note = group
       ? 'Encrypted + delivered by your listener within a couple seconds. The operator sees it in their console chat and on their phone.'
       : "No conversation exists yet — your listener will establish one with the operator's devices, then deliver this. (If the listener isn't running, the message waits in the outbox until it is.)";

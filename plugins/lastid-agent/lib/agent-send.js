@@ -85,6 +85,48 @@ export async function enqueueSend({ scope, operatorDid, text }) {
 }
 
 /**
+ * Producer-side caps shared with lastid-core::types::mls. Keep in sync.
+ * - PLAIN_TEXT_SOFT_CAP_CHARS: when the agent tries to send `text` longer
+ *   than this, the tool rejects with a hint to switch to markdown mode so
+ *   the recipient gets a scannable tldr + an expandable body instead of a
+ *   wall of unstructured text in the bubble list.
+ * - MARKDOWN_TLDR_MAX_CHARS: the trimmed tldr must fit on one short line in
+ *   the bubble list; longer captions get visually crowded.
+ */
+export const PLAIN_TEXT_SOFT_CAP_CHARS = 1000;
+export const MARKDOWN_TLDR_MAX_CHARS = 140;
+
+/**
+ * Append a MARKDOWN send request to the outbox. The drain builds the
+ * lastid-core MessageEnvelope ({ v:1, t:'markdown', p:JSON({tldr,body}) }) and
+ * encrypts it through the same MLS path as text messages, so receivers (mobile
+ * + console) render the tldr inline with a Read-more affordance.
+ */
+export async function enqueueMarkdownSend({ scope, operatorDid, tldr, body }) {
+  if (!operatorDid || typeof operatorDid !== 'string') {
+    throw new Error('enqueueMarkdownSend: operatorDid required');
+  }
+  if (typeof tldr !== 'string' || tldr.trim().length === 0) {
+    throw new Error('enqueueMarkdownSend: tldr required');
+  }
+  if (typeof body !== 'string' || body.length === 0) {
+    throw new Error('enqueueMarkdownSend: body required');
+  }
+  const req = {
+    id: newId(),
+    kind: 'markdown',
+    operator_did: operatorDid,
+    tldr: tldr.trim(),
+    body,
+    enqueued_at: new Date().toISOString(),
+  };
+  const path = outboxPath(scope);
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(req)}\n`, { flag: 'a' });
+  return req.id;
+}
+
+/**
  * Append a REACTION request to the outbox. Like enqueueSend, safe from any
  * process — it never touches MLS state (a reaction is a plaintext control
  * frame, not an encrypted message). The listener drains it, resolves the
@@ -247,11 +289,22 @@ async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, sig
   // ({ v, t, p }), the SAME shape native (mls_send_group_message) encrypts. This
   // is what every LastID client renders as a chat bubble and what read-receipts
   // / reactions key off (content_type `t`). No custom envelope.
-  const envelope = {
-    v: 1,
-    t: 'text',
-    p: req.text,
-  };
+  let envelope;
+  let messageType;
+  if (req.kind === 'markdown') {
+    // {tldr, body} mirrors lastid-core::types::mls::MarkdownPayload — the
+    // mobile + console bubbles parse this JSON out of `p` to render the
+    // tldr inline and the body in the expand sheet.
+    envelope = {
+      v: 1,
+      t: 'markdown',
+      p: JSON.stringify({ tldr: req.tldr, body: req.body }),
+    };
+    messageType = 'markdown';
+  } else {
+    envelope = { v: 1, t: 'text', p: req.text };
+    messageType = 'text';
+  }
   const envelopeB64 = textToB64(JSON.stringify(envelope));
   const mlsMessage = await mls.encryptApplicationMessage(groupIdB64, envelopeB64);
   // encryptApplicationMessage auto-flushes through the storage-provider
@@ -269,7 +322,7 @@ async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, sig
       mls_message: mlsMessage,
       epoch: Number.isFinite(epoch) ? epoch : 0,
       sender_did: agentDid,
-      message_type: 'text',
+      message_type: messageType,
       message_id: req.id,
     },
   });
