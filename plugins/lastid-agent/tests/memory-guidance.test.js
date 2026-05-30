@@ -70,6 +70,27 @@ test('makes drafting the reflex for inferred durable facts', () => {
   assert.match(t, /every time/);
 });
 
+test('makes CURATION (search → update → forget) a reflex, not just collection', () => {
+  const t = text();
+  assert.match(t, /CURATE, don't collect/);
+  // Names the curation tools the agent must use, not just write/draft.
+  assert.match(t, /lastid_memory_search/);
+  assert.match(t, /lastid_memory_update/);
+  assert.match(t, /lastid_memory_forget/);
+  // Search-before-write, and edit the canonical memory rather than duplicate it.
+  assert.match(t, /BEFORE every write\/draft/);
+  assert.match(t, /do NOT write a parallel near-duplicate/);
+  // Fix-or-forget a now-stale memory in the SAME turn (the reported failure mode).
+  assert.match(t, /now wrong or\s+stale/);
+  assert.match(t, /SAME\s+turn/);
+});
+
+test('forbids storing transient task state as durable memory', () => {
+  const t = text();
+  assert.match(t, /NEVER store transient TASK STATE/);
+  assert.match(t, /stable fact\/decision\/rule/);
+});
+
 test('nudges ToolSearch to close the tool-loading friction gap', () => {
   const t = text();
   assert.match(t, /ToolSearch/);
