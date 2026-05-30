@@ -707,6 +707,22 @@ export function sdkSignup(password: string, use_biometrics: boolean, persona_jso
 export function sdkUpsertConversation(conversation_id: string, record_json: string): Promise<void>;
 
 /**
+ * Apply one inbound `sync.vault_changed` frame using the shared
+ * `sync_core::subscribe::apply_and_advance`. `frame_cursor` is the
+ * plaintext `payload.cursor` field the IdP attaches to each relayed
+ * frame (and to each replay frame from a `sync.vault_subscribe`).
+ * `event_action` is the transport-level action (fallback when the
+ * decrypted payload's `action` is empty).
+ *
+ * Side effect: advances `read_cursor` in IndexedDB monotonically
+ * (only when `frame_cursor` exceeds the persisted value, per the
+ * `apply_and_advance` contract). Self-origin + local-wins skips still
+ * advance the cursor — the IdP allocated a slot for them and
+ * re-replay must not loop.
+ */
+export function sdkVaultApplyInbound(transport_b64: string, frame_cursor: bigint, event_action: string): Promise<any>;
+
+/**
  * Apply one inbound `sync.vault_changed` frame: decrypt the transport
  * envelope with the vault transport key, then run the SHARED
  * `apply_vault_sync_to_storage` (deterministic conflict resolution).
@@ -764,6 +780,15 @@ export function sdkVaultGetItem(item_id: string): Promise<string | undefined>;
 export function sdkVaultListEntries(): Promise<string>;
 
 /**
+ * Persist `write_cursor = WRITE_CURSOR_SENTINEL` so the next
+ * `sdkVaultSyncStart` skips the first-publish backlog. JS calls this
+ * AFTER every frame from `first_publish_frames` lands on the WS —
+ * not before, or a WS-failure partial-publish would still be marked
+ * "done" and the un-shipped items would never reach the IdP.
+ */
+export function sdkVaultMarkFirstPublishComplete(): Promise<void>;
+
+/**
  * Record a failed delivery attempt (increments attempts, stores the
  * error). The entry stays in the outbox for retry.
  */
@@ -798,9 +823,32 @@ export function sdkVaultSyncDecrypt(enc_b64: string): Promise<Uint8Array>;
  * returned base64 over the `sync.vault_changed` WebSocket event so the
  * operator's other devices converge — vault items are NOT stored server-side,
  * they transit this envelope. Byte-compatible with
- * `lastid-runtime::sync::encrypt_vault_sync_payload`.
+ * `lastid_vault::sync_core::transport::encrypt_for_transport`.
  */
 export function sdkVaultSyncEncrypt(payload: Uint8Array): Promise<string>;
+
+/**
+ * Cursor-protocol "on connect" entry point.
+ *
+ * Reads persisted `read_cursor` + `write_cursor` from IndexedDB
+ * internally. The return tells JS what to put on the wire:
+ *
+ *   - `subscribe_frame` (always): send as `sync.vault_subscribe`. The
+ *     IdP replies with one `sync.vault_changed` per mutation whose
+ *     `cursor > since`, ordered ASC; JS routes each into
+ *     `sdkVaultApplyInbound`.
+ *   - `first_publish_frames` (only when `write_cursor.is_none()`):
+ *     for each, send as `sync.vault_changed`. After all succeed, call
+ *     `sdkVaultMarkFirstPublishComplete` to persist `write_cursor`.
+ *     The IdP's `(item_id, revision)` dedup makes a partial-failure
+ *     retry safe — don't call MarkComplete on failure and this
+ *     function re-emits the same backlog next reconnect.
+ *
+ * The vault_kek + vault_transport_key derive in-wasm from the
+ * unsealed bundle and zeroize before returning; neither crosses into
+ * JS. Operator-only — agents must never call this binding.
+ */
+export function sdkVaultSyncStart(): Promise<any>;
 
 /**
  * Sign an arbitrary payload with an Ed25519 signing key. Returns the

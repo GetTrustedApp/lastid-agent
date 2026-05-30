@@ -1540,6 +1540,34 @@ function sdkUpsertConversation(conversation_id, record_json) {
 exports.sdkUpsertConversation = sdkUpsertConversation;
 
 /**
+ * Apply one inbound `sync.vault_changed` frame using the shared
+ * `sync_core::subscribe::apply_and_advance`. `frame_cursor` is the
+ * plaintext `payload.cursor` field the IdP attaches to each relayed
+ * frame (and to each replay frame from a `sync.vault_subscribe`).
+ * `event_action` is the transport-level action (fallback when the
+ * decrypted payload's `action` is empty).
+ *
+ * Side effect: advances `read_cursor` in IndexedDB monotonically
+ * (only when `frame_cursor` exceeds the persisted value, per the
+ * `apply_and_advance` contract). Self-origin + local-wins skips still
+ * advance the cursor — the IdP allocated a slot for them and
+ * re-replay must not loop.
+ * @param {string} transport_b64
+ * @param {bigint} frame_cursor
+ * @param {string} event_action
+ * @returns {Promise<any>}
+ */
+function sdkVaultApplyInbound(transport_b64, frame_cursor, event_action) {
+    const ptr0 = passStringToWasm0(transport_b64, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(event_action, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.sdkVaultApplyInbound(ptr0, len0, frame_cursor, ptr1, len1);
+    return ret;
+}
+exports.sdkVaultApplyInbound = sdkVaultApplyInbound;
+
+/**
  * Apply one inbound `sync.vault_changed` frame: decrypt the transport
  * envelope with the vault transport key, then run the SHARED
  * `apply_vault_sync_to_storage` (deterministic conflict resolution).
@@ -1649,6 +1677,20 @@ function sdkVaultListEntries() {
 exports.sdkVaultListEntries = sdkVaultListEntries;
 
 /**
+ * Persist `write_cursor = WRITE_CURSOR_SENTINEL` so the next
+ * `sdkVaultSyncStart` skips the first-publish backlog. JS calls this
+ * AFTER every frame from `first_publish_frames` lands on the WS —
+ * not before, or a WS-failure partial-publish would still be marked
+ * "done" and the un-shipped items would never reach the IdP.
+ * @returns {Promise<void>}
+ */
+function sdkVaultMarkFirstPublishComplete() {
+    const ret = wasm.sdkVaultMarkFirstPublishComplete();
+    return ret;
+}
+exports.sdkVaultMarkFirstPublishComplete = sdkVaultMarkFirstPublishComplete;
+
+/**
  * Record a failed delivery attempt (increments attempts, stores the
  * error). The entry stays in the outbox for retry.
  * @param {string} outbox_id
@@ -1718,7 +1760,7 @@ exports.sdkVaultSyncDecrypt = sdkVaultSyncDecrypt;
  * returned base64 over the `sync.vault_changed` WebSocket event so the
  * operator's other devices converge — vault items are NOT stored server-side,
  * they transit this envelope. Byte-compatible with
- * `lastid-runtime::sync::encrypt_vault_sync_payload`.
+ * `lastid_vault::sync_core::transport::encrypt_for_transport`.
  * @param {Uint8Array} payload
  * @returns {Promise<string>}
  */
@@ -1729,6 +1771,34 @@ function sdkVaultSyncEncrypt(payload) {
     return ret;
 }
 exports.sdkVaultSyncEncrypt = sdkVaultSyncEncrypt;
+
+/**
+ * Cursor-protocol "on connect" entry point.
+ *
+ * Reads persisted `read_cursor` + `write_cursor` from IndexedDB
+ * internally. The return tells JS what to put on the wire:
+ *
+ *   - `subscribe_frame` (always): send as `sync.vault_subscribe`. The
+ *     IdP replies with one `sync.vault_changed` per mutation whose
+ *     `cursor > since`, ordered ASC; JS routes each into
+ *     `sdkVaultApplyInbound`.
+ *   - `first_publish_frames` (only when `write_cursor.is_none()`):
+ *     for each, send as `sync.vault_changed`. After all succeed, call
+ *     `sdkVaultMarkFirstPublishComplete` to persist `write_cursor`.
+ *     The IdP's `(item_id, revision)` dedup makes a partial-failure
+ *     retry safe — don't call MarkComplete on failure and this
+ *     function re-emits the same backlog next reconnect.
+ *
+ * The vault_kek + vault_transport_key derive in-wasm from the
+ * unsealed bundle and zeroize before returning; neither crosses into
+ * JS. Operator-only — agents must never call this binding.
+ * @returns {Promise<any>}
+ */
+function sdkVaultSyncStart() {
+    const ret = wasm.sdkVaultSyncStart();
+    return ret;
+}
+exports.sdkVaultSyncStart = sdkVaultSyncStart;
 
 /**
  * Sign an arbitrary payload with an Ed25519 signing key. Returns the
@@ -2819,27 +2889,27 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1530, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1652, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h07eda6f9933457e4);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 1112, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 1234, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h1725375cb213b3e4);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 1043, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("IDBVersionChangeEvent")], shim_idx: 1165, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h0863b872d6f8b8ab);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1200, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1322, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3c6c61154a9359bf);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 601, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 637, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h23499dd81690a033);
             return ret;
         },
