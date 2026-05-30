@@ -239,10 +239,12 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
 
     async submit_member_add(argJson) {
       const { group_id, member_did, commit } = parseArg(argJson);
-      // commit on this surface is the wire-shape {welcome,commit} pair the
-      // orchestrator hands us; addGroupMember takes them split.
-      const mlsWelcomeB64 = commit?.welcome_b64 ?? commit?.welcome ?? null;
-      const mlsCommitB64 = commit?.commit_b64 ?? commit?.commit ?? null;
+      // commit is the wasm PreparedAddCommit (lastid-mls-core dto): its blobs
+      // serialize as mls_commit / mls_welcome. Read THOSE — the old
+      // commit_b64/welcome_b64 names never existed on the wire, so they
+      // resolved to null and the IdP rejected the add. (Console reads the same.)
+      const mlsWelcomeB64 = commit?.mls_welcome ?? null;
+      const mlsCommitB64 = commit?.mls_commit ?? null;
       await transportDeps.addGroupMember({
         ...auth(),
         groupId: group_id,
@@ -258,9 +260,9 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
 
     async submit_member_device_reconcile(argJson) {
       const { group_id, member_did, target_device_ids, commit } = parseArg(argJson);
-      const mlsCommitB64 = commit?.commit_b64 ?? commit?.commit ?? null;
-      const mlsWelcomeB64 = commit?.welcome_b64 ?? commit?.welcome ?? null;
-      const newEpoch = commit?.new_epoch ?? commit?.epoch ?? 0;
+      const mlsCommitB64 = commit?.mls_commit ?? null;
+      const mlsWelcomeB64 = commit?.mls_welcome ?? null;
+      const newEpoch = commit?.new_epoch ?? 0;
       await transportDeps.reconcileMemberDevicesAdd({
         ...auth(),
         groupId: group_id,
@@ -274,8 +276,8 @@ export function buildCallbackBundles({ ctx, deps = {} }) {
 
     async submit_member_device_evict(argJson) {
       const { group_id, member_did, target_device_ids, commit, reason } = parseArg(argJson);
-      const mlsCommitB64 = commit?.commit_b64 ?? commit?.commit ?? null;
-      const newEpoch = commit?.new_epoch ?? commit?.epoch ?? 0;
+      const mlsCommitB64 = commit?.mls_commit ?? null;
+      const newEpoch = commit?.new_epoch ?? 0;
       await transportDeps.evictMemberDevices({
         ...auth(),
         groupId: group_id,

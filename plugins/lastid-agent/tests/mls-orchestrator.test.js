@@ -343,17 +343,32 @@ test('transport.submit_member_add splits the commit envelope into welcome/commit
       },
     },
   });
+  // The wasm hands us a PreparedAddCommit (lastid-mls-core dto): the blobs
+  // serialize as mls_commit / mls_welcome. Forward exactly those.
   await transport.submit_member_add(
     JSON.stringify({
       group_id: 'idp-1',
       member_did: ctx.operatorDid,
-      commit: { commit_b64: 'C1', welcome_b64: 'W1', new_epoch: 1 },
+      commit: { mls_commit: 'C1', mls_welcome: 'W1', new_epoch: 1 },
     }),
   );
   assert.equal(addArgs.groupId, 'idp-1');
   assert.equal(addArgs.inviteeDid, ctx.operatorDid);
   assert.equal(addArgs.mlsWelcomeB64, 'W1');
   assert.equal(addArgs.mlsCommitB64, 'C1');
+
+  // Regression guard: the OLD commit_b64/welcome_b64 names never existed on the
+  // wire — reading them sent null blobs and the IdP rejected the add. A commit
+  // carrying ONLY the stale names must forward null (we read mls_*, not those).
+  await transport.submit_member_add(
+    JSON.stringify({
+      group_id: 'idp-1',
+      member_did: ctx.operatorDid,
+      commit: { commit_b64: 'STALE_C', welcome_b64: 'STALE_W', new_epoch: 1 },
+    }),
+  );
+  assert.equal(addArgs.mlsWelcomeB64, null);
+  assert.equal(addArgs.mlsCommitB64, null);
 });
 
 test('transport.submit_member_device_reconcile sets expected_epoch = new_epoch - 1', async () => {
@@ -372,7 +387,7 @@ test('transport.submit_member_device_reconcile sets expected_epoch = new_epoch -
       group_id: 'idp-1',
       member_did: ctx.operatorDid,
       target_device_ids: ['devB'],
-      commit: { commit_b64: 'AC', welcome_b64: 'AW', new_epoch: 3 },
+      commit: { mls_commit: 'AC', mls_welcome: 'AW', new_epoch: 3 },
     }),
   );
   assert.equal(recArgs.groupId, 'idp-1');
@@ -398,7 +413,7 @@ test('transport.submit_member_device_evict passes reason through', async () => {
       group_id: 'idp-1',
       member_did: ctx.operatorDid,
       target_device_ids: ['devB'],
-      commit: { commit_b64: 'RC', new_epoch: 5 },
+      commit: { mls_commit: 'RC', new_epoch: 5 },
       reason: 'operator_requested',
     }),
   );
