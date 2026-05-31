@@ -152,6 +152,20 @@ export function escalateSensitivity(caller, ...texts) {
   return SENSITIVITY_RANK[floor] > SENSITIVITY_RANK[base] ? floor : base;
 }
 
+/**
+ * Strip a tool-call framing leak from a claim. A malformed memory write can
+ * append the param's OWN close tag (`</claim>`) and/or a following
+ * `<parameter name="…">…` block into the claim VALUE — those are tool-call XML
+ * tokens, never legitimate memory prose, so the real claim ends at the first
+ * one. Cut there. (This is why some older memories render with a stray
+ * `…every session.</claim> <parameter name="source_kind">conversation` tail.)
+ */
+function sanitizeClaim(raw) {
+  if (typeof raw !== 'string') return '';
+  const m = raw.match(/<\/claim>|<parameter\s+name=/i);
+  return (m && m.index !== undefined ? raw.slice(0, m.index) : raw).trim();
+}
+
 function validateWriteInput(input) {
   const errs = [];
   const kind = input.kind;
@@ -172,7 +186,7 @@ function validateWriteInput(input) {
     ? input.subject.filter((s) => typeof s === 'string' && s.trim().length > 0)
     : [];
   if (subject.length === 0) errs.push('subject must be a non-empty array of strings');
-  const claim = typeof input.claim === 'string' ? input.claim.trim() : '';
+  const claim = sanitizeClaim(input.claim);
   if (!claim) errs.push('claim is required');
   if (claim.length > CLAIM_MAX) errs.push(`claim exceeds ${CLAIM_MAX} chars`);
   // Optional summary — clamp (never reject): the claim is the real content.
@@ -399,7 +413,7 @@ export class MemoryStore {
     if (!m) return null;
     let embeddingDirty = false;
     if (typeof patch.claim === 'string') {
-      const c = patch.claim.trim();
+      const c = sanitizeClaim(patch.claim);
       if (!c) throw Object.assign(new Error('claim cannot be empty'), { code: 'EVALIDATION' });
       if (c.length > CLAIM_MAX) throw Object.assign(new Error(`claim exceeds ${CLAIM_MAX}`), { code: 'EVALIDATION' });
       if (c !== m.claim) embeddingDirty = true;

@@ -56,6 +56,36 @@ test('write: global tier leaves agent_did null', () => {
   assert.equal(m.bedrock, true);
 });
 
+// ── claim sanitization (the </claim> tool-framing leak) ────────────
+
+test('write: strips a leaked tool-call framing tail from the claim (the </claim> glitch)', () => {
+  const s = freshStore();
+  const m = s.write({
+    ...baseWrite,
+    claim: 'Real content here.</claim>\n<parameter name="source_kind">conversation',
+  });
+  assert.equal(m.claim, 'Real content here.');
+});
+
+test('write: strips a leaked <parameter name= tail with no closing tag', () => {
+  const s = freshStore();
+  const m = s.write({ ...baseWrite, claim: 'Just the claim. <parameter name="summary">junk' });
+  assert.equal(m.claim, 'Just the claim.');
+});
+
+test('write: leaves a clean claim untouched', () => {
+  const s = freshStore();
+  const clean = 'A normal claim with no markup at all.';
+  assert.equal(s.write({ ...baseWrite, claim: clean }).claim, clean);
+});
+
+test('update: sanitizes a leaked framing tail on a claim edit too', () => {
+  const s = freshStore();
+  const m = s.write(baseWrite);
+  const u = s.update(m.id, { claim: 'Edited claim.</claim>\n<parameter name="summary">x' });
+  assert.equal(u.claim, 'Edited claim.');
+});
+
 test('write: confidence default for inferred/tool_observation', () => {
   const s = freshStore();
   assert.equal(s.write({ ...baseWrite, source_kind: 'inferred' }).confidence, 0.5);
