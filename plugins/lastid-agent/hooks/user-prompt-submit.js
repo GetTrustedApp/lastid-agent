@@ -35,8 +35,7 @@ import {
   writeSeenCreds,
 } from '../lib/credential-awareness.js';
 import {
-  diffNewSubagents,
-  formatSubagentDelta,
+  formatSubagentRoster,
   readSeenSubagents,
   writeSeenSubagents,
 } from '../lib/subagent-awareness.js';
@@ -115,14 +114,14 @@ const packetMarkdown = (result.stdout ?? '').trim();
 // effort + local-only (no secret); empty on any failure.
 const credentialDelta = computeCredentialDelta();
 
-// Subagent-awareness delta: parallel to credentials — if a new sub-agent has
-// landed in the listener's local index since the last turn (operator just
-// published one), flash a compact "new helper available" note so the model
-// recognizes the delegation surface mid-session (not just at session start).
-// Best-effort + local-only; empty on any failure.
-const subagentDelta = await computeSubagentDelta();
+// Subagent roster: re-inject a COMPACT list of the agent's installed helpers
+// EVERY turn (newly-arrived ones flagged 🆕), so delegation stays salient at
+// the decision moment instead of receding up-context after session start —
+// the whole reason helpers went unused. Best-effort + local-only; empty when
+// there are no helpers or on any failure.
+const subagentRoster = await computeSubagentRoster();
 
-const additionalContext = [credentialDelta, subagentDelta, packetMarkdown]
+const additionalContext = [credentialDelta, subagentRoster, packetMarkdown]
   .filter((s) => s && s.trim().length > 0)
   .join('\n\n');
 if (additionalContext.length === 0) {
@@ -168,20 +167,22 @@ function computeCredentialDelta() {
 }
 
 /**
- * Diff the listener's currently-installed subagents against the
- * seen-slug marker. Inject a compact "new helper available" note when
- * an operator publishes a new sub-agent mid-session — same flash
- * pattern credentials use. Reads listSubagents directly (no CLI hop
- * needed; the index is local-file). Soft-fail.
+ * Build the per-turn helper roster: read the listener's local subagents index
+ * and render a COMPACT list every turn (helpers new since the seen-marker get
+ * a 🆕 flag). Advances the seen-marker after rendering so 🆕 only shows the
+ * first turn a helper appears. Reads listSubagents directly (local-file; no CLI
+ * hop). Soft-fail to '' on any error or when there are no helpers.
  */
-async function computeSubagentDelta() {
+async function computeSubagentRoster() {
   try {
     const scope = resolveScope();
     const entries = await listSubagents(scope);
-    const fresh = diffNewSubagents(readSeenSubagents(scope), entries);
-    if (fresh.length === 0) return '';
-    writeSeenSubagents(scope, entries.map((e) => e?.slug).filter(Boolean));
-    return formatSubagentDelta(fresh);
+    const roster = formatSubagentRoster(entries, readSeenSubagents(scope));
+    writeSeenSubagents(
+      scope,
+      (Array.isArray(entries) ? entries : []).map((e) => e?.slug).filter(Boolean),
+    );
+    return roster;
   } catch {
     return '';
   }
