@@ -77,6 +77,12 @@ test('[POSITIVE] formatHelperRuntimeRules: universal credential-hygiene rules pr
   assert.match(prelude, /environment variables/);
   assert.match(prelude, /read files/);
 });
+test('[POSITIVE] formatHelperRuntimeRules: one-shot helper must RETURN questions, not guess (no back-channel)', () => {
+  const prelude = formatHelperRuntimeRules();
+  assert.match(prelude, /NEEDS INPUT:/);
+  assert.match(prelude, /one-shot/i);
+  assert.match(prelude, /no back-channel/i);
+});
 
 test('[REGRESSION] formatHelperRuntimeRules: pins the explicit `lastid-agent run` CLI-proxy contract (regression — no auto-rewrite in spawned helpers)', () => {
   const prelude = formatHelperRuntimeRules();

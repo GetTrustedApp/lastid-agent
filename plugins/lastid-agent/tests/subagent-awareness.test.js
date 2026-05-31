@@ -91,3 +91,11 @@ test('formatSubagentRoster: stays compact + names the two highest-signal trigger
   assert.match(t, /credentials\/grants/);
   assert.match(t, /flood your context/);
 });
+
+test('formatSubagentBlock: tells the parent how to handle a helper that returns NEEDS INPUT', () => {
+  // Helpers are one-shot with no back-channel; a blocked helper returns its
+  // question. The parent must know to answer + re-invoke (not treat it as done).
+  const t = formatSubagentBlock([A]);
+  assert.match(t, /NEEDS INPUT:/);
+  assert.match(t, /re-invoke/i);
+});

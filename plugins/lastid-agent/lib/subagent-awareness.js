@@ -84,6 +84,12 @@ export function formatSubagentBlock(entries) {
     'so don\'t force it, and the reflex stays believable. But the moment a task',
     'lands in a helper\'s domain — anything credentialed, noisy, or long — the',
     'helper goes first.',
+    '',
+    'If a helper returns a message starting with `NEEDS INPUT:`, it hit a',
+    'decision only you or the operator can make and STOPPED instead of guessing',
+    '(helpers are one-shot — they have no mid-task back-channel to ask you).',
+    'Answer the question(s) and re-invoke the helper with the answer folded into',
+    'a fresh `input`.',
   );
   return lines.join('\n');
 }
