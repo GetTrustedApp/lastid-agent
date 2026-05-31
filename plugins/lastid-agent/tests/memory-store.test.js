@@ -14,6 +14,7 @@ import {
   escalateSensitivity,
   memoryEmbeddingText,
   isExpired,
+  detectTaskState,
 } from '../lib/memory-store.js';
 
 function freshStore() {
@@ -84,6 +85,39 @@ test('update: sanitizes a leaked framing tail on a claim edit too', () => {
   const m = s.write(baseWrite);
   const u = s.update(m.id, { claim: 'Edited claim.</claim>\n<parameter name="summary">x' });
   assert.equal(u.claim, 'Edited claim.');
+});
+
+// ── detectTaskState: steer working/task-state out of durable memory ──
+
+test('detectTaskState: flags a forward-looking todo', () => {
+  assert.ok(detectTaskState('Wire the broker. NEXT: add the SE key path.', ''));
+  assert.ok(detectTaskState('TODO: bump the plugin version', ''));
+  assert.ok(detectTaskState('REMAINING: console rendering of kind=sticky', ''));
+});
+
+test('detectTaskState: flags pipeline status flags', () => {
+  assert.ok(detectTaskState('The fix is committed, deploy pending.', ''));
+  assert.ok(detectTaskState('Phase 2 in progress on the broker.', ''));
+  assert.ok(detectTaskState('Big refactor, WIP across the crate.', ''));
+});
+
+test('detectTaskState: flags a status label opening the claim', () => {
+  assert.ok(detectTaskState('FIXED 2026-05-27 (plugin commit 9ab5eab).', ''));
+  assert.ok(detectTaskState('DONE — shipped in v0.22.', ''));
+});
+
+test('detectTaskState: leaves a genuine durable fact alone (no false positive)', () => {
+  assert.equal(
+    detectTaskState('The agent authenticates to the IdP with DPoP resource tokens.', ''),
+    null,
+  );
+  // "shipped" mid-prose / in the summary, and a leading non-status word, must NOT trip it.
+  assert.equal(
+    detectTaskState('MLS credentials carry device_id; the codec is the single parser.', 'shipped across sdk + idp'),
+    null,
+  );
+  // "fixed-window" is a technical term, not the leading status label.
+  assert.equal(detectTaskState('We use fixed-window rate limiting in the IdP.', ''), null);
 });
 
 test('write: confidence default for inferred/tool_observation', () => {

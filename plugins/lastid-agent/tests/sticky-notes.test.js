@@ -81,6 +81,31 @@ test('a NON-sticky memory carrying the same path is NOT surfaced by stickyNotesF
   assert.equal(s.stickyNotesForAnchor(REPO, REL).length, 0);
 });
 
+// ── folder anchors (surface for anything under the folder) ─────────
+
+test('stickyNotesForAnchor: a FOLDER-anchored sticky surfaces for any file under it', () => {
+  const s = freshStore();
+  const FOLDER = 'plugins/lastid-agent/lib';
+  s.write(stickyInput({ anchor: { repo_key: REPO, rel_path: FOLDER }, claim: 'area note' }));
+  assert.equal(s.stickyNotesForAnchor(REPO, `${FOLDER}/memory-store.js`).length, 1); // direct child
+  assert.equal(s.stickyNotesForAnchor(REPO, `${FOLDER}/sub/deep.js`).length, 1); // deeper
+  assert.equal(s.stickyNotesForAnchor(REPO, FOLDER).length, 1); // the folder itself (exact)
+});
+
+test('stickyNotesForAnchor: a folder anchor does NOT leak to a prefix-sharing sibling', () => {
+  const s = freshStore();
+  s.write(stickyInput({ anchor: { repo_key: REPO, rel_path: 'lib' }, claim: 'lib note' }));
+  assert.equal(s.stickyNotesForAnchor(REPO, 'library/x.js').length, 0); // "lib" must not match "library/…"
+  assert.equal(s.stickyNotesForAnchor(REPO, 'lib/x.js').length, 1); // a real file under lib does
+});
+
+test('stickyNotesForAnchor: a FILE anchor stays effectively exact (no subtree leak)', () => {
+  const s = freshStore();
+  s.write(stickyInput()); // anchored to the REL file
+  assert.equal(s.stickyNotesForAnchor(REPO, REL).length, 1);
+  assert.equal(s.stickyNotesForAnchor(REPO, 'plugins/lastid-agent/lib/other.js').length, 0);
+});
+
 test('sticky notes are EXCLUDED from semantic recall (searchMemories), facts are not', async () => {
   const s = freshStore();
   const sticky = s.write(stickyInput({ claim: 'reconcile KP purge eligibility note' }));

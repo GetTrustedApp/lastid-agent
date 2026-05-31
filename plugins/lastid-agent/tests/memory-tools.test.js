@@ -83,6 +83,51 @@ test('a project-tier write WITH a project_root_seed passes the seed guard and pr
   }
 });
 
+// STEER working/task-state to a sticky: a non-sticky durable write that reads
+// like task state is refused with guidance; a sticky is exempt; a clean fact
+// passes. (detectTaskState's own pos/neg cases live in memory-store.test.js.)
+test('STEER: a non-sticky write that reads like task state is refused with sticky guidance', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const res = await call('lastid_memory_write', {
+      kind: 'fact', subject: ['x'], tier: 'agent',
+      claim: 'Broker wired up. NEXT: add the SE key path.',
+    }, scope);
+    assert.equal(res.isError, true);
+    assert.match(body(res).error, /sticky/i);
+  } finally {
+    cleanup();
+  }
+});
+
+test('STEER: a sticky with the same working-state text is allowed (it is the right home)', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const res = await call('lastid_memory_write', {
+      kind: 'sticky', subject: ['x'],
+      claim: 'Broker wired up. NEXT: add the SE key path.',
+    }, scope);
+    assert.equal(res.isError ?? false, false);
+    assert.equal(body(res).ok, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test('STEER: a clean durable fact is NOT blocked', async () => {
+  const { scope, cleanup } = withScope();
+  try {
+    const res = await call('lastid_memory_write', {
+      kind: 'fact', subject: ['x'], tier: 'agent',
+      claim: 'The agent authenticates to the IdP with DPoP resource tokens.',
+    }, scope);
+    assert.equal(res.isError ?? false, false);
+    assert.equal(body(res).ok, true);
+  } finally {
+    cleanup();
+  }
+});
+
 // source_kind is implied by the tool, so the agent never has to supply it (and a
 // missing/dropped value can't fail a save). The tool name is the source of truth:
 // write = operator-instructed (user_explicit), draft = agent-inferred (inferred).

@@ -14,7 +14,7 @@
  * no embedder is wired; the embeddings layer (lib/embeddings.js) swaps in
  * cosine similarity via `searchMemories`'s optional embedder.
  */
-import { MemoryStore } from './memory-store.js';
+import { MemoryStore, detectTaskState } from './memory-store.js';
 import { makeEmbedder, cosine, embedMemory, EMBED_DIM, SEMANTIC_FLOOR } from './embeddings.js';
 import { enqueueAuditEvent } from './audit-spool.js';
 import { publishAgentMemory } from './agent-memory-publish.js';
@@ -64,7 +64,7 @@ const writeInputSchema = {
     path: {
       type: 'string',
       description:
-        "STICKY NOTES ONLY (kind:'sticky'): the file this working note is anchored to. Pass the path you're working on; the note surfaces just-in-time the next time you Read that file, persists across sessions, and is resolved to a repo-relative anchor automatically. Ignored for other kinds.",
+        "STICKY NOTES ONLY (kind:'sticky'): the file OR folder this working note is anchored to. Pass the path you're working on — a FILE surfaces the note when you next read that file; a FOLDER (directory path) surfaces it whenever you touch anything under that folder (use this for a task spanning an area, not one file). Persists across sessions; resolved to a repo-relative anchor automatically. Ignored for other kinds.",
     },
   },
   // source_kind intentionally NOT required: it's defaulted from the tool name
@@ -341,6 +341,26 @@ export async function handleMemoryTool({ name, args = {}, scope = 'main', loaded
         typeof args.path === 'string' && args.path.length > 0 ? anchorForPath(args.path) : null;
       args = { ...args, tier: 'agent', ...(anchor ? { anchor } : {}) };
       if ('path' in args) delete args.path;
+    } else {
+      // STEER working/task-state to a sticky. A durable write that reads like
+      // transient task state (a todo, a status flag, a "FIXED …" status label)
+      // pollutes long-term recall — the #3 curation anti-pattern. Refuse it with
+      // guidance: re-save as a sticky (file- OR folder-anchored), or rephrase to
+      // a stable fact. Sticky writes are exempt (handled above). High-precision
+      // detector, so a genuine fact that merely mentions "fixed" isn't blocked.
+      const taskReason = detectTaskState(args.claim, args.summary);
+      if (taskReason) {
+        return err(
+          `This reads like transient task state, not a durable fact — it has ${taskReason}. ` +
+            `Durable memory is for stable facts/decisions/rules; todos, status flags, and ` +
+            `progress notes clog recall for every agent. Save it as a sticky instead:\n` +
+            `  lastid_memory_write({ kind: "sticky", path: "<the file OR folder you're working in>", claim: "…" })\n` +
+            `A sticky resurfaces just-in-time the next time you touch that path — and a FOLDER ` +
+            `path covers everything under it — and never pollutes durable recall. If this really ` +
+            `is a stable fact/decision, rephrase to drop the status/todo wording (move any ` +
+            `commit refs to source_ref) and resubmit.`,
+        );
+      }
     }
     // source_kind is implied by the tool, so the agent never needs to pass it
     // (and a missing/dropped arg can't fail the save): an explicit write is

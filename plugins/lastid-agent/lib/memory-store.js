@@ -166,6 +166,38 @@ function sanitizeClaim(raw) {
   return (m && m.index !== undefined ? raw.slice(0, m.index) : raw).trim();
 }
 
+/**
+ * Detect when a would-be DURABLE memory is actually transient TASK STATE that
+ * belongs in a sticky note (or the task list), not long-term recall. Returns a
+ * short human reason when it smells like task state, else null. The write path
+ * uses this to STEER the agent to `kind:'sticky'` instead of polluting durable
+ * recall with status flags / todos (the #3 anti-pattern in the curation rule).
+ *
+ * Deliberately HIGH-PRECISION for v1 — only the unambiguous markers, so it
+ * rarely blocks a legitimate fact. (Intentionally does NOT count commit hashes:
+ * this codebase is full of hex device-ids/hashes that would false-positive.)
+ * Sticky writes are exempt (they ARE the right home); the caller gates on kind.
+ */
+export function detectTaskState(claim, summary) {
+  const c = typeof claim === 'string' ? claim : '';
+  const text = `${c}\n${typeof summary === 'string' ? summary : ''}`;
+  // Forward-looking todo — the clearest "this is task state" tell.
+  if (/\b(NEXT|TODO|REMAINING|FOLLOW[-\s]?UP)\s*:/i.test(text)) {
+    return 'a forward-looking todo (e.g. "NEXT: …")';
+  }
+  // Pipeline / progress status flags.
+  if (/\b(deploy[-\s]?pending|in[-\s]progress|not yet (shipped|deployed|bumped|committed)|\bWIP\b)\b/i.test(text)) {
+    return 'a status flag (e.g. "deploy pending", "in progress", "WIP")';
+  }
+  // A status label OPENING the claim ("FIXED 2026-…", "DONE …", "DEFERRED …").
+  // Leading-position only, so a "fixed"/"shipped" mid-prose in a real fact is
+  // left alone.
+  if (/^\s*(DONE|FIXED|SHIPPED|COMMITTED|DEPLOYED|DEFERRED|WIP)\b/i.test(c)) {
+    return 'a status label opening the claim (e.g. "FIXED …", "DONE …")';
+  }
+  return null;
+}
+
 function validateWriteInput(input) {
   const errs = [];
   const kind = input.kind;
@@ -573,7 +605,11 @@ export class MemoryStore {
       (m) =>
         m.kind === 'sticky' &&
         m.anchor &&
-        m.anchor.rel_path === relPath &&
+        // Exact (file anchor) OR the touched path is UNDER the anchored path
+        // (folder anchor): a sticky on `lib/foo` surfaces for `lib/foo/bar.js`.
+        // The `+ '/'` guard stops `lib` from matching `library/…`. A file
+        // anchor stays effectively exact (no real file lives under a file).
+        (m.anchor.rel_path === relPath || relPath.startsWith(`${m.anchor.rel_path}/`)) &&
         // repo_key matches when both carry one; missing on either side is permissive.
         !(m.anchor.repo_key && repoKey && m.anchor.repo_key !== repoKey),
     );
