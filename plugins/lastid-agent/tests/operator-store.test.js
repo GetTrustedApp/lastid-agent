@@ -55,6 +55,43 @@ test('revoked status removes the record', () => {
   assert.equal(s.listRules().length, 0);
 });
 
+test('applyRecords: an in-batch revoke wins over a sibling active row for the same id', () => {
+  // The mem_01KSTB0Q failure mode: one id arrives on two rails in one sync — a
+  // revoke (e.g. a fan-out tombstone) AND an active sibling (the global-shared
+  // routing copy). Worst-case ORDER here: revoke FIRST. Per-record upsert alone
+  // would delete then re-add → resurrect a forgotten bedrock. Revoke-by-id must
+  // drop the id regardless of order.
+  const s = freshStore();
+  const changed = s.applyRecords(
+    [
+      { id: 'm1', kind: 'memory', status: 'revoked', version: 2, target: 'global' },
+      {
+        id: 'm1',
+        kind: 'memory',
+        status: 'active',
+        version: 2,
+        target: 'project',
+        content: { bedrock: true, claim: 'forgotten — must not inject' },
+      },
+    ],
+    10,
+  );
+  assert.equal(s.bedrockMemories().length, 0, 'revoked id must not be injected as bedrock');
+  assert.equal(s.listMemories().length, 0, 'revoked id must not survive on any rail');
+  assert.equal(changed, 0, 'a revoked-then-skipped pair makes no net live change');
+
+  // The natural [active, revoke] order ends gone too (regression-locks both).
+  const s2 = freshStore();
+  s2.applyRecords(
+    [
+      { id: 'm2', kind: 'memory', status: 'active', version: 1, content: { bedrock: true, claim: 'x' } },
+      { id: 'm2', kind: 'memory', status: 'revoked', version: 1, target: 'global' },
+    ],
+    11,
+  );
+  assert.equal(s2.bedrockMemories().length, 0);
+});
+
 test('applyRecords advances cursor, persists, and reload preserves state', () => {
   const path = join(tmpdir(), `opstore-${randomUUID()}.json`);
   const s = new OperatorStore('test', path);

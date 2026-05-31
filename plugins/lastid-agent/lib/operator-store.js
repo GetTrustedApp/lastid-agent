@@ -291,8 +291,27 @@ export class OperatorStore {
    * state.
    */
   applyRecords(records = [], cursor = null) {
+    // Revoke-by-id wins WITHIN a batch. If this batch carries a revoke for an
+    // id, that id is gone — even if the SAME batch also carries an active row
+    // for it (a target-mismatched sibling rail, e.g. a global-shared routing
+    // copy alongside a fan-out tombstone). Without this, array order alone
+    // decides: a [revoke, active] sequence would delete then re-add, resurrecting
+    // a memory the operator forgot — the mem_01KSTB0Q injection-after-delete
+    // failure mode. Pairs with the IdP revoke-by-id cascade (#23), which now
+    // delivers every rail's revoke under one cursor, i.e. in one batch.
+    const revokedIds = new Set();
+    for (const r of records) {
+      if (r && r.id && r.status && r.status !== 'active') revokedIds.add(r.id);
+    }
     let changed = 0;
-    for (const r of records) if (this.upsert(r)) changed += 1;
+    for (const r of records) {
+      // Drop an active row whose id is revoked elsewhere in this same batch; the
+      // revoke record itself still runs through upsert below (deleting any prior).
+      if (r && r.id && revokedIds.has(r.id) && (!r.status || r.status === 'active')) {
+        continue;
+      }
+      if (this.upsert(r)) changed += 1;
+    }
     const cursorMoved = cursor != null && Number(cursor) > this.state.cursor;
     if (cursor != null) this.setCursor(cursor);
     // Also persist when per-kind cursors advanced (setCursorFor) even if no
