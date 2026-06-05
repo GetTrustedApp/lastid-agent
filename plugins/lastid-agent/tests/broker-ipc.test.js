@@ -11,12 +11,13 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { rmSync } from 'node:fs';
+import { rmSync, mkdirSync, writeFileSync } from 'node:fs';
 
 import {
   brokerIpcCall,
   brokerIdpFetch,
   brokerHealth,
+  brokerAvailable,
   brokerSocketPath,
   brokerTokenPath,
   brokerRuntimeDir,
@@ -78,6 +79,21 @@ async function startServer(respond) {
       }),
   };
 }
+
+test('brokerAvailable: true only when BOTH socket + token exist for the scope', async () => {
+  const scope = `__brk_avail_test_${process.pid}`;
+  const dir = brokerRuntimeDir(scope);
+  try {
+    assert.equal(await brokerAvailable(scope), false, 'absent → false');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(brokerSocketPath(scope), ''); // a plain file stands in for the socket node
+    assert.equal(await brokerAvailable(scope), false, 'socket only → false');
+    writeFileSync(brokerTokenPath(scope), 'tok');
+    assert.equal(await brokerAvailable(scope), true, 'socket + token → true');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('path helpers follow the ~/.lastid-agent/<scope> convention', () => {
   assert.ok(brokerRuntimeDir('main').endsWith('/.lastid-agent/main'));

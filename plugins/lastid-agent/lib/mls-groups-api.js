@@ -12,6 +12,9 @@
  */
 
 import { mintDpopJwt } from './dpop.js';
+import { brokerIdpFetch, brokerAvailable } from './broker-ipc.js';
+import { brokerIdpEnabled } from './broker-supervisor.js';
+import { getActiveScope } from './active-scope.js';
 
 /**
  * One authenticated IdP call. Returns parsed JSON ({} on empty body).
@@ -27,6 +30,7 @@ import { mintDpopJwt } from './dpop.js';
  * @param {string} a.vcCompact            - agent VC SD-JWT (bearer)
  * @param {import('node:crypto').KeyObject} a.signingKey - agent Ed25519 (DPoP)
  * @param {typeof fetch} [a.fetchImpl]
+ * @param {string} [a.scope]              - broker routing target (default: ambient)
  */
 export async function authedIdpFetch({
   idpUrl,
@@ -37,7 +41,23 @@ export async function authedIdpFetch({
   vcCompact,
   signingKey,
   fetchImpl = fetch,
+  scope,
+  // Injectable so the dispatch is unit-testable without a real broker.
+  _brokerIdpFetch = brokerIdpFetch,
+  _brokerAvailable = brokerAvailable,
+  _brokerEnabled = brokerIdpEnabled,
 }) {
+  // FORK1 (broker-credential-custody Phase 2): when broker routing is enabled
+  // AND a broker is actually up for this scope, the SIGNED BROKER makes the call
+  // — it holds the slot seed + mints the canonical DPoP resource-token, so node
+  // derives no key and mints no DPoP here. No-flag-day: LASTID_BROKER_IDP is off
+  // by default, and even when on we fall back to the legacy node path below
+  // whenever no broker is running (brokerAvailable=false).
+  const routeScope = scope ?? getActiveScope();
+  if (_brokerEnabled() && (await _brokerAvailable(routeScope))) {
+    return _brokerIdpFetch({ method, path, body, scope: routeScope });
+  }
+
   const trimmed = String(idpUrl ?? '').replace(/\/$/, '');
   if (!trimmed) throw new Error('authedIdpFetch: idpUrl required');
   const url = `${trimmed}${path}`;

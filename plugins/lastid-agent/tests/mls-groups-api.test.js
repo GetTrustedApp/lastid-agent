@@ -335,3 +335,68 @@ test('revokeAgentDevice: missing deviceId throws (never DELETEs the collection)'
   await assert.rejects(() => revokeAgentDevice({ ...AUTH, fetchImpl }), /deviceId required/);
   assert.equal(fetchImpl.calls.length, 0);
 });
+
+// ── FORK1 broker dispatch (Phase 2) ──────────────────────────────────────────
+// When LASTID_BROKER_IDP is on AND a broker is up for the scope, authedIdpFetch
+// routes through the signed broker (no node DPoP minting); otherwise legacy.
+
+test('authedIdpFetch: routes to the broker when enabled + a broker is available', async () => {
+  const fetchImpl = recordingFetch(res({}));
+  let brokerCall = null;
+  const out = await authedIdpFetch({
+    ...AUTH,
+    method: 'POST',
+    path: '/v1/groups',
+    body: { name: 'x' },
+    fetchImpl,
+    scope: 'tscope',
+    _brokerEnabled: () => true,
+    _brokerAvailable: async () => true,
+    _brokerIdpFetch: async (a) => {
+      brokerCall = a;
+      return { ok: true };
+    },
+  });
+  assert.deepEqual(brokerCall, { method: 'POST', path: '/v1/groups', body: { name: 'x' }, scope: 'tscope' });
+  assert.deepEqual(out, { ok: true });
+  assert.equal(fetchImpl.calls.length, 0, 'legacy node DPoP fetch must NOT run when routed to broker');
+});
+
+test('authedIdpFetch: legacy node path when broker routing is disabled', async () => {
+  const fetchImpl = recordingFetch(res({ ok: 1 }));
+  let brokerCalled = false;
+  await authedIdpFetch({
+    ...AUTH,
+    method: 'GET',
+    path: '/v1/thing',
+    fetchImpl,
+    _brokerEnabled: () => false,
+    _brokerAvailable: async () => true, // available, but disabled → legacy
+    _brokerIdpFetch: async () => {
+      brokerCalled = true;
+      return {};
+    },
+  });
+  assert.equal(brokerCalled, false);
+  assert.equal(fetchImpl.calls.length, 1, 'legacy DPoP fetch runs when the flag is off');
+  assert.ok(fetchImpl.calls[0].init.headers.DPoP, 'DPoP header minted on the legacy path');
+});
+
+test('authedIdpFetch: falls back to legacy when enabled but NO broker is up (no-flag-day)', async () => {
+  const fetchImpl = recordingFetch(res({ ok: 1 }));
+  let brokerCalled = false;
+  await authedIdpFetch({
+    ...AUTH,
+    method: 'GET',
+    path: '/v1/thing',
+    fetchImpl,
+    _brokerEnabled: () => true,
+    _brokerAvailable: async () => false, // flag on, but broker not running
+    _brokerIdpFetch: async () => {
+      brokerCalled = true;
+      return {};
+    },
+  });
+  assert.equal(brokerCalled, false, 'must NOT route to a broker that is not up');
+  assert.equal(fetchImpl.calls.length, 1, 'falls back to the legacy node path');
+});

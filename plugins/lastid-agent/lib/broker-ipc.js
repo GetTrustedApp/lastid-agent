@@ -12,7 +12,7 @@
  * JSON, throws on non-2xx) so Phase 2 can swap call sites with no caller change.
  */
 import net from 'node:net';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -34,6 +34,22 @@ export function brokerTokenPath(scope = 'main') {
 export async function readBrokerToken(scope = 'main') {
   const raw = await readFile(brokerTokenPath(scope), 'utf8');
   return raw.trim();
+}
+
+/**
+ * Whether a broker is actually running for `scope` — both the socket AND the
+ * per-launch token exist. The dispatch in authedIdpFetch checks this so that,
+ * even with LASTID_BROKER_IDP on, a call falls back to the legacy node path
+ * whenever no broker is up (no-flag-day safety).
+ */
+export async function brokerAvailable(scope = 'main') {
+  try {
+    await stat(brokerSocketPath(scope));
+    await stat(brokerTokenPath(scope));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 let _ipcCounter = 0;

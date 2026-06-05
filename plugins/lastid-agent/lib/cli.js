@@ -56,6 +56,7 @@ function detectRuntimeName() {
 import { provisionAgent, resolveAgentDeviceId } from '../lib/agent-provisioning.js';
 import { recordGroup } from '../lib/agent-groups.js';
 import { resolveScope } from '../lib/scope.js';
+import { setActiveScope } from '../lib/active-scope.js';
 import { persistAgentVc, loadAgentVc } from '../lib/keychain.js';
 import { publishAgentKeyPackage } from '../lib/mls-publish.js';
 import { linkHumanDid } from '../lib/agent-link.js';
@@ -1259,6 +1260,10 @@ async function cmdSync(flags) {
  */
 async function cmdListen(flags) {
   const scope = resolveScope(flags);
+  // Record this process's scope so the shared authedIdpFetch broker dispatch
+  // (FORK1) can locate ~/.lastid-agent/<scope>/broker.{sock,token} without
+  // threading scope through every list-A call site.
+  setActiveScope(scope);
   const loaded = await loadAgentVc(scope);
   if (!loaded) {
     process.stderr.write(`not_provisioned (scope=${scope}) — run \`lastid-agent provision\` first\n`);
