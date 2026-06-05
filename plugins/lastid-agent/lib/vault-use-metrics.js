@@ -10,7 +10,7 @@
  * Best-effort: a metrics failure must NEVER disrupt the vault flow, so callers
  * fire-and-forget and this never throws.
  */
-import { mintDpopJwt } from './dpop.js';
+import { authedIdpFetch } from './mls-groups-api.js';
 
 /** Build the credentialed-use body for one handle event. Pure + exported so the
  *  field mapping (handle → wire row) is unit-tested. `kind` is 'mint'|'consume'. */
@@ -54,20 +54,18 @@ export async function publishCredentialedUse({
   try {
     if (!vcCompact || !signingKey || !handle?.itemId) return;
     const body = credentialedUseBody(kind, handle, metrics);
-    const url = `${idpUrl}/v2/agents/${encodeURIComponent(agentDid)}/credentialed-use`;
-    // mintDpopJwt feature-detects alg from the KeyObject (Ed25519→EdDSA,
-    // P-256→ES256). Best-effort: a metrics failure must NEVER disrupt the
-    // vault flow, so the outer try/catch still swallows everything.
-    const popJwt = mintDpopJwt({
-      agentDid,
-      httpMethod: 'POST',
-      httpUri: url,
-      signingKey,
-    });
-    await fetchImpl(url, {
+    // Route through the shared, broker-aware authedIdpFetch (FORK1). Fire-and-
+    // forget: the outer try/catch swallows everything (a metrics failure must
+    // NEVER disrupt the vault flow), and scope is ambient (getActiveScope).
+    await authedIdpFetch({
+      idpUrl,
       method: 'POST',
-      headers: { Authorization: `Bearer ${vcCompact}`, DPoP: popJwt, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      path: `/v2/agents/${encodeURIComponent(agentDid)}/credentialed-use`,
+      body,
+      agentDid,
+      vcCompact,
+      signingKey,
+      fetchImpl,
     });
   } catch {
     /* best-effort: metrics must never disrupt the vault flow */

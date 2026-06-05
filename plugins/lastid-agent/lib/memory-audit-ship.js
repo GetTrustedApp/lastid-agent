@@ -8,7 +8,7 @@
  * The records carry NON-sensitive metadata only (no memory claim), so the
  * server stores an audit trail of WHAT happened without seeing content.
  */
-import { mintDpopJwt } from './dpop.js';
+import { authedIdpFetch } from './mls-groups-api.js';
 import { shipUnshipped } from './memory-audit.js';
 
 export const AUDIT_PATH = '/v1/agent-state/audit';
@@ -22,24 +22,27 @@ export async function shipMemoryAudit({
   fetchImpl = globalThis.fetch,
 }) {
   if (typeof fetchImpl !== 'function') return 0;
-  const base = `${idpUrl}${AUDIT_PATH}`;
   // Ship THIS agent's chain (the file is keyed by the listener's agentDid — the
   // same key that signs the records and the same VC that authenticates here).
+  // Route through the shared, broker-aware authedIdpFetch (FORK1); keep the
+  // offline-safe BOOLEAN contract (true on 2xx, false on any error → cursor
+  // stays, retry next drain). authedIdpFetch throws on non-2xx, so try/catch.
   return shipUnshipped(scope, agentDid, async (records) => {
-    let res;
     try {
-      res = await fetchImpl(base, {
+      await authedIdpFetch({
+        idpUrl,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${vcCompact}`,
-          DPoP: mintDpopJwt({ agentDid, httpMethod: 'POST', httpUri: base, signingKey }),
-        },
-        body: JSON.stringify({ records }),
+        path: AUDIT_PATH,
+        body: { records },
+        agentDid,
+        vcCompact,
+        signingKey,
+        fetchImpl,
+        scope,
       });
+      return true;
     } catch {
-      return false; // network error → cursor stays, retry later
+      return false; // network error / non-2xx → cursor stays, retry later
     }
-    return res?.ok === true || (typeof res?.status === 'number' && res.status >= 200 && res.status < 300);
   });
 }

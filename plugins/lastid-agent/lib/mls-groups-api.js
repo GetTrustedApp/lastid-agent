@@ -42,6 +42,7 @@ export async function authedIdpFetch({
   signingKey,
   fetchImpl = fetch,
   scope,
+  signal,
   // Injectable so the dispatch is unit-testable without a real broker.
   _brokerIdpFetch = brokerIdpFetch,
   _brokerAvailable = brokerAvailable,
@@ -70,6 +71,7 @@ export async function authedIdpFetch({
     accept: 'application/json',
   };
   const init = { method, headers };
+  if (signal !== undefined) init.signal = signal;
   if (body !== undefined) {
     headers['content-type'] = 'application/json';
     init.body = JSON.stringify(body);
@@ -77,7 +79,9 @@ export async function authedIdpFetch({
   const res = await fetchImpl(url, init);
   if (!res.ok) {
     const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
-    throw new Error(`${method} ${path} failed: HTTP ${res.status} ${text}`);
+    const err = new Error(`${method} ${path} failed: HTTP ${res.status} ${text}`);
+    err.status = res.status; // let callers branch (e.g. 404 → null) without string-matching
+    throw err;
   }
   if (typeof res.json === 'function') {
     return await res.json().catch(() => ({}));

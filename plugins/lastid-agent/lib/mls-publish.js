@@ -25,7 +25,7 @@
  * deterministic, colon-free.
  */
 import { MlsClient } from './mls-client.js';
-import { mintDpopJwt } from './dpop.js';
+import { authedIdpFetch } from './mls-groups-api.js';
 import { deriveAgentKeypair, resolveAgentDeviceId } from './agent-provisioning.js';
 
 /** How many regular (consumable) KeyPackages to keep on file. */
@@ -142,35 +142,18 @@ export async function publishAgentKeyPackage({
   // flushBlob callback; persist() is a kept-for-compat no-op.
   await mls.persist();
 
-  const url = `${trimmed}/v1/mls/keypackages/batch`;
-  const dpopProof = mintDpopJwt({
-    agentDid,
-    httpMethod: 'POST',
-    httpUri: url,
-    signingKey,
-  });
-
-  // Auth pattern: Bearer SD-JWT VC compact + DPoP proof in a
-  // separate header. See note in single-publish flow — `DPoP <token>`
-  // scheme is for IdP-issued OAuth access tokens, not raw VCs.
-  const res = await fetch(url, {
+  // Route through the shared, broker-aware authedIdpFetch (FORK1): same legacy
+  // Bearer + DPoP shaping, and the signed broker makes the call when enabled.
+  const body = await authedIdpFetch({
+    idpUrl: trimmed,
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${vcCompact}`,
-      DPoP: dpopProof,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ key_packages: items }),
+    path: '/v1/mls/keypackages/batch',
+    body: { key_packages: items },
+    agentDid,
+    vcCompact,
+    signingKey,
+    scope,
   });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '<no body>');
-    throw new Error(
-      `POST /v1/mls/keypackages/batch failed: HTTP ${res.status} ${text}`,
-    );
-  }
-
-  const body = await res.json().catch(() => ({}));
   const refs = Array.isArray(body?.refs) ? body.refs : [];
   return { ok: true, refs, count: items.length };
 }
@@ -199,29 +182,23 @@ export async function maintainAgentKeyPackages({
   }
   const { signingKey } = deriveAgentKeypair(slotSeed, agentDid);
 
-  const htu = `${trimmed}/v1/mls/keypackages/me`;
-  const dpop = mintDpopJwt({
-    agentDid,
-    httpMethod: 'GET',
-    httpUri: htu,
-    signingKey,
-  });
   let available = 0;
   try {
-    const res = await fetch(htu, {
+    // Shared, broker-aware authedIdpFetch (FORK1). Throws on non-2xx → the catch
+    // leaves available=0 (publish), same as the old `if (res.ok)` skip.
+    const body = await authedIdpFetch({
+      idpUrl: trimmed,
       method: 'GET',
-      headers: {
-        Authorization: `Bearer ${vcCompact}`,
-        DPoP: dpop,
-      },
+      path: '/v1/mls/keypackages/me',
+      agentDid,
+      vcCompact,
+      signingKey,
+      scope,
     });
-    if (res.ok) {
-      const body = await res.json().catch(() => ({}));
-      // Count non-last-resort packages — last-resorts don't get
-      // consumed so they're not what determines "do we need more?".
-      const all = Array.isArray(body?.key_packages) ? body.key_packages : [];
-      available = all.filter((p) => !p.is_last_resort).length;
-    }
+    // Count non-last-resort packages — last-resorts don't get
+    // consumed so they're not what determines "do we need more?".
+    const all = Array.isArray(body?.key_packages) ? body.key_packages : [];
+    available = all.filter((p) => !p.is_last_resort).length;
   } catch {
     // Network hiccup → fall through and publish (safer to over-publish).
   }

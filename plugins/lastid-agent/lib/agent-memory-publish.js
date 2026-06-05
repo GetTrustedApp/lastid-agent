@@ -17,7 +17,7 @@ import { encryptContent } from './agent-content-crypto.js';
 import { deriveProjectRoutingId, encryptProjectContent } from './project-crypto.js';
 import { deriveAgentKeypair } from './agent-provisioning.js';
 import { signAgentRecordJws, sha256Hex } from './agent-sig-verify.js';
-import { mintDpopJwt } from './dpop.js';
+import { authedIdpFetch } from './mls-groups-api.js';
 
 export const MEMORIES_PATH = '/v1/agent-state/memories';
 
@@ -45,14 +45,6 @@ export function memorySyncContent(m) {
     // (another session/device, or console) re-hydrates with the same
     // repo-relative anchor and surfaces on the right file.
     ...(m.anchor && typeof m.anchor === 'object' ? { anchor: m.anchor } : {}),
-  };
-}
-
-function authHeaders({ idpUrl, agentDid, vcCompact, signingKey }) {
-  return {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${vcCompact}`,
-    DPoP: mintDpopJwt({ agentDid, httpMethod: 'POST', httpUri: `${idpUrl}${MEMORIES_PATH}`, signingKey }),
   };
 }
 
@@ -136,17 +128,25 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
           sig,
         };
   }
-  let res;
+  // Route through the shared, broker-aware authedIdpFetch (FORK1): same legacy
+  // Bearer + DPoP shaping, broker resource-token when enabled. Keep the BOOLEAN
+  // contract (true on 2xx, false on any error → caller marks unsynced for retry)
+  // + the 5s timeout (passed as `signal`). The record sig is still minted node-
+  // side above (signAgentRecordJws); broker-side signing is a later phase.
   try {
-    res = await fetchImpl(`${idpUrl}${MEMORIES_PATH}`, {
+    await authedIdpFetch({
+      idpUrl,
       method: 'POST',
-      headers: authHeaders({ idpUrl, agentDid, vcCompact: loaded.vcCompact, signingKey }),
-      body: JSON.stringify(body),
-      // Don't let a slow/down IdP hang the memory tool call.
+      path: MEMORIES_PATH,
+      body,
+      agentDid,
+      vcCompact: loaded.vcCompact,
+      signingKey,
+      fetchImpl,
       ...(typeof AbortSignal?.timeout === 'function' ? { signal: AbortSignal.timeout(5000) } : {}),
     });
+    return true;
   } catch {
-    return false; // offline/timeout → caller marks the memory unsynced for retry
+    return false; // offline/timeout/non-2xx → caller marks the memory unsynced for retry
   }
-  return res?.ok === true || (typeof res?.status === 'number' && res.status >= 200 && res.status < 300);
 }

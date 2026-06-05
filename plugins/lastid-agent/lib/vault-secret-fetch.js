@@ -9,7 +9,7 @@
  * The IdP returns ciphertext only — it never sees plaintext and the wrap binds
  * the delivery to this one handle (single-use, replay-proof).
  */
-import { mintDpopJwt } from './dpop.js';
+import { authedIdpFetch } from './mls-groups-api.js';
 
 /**
  * @returns {Promise<string|null>} the base64 `wrapped_secret_b64`, or null when
@@ -28,25 +28,25 @@ export async function fetchWrappedVaultSecret({
   if (!vcCompact) throw new Error('no agent VC — cannot fetch vault secret');
   if (!signingKey) throw new Error('no signingKey — cannot mint DPoP for vault secret');
   if (!handlePubB64 || !handleId) throw new Error('handle pubkey + id required to wrap the secret');
-  const url = `${idpUrl}/v1/agent-state/vault/${encodeURIComponent(id)}/secret`;
-  // mintDpopJwt feature-detects the alg from the KeyObject (Ed25519→EdDSA,
-  // P-256→ES256) so an Ed25519 agent doesn't 401 on `agent_pop: header.alg
-  // must be 'EdDSA' for a Ed25519 cnf.jwk, got 'ES256'`.
-  const popJwt = mintDpopJwt({
-    agentDid,
-    httpMethod: 'POST',
-    httpUri: url,
-    signingKey,
-  });
-  const res = await fetchImpl(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${vcCompact}`, DPoP: popJwt, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ handle_pubkey_b64: handlePubB64, handle_id: handleId }),
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    throw new Error(`vault secret fetch: HTTP ${res.status} ${(await res.text?.().catch(() => '')) ?? ''}`);
+  // Route through the shared, broker-aware authedIdpFetch (FORK1). Preserve the
+  // 404 → null contract (revoked / never shared / wrong agent): authedIdpFetch
+  // throws on non-2xx and tags the error with `.status`, so a 404 maps to null
+  // and any other non-2xx re-throws. Scope is ambient (getActiveScope).
+  let json;
+  try {
+    json = await authedIdpFetch({
+      idpUrl,
+      method: 'POST',
+      path: `/v1/agent-state/vault/${encodeURIComponent(id)}/secret`,
+      body: { handle_pubkey_b64: handlePubB64, handle_id: handleId },
+      agentDid,
+      vcCompact,
+      signingKey,
+      fetchImpl,
+    });
+  } catch (e) {
+    if (e?.status === 404) return null;
+    throw e;
   }
-  const json = await res.json();
   return typeof json?.wrapped_secret_b64 === 'string' ? json.wrapped_secret_b64 : null;
 }

@@ -23,7 +23,7 @@
  */
 
 import { initializeSdkBindings } from './sdk-bindings.js';
-import { mintDpopJwt } from './dpop.js';
+import { authedIdpFetch } from './mls-groups-api.js';
 
 const IDP_BASE_URL = process.env.LASTID_IDP_URL ?? 'https://human.lastid.co';
 const POLL_INTERVAL_MS = 3000;
@@ -75,28 +75,18 @@ async function createApprovalRow({
       'use-approval: no signingKey available — required to mint DPoP proof',
     );
   }
-  const url = `${IDP_BASE_URL}/v1/agent-use-approvals`;
-  const popJwt = mintDpopJwt({
+  // Shared, broker-aware authedIdpFetch (FORK1): same Bearer + DPoP legacy
+  // shaping, broker resource-token when enabled. Throws on non-2xx (caller
+  // surfaces it). Scope is ambient (getActiveScope).
+  return authedIdpFetch({
+    idpUrl: IDP_BASE_URL,
+    method: 'POST',
+    path: '/v1/agent-use-approvals',
+    body: request,
     agentDid,
-    httpMethod: 'POST',
-    httpUri: url,
+    vcCompact,
     signingKey,
   });
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${vcCompact}`,
-      DPoP: popJwt,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(request),
-  });
-  if (!res.ok) {
-    throw new Error(
-      `use-approval: create failed: HTTP ${res.status} ${await res.text().catch(() => '')}`,
-    );
-  }
-  return res.json();
 }
 
 /**
@@ -112,32 +102,25 @@ async function pollApprovalRow({
   timeoutMs = PENDING_TTL_MS,
 }) {
   const deadlineMs = Date.now() + timeoutMs;
-  const url = `${IDP_BASE_URL}/v1/agent-use-approvals/${encodeURIComponent(approvalId)}`;
+  const path = `/v1/agent-use-approvals/${encodeURIComponent(approvalId)}`;
   while (Date.now() < deadlineMs) {
-    // Mint a fresh DPoP proof per poll so iat stays inside the IdP's
-    // ±60s window even if the operator takes a while to decide.
-    const popJwt = mintDpopJwt({
-      agentDid,
-      httpMethod: 'GET',
-      httpUri: url,
-      signingKey,
-    });
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${vcCompact}`,
-        DPoP: popJwt,
-      },
-    });
-    if (res.status === 404) {
-      throw new Error('use-approval: row vanished mid-poll');
+    // Shared, broker-aware authedIdpFetch (FORK1) per poll — the legacy path
+    // mints a fresh DPoP each time (iat stays in the IdP's ±60s window); the
+    // broker path refreshes its resource-token internally. 404 → row vanished.
+    let row;
+    try {
+      row = await authedIdpFetch({
+        idpUrl: IDP_BASE_URL,
+        method: 'GET',
+        path,
+        agentDid,
+        vcCompact,
+        signingKey,
+      });
+    } catch (e) {
+      if (e?.status === 404) throw new Error('use-approval: row vanished mid-poll');
+      throw e;
     }
-    if (!res.ok) {
-      throw new Error(
-        `use-approval: poll failed: HTTP ${res.status} ${await res.text().catch(() => '')}`,
-      );
-    }
-    const row = await res.json();
     if (row.status && row.status !== 'pending') {
       return row;
     }

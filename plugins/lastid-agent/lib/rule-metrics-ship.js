@@ -5,7 +5,7 @@
  * (off the tool-call latency path). Carries only rule id / severity / tool
  * category / curated provenance — never command or pattern text.
  */
-import { mintDpopJwt } from './dpop.js';
+import { authedIdpFetch } from './mls-groups-api.js';
 import { shipRuleHits } from './rule-metrics.js';
 
 export const RULE_HITS_PATH = '/v1/agent-state/rule-hits';
@@ -19,21 +19,27 @@ export async function shipRuleMetrics({
   fetchImpl = globalThis.fetch,
 }) {
   if (typeof fetchImpl !== 'function' || !idpUrl || !vcCompact || !signingKey) return 0;
+  // Route through the shared, broker-aware authedIdpFetch (FORK1); preserve the
+  // offline-safe BOOLEAN contract + the 5s timeout (passed as `signal`, which
+  // authedIdpFetch forwards to the legacy fetch; the broker path has its own
+  // IPC timeout). authedIdpFetch throws on non-2xx, so try/catch → false.
   return shipRuleHits(scope, async (records) => {
     try {
-      const res = await fetchImpl(`${idpUrl}${RULE_HITS_PATH}`, {
+      await authedIdpFetch({
+        idpUrl,
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${vcCompact}`,
-          DPoP: mintDpopJwt({ agentDid, httpMethod: 'POST', httpUri: `${idpUrl}${RULE_HITS_PATH}`, signingKey }),
-        },
-        body: JSON.stringify({ hits: records }),
+        path: RULE_HITS_PATH,
+        body: { hits: records },
+        agentDid,
+        vcCompact,
+        signingKey,
+        fetchImpl,
+        scope,
         ...(typeof AbortSignal?.timeout === 'function' ? { signal: AbortSignal.timeout(5000) } : {}),
       });
-      return res?.ok === true || (typeof res?.status === 'number' && res.status >= 200 && res.status < 300);
+      return true;
     } catch {
-      return false; // offline/timeout → cursor stays, retry next tick
+      return false; // offline/timeout/non-2xx → cursor stays, retry next tick
     }
   });
 }
