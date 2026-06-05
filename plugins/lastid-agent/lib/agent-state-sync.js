@@ -15,7 +15,7 @@
  * each record's signature without a separate fetch (same precedent as
  * approval rows). RULES are fail-closed — an unverified rule is dropped.
  */
-import { mintDpopJwt } from './dpop.js';
+import { authedIdpFetch } from './mls-groups-api.js';
 import { decryptContent } from './agent-content-crypto.js';
 import { applyVaultRecords, refreshCliBindings } from './vault-cache.js';
 import {
@@ -99,19 +99,20 @@ export function decodeRecord(record, slotSeed, projectRootSeed = null) {
 }
 
 async function fetchKind({ idpUrl, path, since, agentDid, vcCompact, signingKey, fetchImpl }) {
-  const base = `${idpUrl}${path}`;
-  const url = `${base}?since=${encodeURIComponent(since)}`;
-  const headers = {
-    Authorization: `Bearer ${vcCompact}`,
-    DPoP: mintDpopJwt({ agentDid, httpMethod: 'GET', httpUri: base, signingKey }),
-    accept: 'application/json',
-  };
-  const res = await fetchImpl(url, { method: 'GET', headers });
-  if (!res.ok) {
-    const text = typeof res.text === 'function' ? await res.text() : '';
-    throw new Error(`agent-state ${path} fetch failed: ${res.status} ${text}`);
-  }
-  const body = await res.json();
+  // FORK1 (Phase 2): route through the shared, broker-aware authedIdpFetch. The
+  // legacy path is byte-identical (Bearer + DPoP; htu strips the ?since query the
+  // same way) and, when LASTID_BROKER_IDP is on + a broker is up, the signed
+  // broker makes the call. Scope is ambient (getActiveScope). authedIdpFetch
+  // returns the parsed body; we shape the per-kind result from it as before.
+  const body = await authedIdpFetch({
+    idpUrl,
+    method: 'GET',
+    path: `${path}?since=${encodeURIComponent(since)}`,
+    agentDid,
+    vcCompact,
+    signingKey,
+    fetchImpl,
+  });
   return {
     records: Array.isArray(body?.records) ? body.records : [],
     cursor: typeof body?.cursor === 'number' ? body.cursor : since,
