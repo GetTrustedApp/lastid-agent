@@ -18,6 +18,7 @@ import {
   brokerIdpFetch,
   brokerHealth,
   brokerAvailable,
+  brokerSignAgentRecord,
   brokerSocketPath,
   brokerTokenPath,
   brokerRuntimeDir,
@@ -219,4 +220,59 @@ test('brokerIpcCall: unconnectable socket → rejects (no hang)', async () => {
     }),
     /broker ipc:/,
   );
+});
+
+test('brokerSignAgentRecord: sends kind=sign_agent_record + base64url(JSON(claims)), returns the jws', async () => {
+  const srv = await startServer((req) => {
+    // Echo a fake JWS so we can assert the request shape + return path.
+    return { id: req.id, ok: true, status: 200, body: { jws: 'h.p.s' } };
+  });
+  try {
+    const claims = { kind: 'memory', id: 'm1', version: 3 };
+    const jws = await brokerSignAgentRecord({ socketPath: srv.socketPath, token: 't', claims });
+    assert.equal(jws, 'h.p.s');
+    const req = srv.received[0];
+    assert.equal(req.kind, 'sign_agent_record');
+    // payload_b64 MUST equal node's own base64url(JSON.stringify(claims)) — the
+    // broker signs exactly these bytes, so node owns the canonicalization.
+    const expected = Buffer.from(JSON.stringify(claims), 'utf8').toString('base64url');
+    assert.equal(req.payload_b64, expected);
+    assert.ok(!('method' in req), 'no idp_call fields leak in');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerSignAgentRecord: accepts a precomputed payloadB64 verbatim', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: true, status: 200, body: { jws: 'a.b.c' } }));
+  try {
+    await brokerSignAgentRecord({ socketPath: srv.socketPath, token: 't', payloadB64: 'PRECOMPUTED' });
+    assert.equal(srv.received[0].payload_b64, 'PRECOMPUTED');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerSignAgentRecord: broker error → throws', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: false, error: { code: 'bad_request', message: 'nope' } }));
+  try {
+    await assert.rejects(
+      brokerSignAgentRecord({ socketPath: srv.socketPath, token: 't', claims: { a: 1 } }),
+      /sign_agent_record failed: broker bad_request/,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerSignAgentRecord: a non-JWS body → throws', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: true, status: 200, body: { jws: 'not-a-jws' } }));
+  try {
+    await assert.rejects(
+      brokerSignAgentRecord({ socketPath: srv.socketPath, token: 't', claims: { a: 1 } }),
+      /unexpected broker response/,
+    );
+  } finally {
+    await srv.close();
+  }
 });

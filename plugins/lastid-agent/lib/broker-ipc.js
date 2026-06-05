@@ -86,6 +86,7 @@ export function brokerIpcCall({
   method,
   path,
   body,
+  fields,
   connect = net.createConnection,
   timeoutMs = 20_000,
 }) {
@@ -96,6 +97,8 @@ export function brokerIpcCall({
       req.path = path;
       if (body !== undefined) req.body = body;
     }
+    // Extra op fields for non-idp_call ops (e.g. sign_agent_record → payload_b64).
+    if (fields && typeof fields === 'object') Object.assign(req, fields);
 
     let sock;
     try {
@@ -235,4 +238,54 @@ export async function brokerIdpFetch({
     throw err;
   }
   return resp.body ?? {};
+}
+
+/**
+ * Sign an authored memory/rule record via the signed broker (FORK1 Phase 3).
+ * The broker holds the agent's slot-seed-derived P-256 identity key and returns
+ * the compact ES256 provenance JWS — BYTE-IDENTICAL to the JS
+ * `agent-sig-verify.js::signAgentRecordJws` for the same claims, because node
+ * controls the JSON canonicalization here (base64url(JSON.stringify(claims)) is
+ * the signed payload, exactly as today) and the broker only adds the fixed
+ * header + the deterministic ES256 signature.
+ *
+ * Broker is P-256-only, so this path is for P-256 (`zDn…`) agents; Ed25519
+ * agents keep the local node signer.
+ *
+ * @param {object} a
+ * @param {string} [a.scope]
+ * @param {object} [a.claims]       - record claims (node JSON.stringifies them)
+ * @param {string} [a.payloadB64]   - or a precomputed base64url(JSON) directly
+ * @returns {Promise<string>} the compact JWS (header.payload.sig)
+ */
+export async function brokerSignAgentRecord({
+  scope = 'main',
+  claims,
+  payloadB64,
+  socketPath,
+  token,
+  connect,
+  timeoutMs,
+} = {}) {
+  const sp = socketPath ?? brokerSocketPath(scope);
+  const tok = token ?? (await readBrokerToken(scope));
+  const payload =
+    payloadB64 ?? Buffer.from(JSON.stringify(claims), 'utf8').toString('base64url');
+  const resp = await brokerIpcCall({
+    socketPath: sp,
+    token: tok,
+    kind: 'sign_agent_record',
+    fields: { payload_b64: payload },
+    connect,
+    timeoutMs,
+  });
+  if (resp.error) {
+    const code = resp.error.code ?? 'broker_error';
+    throw new Error(`sign_agent_record failed: broker ${code}: ${resp.error.message ?? ''}`);
+  }
+  const jws = resp.body?.jws;
+  if (typeof jws !== 'string' || jws.split('.').length !== 3) {
+    throw new Error(`sign_agent_record: unexpected broker response ${JSON.stringify(resp.body)}`);
+  }
+  return jws;
 }

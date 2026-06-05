@@ -18,6 +18,9 @@ import { deriveProjectRoutingId, encryptProjectContent } from './project-crypto.
 import { deriveAgentKeypair } from './agent-provisioning.js';
 import { signAgentRecordJws, sha256Hex } from './agent-sig-verify.js';
 import { authedIdpFetch } from './mls-groups-api.js';
+import { brokerAvailable, brokerSignAgentRecord } from './broker-ipc.js';
+import { brokerIdpEnabled } from './broker-supervisor.js';
+import { getActiveScope } from './active-scope.js';
 
 export const MEMORIES_PATH = '/v1/agent-state/memories';
 
@@ -78,19 +81,27 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
   const contentBytes = isRevoke
     ? null
     : Buffer.from(JSON.stringify(memorySyncContent(memory)), 'utf8');
-  const sig = signAgentRecordJws(
-    {
-      kind: 'memory',
-      id: memory.id,
-      target,
-      version: ver,
-      status: recStatus,
-      ...(contentBytes ? { content_sha256: sha256Hex(contentBytes) } : {}),
-    },
-    // Dual-algo signer: the Ed25519 KeyObject selects EdDSA for an existing
-    // Ed25519 agent; the raw P-256 scalar selects ES256 for a new agent.
-    { signingKey, signingSeed },
-  );
+  const claims = {
+    kind: 'memory',
+    id: memory.id,
+    target,
+    version: ver,
+    status: recStatus,
+    ...(contentBytes ? { content_sha256: sha256Hex(contentBytes) } : {}),
+  };
+  // FORK1 Phase 3: a P-256 agent mints the record provenance JWS in the SIGNED
+  // BROKER (it holds the slot-seed key) when LASTID_BROKER_IDP is on AND a broker
+  // is up — byte-identical to signAgentRecordJws (node owns the JSON
+  // canonicalization). The broker is P-256-only, so Ed25519 agents and the
+  // no-broker path keep the local dual-algo signer.
+  const isEd25519 = signingKey?.asymmetricKeyType === 'ed25519';
+  const recordScope = getActiveScope();
+  let sig;
+  if (!isEd25519 && brokerIdpEnabled() && (await brokerAvailable(recordScope))) {
+    sig = await brokerSignAgentRecord({ scope: recordScope, claims });
+  } else {
+    sig = signAgentRecordJws(claims, { signingKey, signingSeed });
+  }
 
   let body;
   if (memory.tier === 'project') {
