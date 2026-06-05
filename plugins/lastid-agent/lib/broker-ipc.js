@@ -289,3 +289,48 @@ export async function brokerSignAgentRecord({
   }
   return jws;
 }
+
+/**
+ * Decrypt an operator-distributed rule/memory envelope via the signed broker
+ * (FORK1 Phase 3). The broker holds the slot_seed (+ project_root_seed) and
+ * returns the PLAINTEXT — byte-identical to JS `agent-content-crypto.js
+ * decryptContent` / `project-crypto.js decryptProjectContent` (same SDK crypto),
+ * but the seeds never reach node.
+ *
+ * @param {object} a
+ * @param {string} [a.scope]
+ * @param {string} a.envelopeB64    - standard base64 of the packed LIDE envelope
+ * @param {string|null} [a.projectKey] - set for project-tier content; absent → slot-seed
+ * @returns {Promise<Buffer>} the decrypted plaintext bytes
+ */
+export async function brokerDecryptContent({
+  scope = 'main',
+  envelopeB64,
+  projectKey,
+  socketPath,
+  token,
+  connect,
+  timeoutMs,
+} = {}) {
+  const sp = socketPath ?? brokerSocketPath(scope);
+  const tok = token ?? (await readBrokerToken(scope));
+  const fields = { envelope_b64: envelopeB64 };
+  if (projectKey != null) fields.project_key = projectKey;
+  const resp = await brokerIpcCall({
+    socketPath: sp,
+    token: tok,
+    kind: 'decrypt_agent_content',
+    fields,
+    connect,
+    timeoutMs,
+  });
+  if (resp.error) {
+    const code = resp.error.code ?? 'broker_error';
+    throw new Error(`decrypt_agent_content failed: broker ${code}: ${resp.error.message ?? ''}`);
+  }
+  const b64 = resp.body?.plaintext_b64;
+  if (typeof b64 !== 'string') {
+    throw new Error(`decrypt_agent_content: unexpected broker response ${JSON.stringify(resp.body)}`);
+  }
+  return Buffer.from(b64, 'base64');
+}

@@ -19,6 +19,7 @@ import {
   brokerHealth,
   brokerAvailable,
   brokerSignAgentRecord,
+  brokerDecryptContent,
   brokerSocketPath,
   brokerTokenPath,
   brokerRuntimeDir,
@@ -271,6 +272,49 @@ test('brokerSignAgentRecord: a non-JWS body → throws', async () => {
     await assert.rejects(
       brokerSignAgentRecord({ socketPath: srv.socketPath, token: 't', claims: { a: 1 } }),
       /unexpected broker response/,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerDecryptContent: slot-tier sends kind=decrypt_agent_content + envelope_b64, returns plaintext Buffer', async () => {
+  const pt = Buffer.from('hello plaintext', 'utf8');
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: true,
+    status: 200,
+    body: { plaintext_b64: pt.toString('base64') },
+  }));
+  try {
+    const out = await brokerDecryptContent({ socketPath: srv.socketPath, token: 't', envelopeB64: 'RU5W' });
+    assert.ok(Buffer.isBuffer(out));
+    assert.equal(out.toString('utf8'), 'hello plaintext');
+    const req = srv.received[0];
+    assert.equal(req.kind, 'decrypt_agent_content');
+    assert.equal(req.envelope_b64, 'RU5W');
+    assert.ok(!('project_key' in req), 'no project_key for slot-tier');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerDecryptContent: project tier includes project_key', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: true, status: 200, body: { plaintext_b64: '' } }));
+  try {
+    await brokerDecryptContent({ socketPath: srv.socketPath, token: 't', envelopeB64: 'X', projectKey: 'my-repo' });
+    assert.equal(srv.received[0].project_key, 'my-repo');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerDecryptContent: broker error (wrong key / tamper) → throws', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: false, error: { code: 'bad_request', message: 'aead failed' } }));
+  try {
+    await assert.rejects(
+      brokerDecryptContent({ socketPath: srv.socketPath, token: 't', envelopeB64: 'X' }),
+      /decrypt_agent_content failed: broker bad_request/,
     );
   } finally {
     await srv.close();
