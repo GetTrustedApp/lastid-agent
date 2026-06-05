@@ -1278,6 +1278,7 @@ async function cmdListen(flags) {
     { PresenceEmitter },
     { readActivityTs, readSignalTs },
     { getOrchestrator, disposeOrchestrator },
+    { startBrokerSupervisor },
   ] = await Promise.all([
     import('./agent-provisioning.js'),
     import('./mls-client.js'),
@@ -1290,6 +1291,7 @@ async function cmdListen(flags) {
     import('./presence-emitter.js'),
     import('./presence-activity.js'),
     import('./mls-orchestrator.js'),
+    import('./broker-supervisor.js'),
   ]);
 
   // The agent's operator (parent human) — the only peer it reconciles against.
@@ -1304,6 +1306,22 @@ async function cmdListen(flags) {
   if (lock.evicted) {
     process.stderr.write(
       `[lastid-agent] evicted a pre-existing listener (pid ${lock.evicted}) on scope=${scope} — single MLS writer enforced\n`,
+    );
+  }
+
+  // Phase 1 (broker-credential-custody): the listener owns the signed broker's
+  // lifecycle. Bring it up for this scope so it can serve FORK1 IdP calls
+  // (brokerIdpFetch). No-flag-day + macOS-gated INSIDE the supervisor → returns
+  // null (legacy node IdP path) when LASTID_BROKER_IDP is off or not on macOS.
+  // Tied to this listener's lifetime; torn down in shutdown().
+  const broker = await startBrokerSupervisor({
+    scope,
+    idpUrl,
+    log: (l) => process.stderr.write(`${l}\n`),
+  });
+  if (broker) {
+    process.stderr.write(
+      `[lastid-agent] signed broker supervised (scope=${scope} ready=${broker.ready} pid=${broker.pid ?? '?'})\n`,
     );
   }
 
@@ -1999,6 +2017,8 @@ async function cmdListen(flags) {
     // also avoids the GC-finalize-flush rust panic at exit
     // (mem_01KSRJR43ZARPS9CPCYPB0DND3).
     try { disposeOrchestrator(listenerCtx); } catch { /* ignore */ }
+    // Stop the supervised signed broker (null when on the legacy node path).
+    if (broker) { try { broker.stop(); } catch { /* ignore */ } }
     // Release the single-instance lock if it's still ours (a listener that
     // took over from us already claimed it — don't delete a live owner's pid).
     void releaseListenerLock({ scope }).catch(() => {});
