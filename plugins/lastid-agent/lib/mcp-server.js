@@ -19,14 +19,8 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { DesktopMcpClient } from './desktop-mcp-client.js';
-import { deriveAgentKeypair } from './agent-provisioning.js';
 import { loadAgentVc } from './keychain.js';
 import { decodeVcClaims, hasCapability } from './vc-claims.js';
-import {
-  parseApprovalRequiredResult,
-  runApprovalLoop,
-} from './use-approval-loop.js';
 import { reapStaleServers } from './reap-stale-servers.js';
 import { MEMORY_TOOLS, MEMORY_TOOL_NAMES, handleMemoryTool } from './memory-tools.js';
 import { CORE_REACTION_EMOJIS, isSupportedReaction } from './reactions.js';
@@ -769,33 +763,6 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
   throw new Error(`unknown plugin tool: ${name}`);
 }
 
-/**
- * Best-effort: build a DesktopMcpClient if the host has an agent
- * VC + slot seed AND a wallet is reachable. Returns null on any
- * failure (the plugin still serves its own tools).
- */
-async function tryConnectDesktop({ loadedAgent }) {
-  if (!loadedAgent) return { client: null, signingKey: null, signingSeed: null };
-  let signingKey;
-  let signingSeed;
-  try {
-    ({ signingKey, signingSeed } = deriveAgentKeypair(loadedAgent.slotSeed, loadedAgent.agentDid));
-  } catch (err) {
-    process.stderr.write(
-      `[lastid-agent] desktop bridge: keypair derivation failed: ${err.message}\n`,
-    );
-    return { client: null, signingKey: null, signingSeed: null };
-  }
-  const client = new DesktopMcpClient({
-    agentDid: loadedAgent.agentDid,
-    vcCompact: loadedAgent.vcCompact,
-    signingKey,
-    signingSeed,
-  });
-  const ok = await client.connect();
-  return { client: ok ? client : null, signingKey, signingSeed };
-}
-
 // True when the on-disk credential differs from the one this server cached.
 // Lets a long-lived server pick up a `provision --reissue` (new slot/DID/VC)
 // without a full restart. Null fresh => nothing valid on disk, keep what we have.
@@ -834,18 +801,9 @@ async function buildServer({ scope }) {
     ].join('\n'),
   });
 
-  // Cached state. Connect once at build time; tools/list re-attempts
-  // the desktop connection only when no client is currently held
-  // (handles "wallet came up mid-session"). tools/call leans on the
-  // client's own re-handshake on 401 / expiry. signingKey (a Node
-  // KeyObject — Ed25519 or P-256) is held alongside the client so the
-  // use-approval orchestrator can mint dual-algo (EdDSA / ES256) DPoP
-  // JWTs against /v1/agent-use-approvals without re-deriving the
-  // keypair on each call.
+  // Cached credential. Re-read on a short TTL so a `provision --reissue` (new
+  // slot/DID/VC) is picked up without a full session restart (reloadAgentIfStale).
   let loadedAgent = await loadAgentVc(scope);
-  let desktopConn = await tryConnectDesktop({ loadedAgent });
-  let desktopClient = desktopConn.client;
-  let signingKey = desktopConn.signingKey;
   // When we last re-read the credential from disk (gates the reissue TTL below).
   let lastAgentReadAt = Date.now();
   // Re-read the credential at most this often (ms) to catch a reissue.
@@ -871,39 +829,20 @@ async function buildServer({ scope }) {
     // keep answering + signing as the OLD (now-revoked) identity until a full
     // session restart. Re-read on a short TTL and swap when the on-disk identity
     // changed; the TTL keeps the common no-change path a single in-process check
-    // rather than a credential read per tool call. Drop the desktop connection
-    // so signingKey re-derives from the new slot seed.
+    // rather than a credential read per tool call.
     if (Date.now() - lastAgentReadAt >= AGENT_REFRESH_TTL_MS) {
       lastAgentReadAt = Date.now();
       const fresh = await loadAgentVc(scope);
       if (agentCredentialChanged(loadedAgent, fresh)) {
         loadedAgent = fresh;
-        desktopClient = null;
-        signingKey = null;
       }
     }
   };
 
-  const ensureDesktop = async () => {
-    if (desktopClient) return desktopClient;
-    await reloadAgentIfStale();
-    desktopConn = await tryConnectDesktop({ loadedAgent });
-    desktopClient = desktopConn.client;
-    signingKey = desktopConn.signingKey;
-    return desktopClient;
-  };
-
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const client = await ensureDesktop();
-    const remote = client?.remoteTools() ?? [];
-    // De-dupe by name in case the desktop ever exposes a plugin
-    // tool name; plugin tools win.
-    const remoteFiltered = remote.filter((t) => !PLUGIN_TOOL_NAMES.has(t.name));
-    const remoteNames = new Set(remoteFiltered.map((t) => t.name));
-    // Advertise the LOCAL vault tools unless a connected desktop already
-    // publishes them (desktop wins so we don't shadow its native vault).
-    const localVault = LOCAL_VAULT_TOOLS.filter((t) => !remoteNames.has(t.name));
-    return { tools: [...PLUGIN_TOOLS, ...remoteFiltered, ...localVault] };
+    // The plugin's own tools + the LOCAL IdP-backed vault tools. (The desktop
+    // MCP proxy was removed — the agent talks only to the IdP + stdin.)
+    return { tools: [...PLUGIN_TOOLS, ...LOCAL_VAULT_TOOLS] };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -912,86 +851,8 @@ async function buildServer({ scope }) {
     if (PLUGIN_TOOL_NAMES.has(name)) {
       return handlePluginTool(name, args ?? {}, { scope, loadedAgent });
     }
-    const client = await ensureDesktop();
-    if (client && client.ownsTool(name)) {
-      try {
-        const initial = await client.callTool(name, args ?? {});
-        // Policy plane: when vault_use returns a structured
-        // `policy_approval_required`, drive the cross-device approval
-        // round-trip transparently so the LLM caller sees one tool
-        // result (either the handle or a structured denial).
-        if (name === 'vault_use' && loadedAgent && signingKey) {
-          const approvalBody = parseApprovalRequiredResult(initial);
-          if (approvalBody) {
-            const outcome = await runApprovalLoop({
-              approvalBody,
-              originalArgs: args ?? {},
-              agentDid: loadedAgent.agentDid,
-              vcCompact: loadedAgent.vcCompact,
-              signingKey,
-            });
-            if (outcome.retryArgs) {
-              return await client.callTool(name, outcome.retryArgs);
-            }
-            if (outcome.expired) {
-              return {
-                content: [
-                  {
-                    type: 'text',
-                    text: JSON.stringify(
-                      {
-                        error: 'policy_approval_expired',
-                        reason_detail:
-                          'operator did not decide within the pending window',
-                      },
-                      null,
-                      2,
-                    ),
-                  },
-                ],
-                isError: true,
-              };
-            }
-            if (outcome.denied) {
-              return {
-                content: [
-                  {
-                    type: 'text',
-                    text: JSON.stringify(outcome.body, null, 2),
-                  },
-                ],
-                isError: true,
-              };
-            }
-          }
-        }
-        return initial;
-      } catch (err) {
-        // Drop the cached client so the next call rediscovers — the
-        // wallet may have shut down between calls.
-        desktopClient = null;
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  error: 'desktop_tool_failed',
-                  tool: name,
-                  message: err.message,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-    // SaaS / no-desktop path: route vault_use + http_fetch to the LOCAL listener.
-    // The approval loop now lives INSIDE vault-ipc's vault_use handler
-    // (single dispatch site), so this caller no longer threads signingSeed.
+    // vault_use + http_fetch go to the LOCAL IdP-backed listener. The approval
+    // loop lives INSIDE vault-ipc's vault_use handler (single dispatch site).
     if (LOCAL_VAULT_TOOL_NAMES.has(name)) {
       return handleLocalVault({ name, args: args ?? {}, scope, loadedAgent });
     }

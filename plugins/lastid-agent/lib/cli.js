@@ -668,36 +668,10 @@ async function cmdMemoryRetrieve(flags) {
     }
   } catch (e) {
     process.stderr.write(`memory-retrieve(local): ${e?.message ?? e}\n`);
-    // fall through to desktop
   }
-
-  // Desktop fallback (transition): the old TCB still holds memories until
-  // they're migrated. Soft-fail to no output if unreachable.
-  const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
-  const { deriveAgentKeypair } = await import('./agent-provisioning.js');
-  const { signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid);
-  const client = new DesktopMcpClient({
-    agentDid: loaded.agentDid,
-    vcCompact: loaded.vcCompact,
-    signingKey,
-    signingSeed,
-  });
-  const ok = await client.connect().catch(() => false);
-  if (!ok) {
-    process.exit(0);
-  }
-  try {
-    const res = await client.postJson('/memory/retrieve', {
-      prompt,
-      agent_dids: [loaded.agentDid],
-    });
-    if (res && typeof res.packet_markdown === 'string') {
-      process.stdout.write(res.packet_markdown);
-    }
-  } catch (e) {
-    process.stderr.write(`memory-retrieve: ${e?.message ?? e}\n`);
-    process.exit(1);
-  }
+  // Local-first only (the desktop fallback was removed — the agent uses the IdP
+  // + stdin). No local hit → emit nothing so the hook injects no ambient context.
+  process.exit(0);
 }
 
 /**
@@ -944,57 +918,10 @@ async function cmdMemorySearch(flags) {
     }
   } catch (e) {
     process.stderr.write(`memory-search(local): ${e?.message ?? e}\n`);
-    // fall through to desktop
   }
-
-  const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
-  const { deriveAgentKeypair } = await import('./agent-provisioning.js');
-  const { signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid);
-  const client = new DesktopMcpClient({
-    agentDid: loaded.agentDid,
-    vcCompact: loaded.vcCompact,
-    signingKey,
-    signingSeed,
-  });
-  const ok = await client.connect().catch(() => false);
-  if (!ok) {
-    // Desktop unreachable. Stay silent so the calling hook treats
-    // this as no ambient context and lets the tool proceed.
-    process.exit(0);
-  }
-  try {
-    const res = await client.postJson('/memory/search', {
-      query: prompt,
-      agent_dids: [loaded.agentDid],
-      limit,
-      exclude_bedrock: excludeBedrock,
-    });
-    if (!res || !Array.isArray(res.hits) || res.hits.length === 0) {
-      process.exit(0);
-    }
-    // Render as a compact <lastid-memory> block. Each hit cites
-    // its id + score so the agent can audit what was injected.
-    const lines = ['<lastid-memory source="ambient">'];
-    for (const hit of res.hits) {
-      const score = typeof hit.score === 'number'
-        ? ` [match ${hit.score.toFixed(2)}]`
-        : '';
-      const subject = Array.isArray(hit.subject) ? hit.subject.join(', ') : '';
-      lines.push(
-        `- [${hit.memory_id}] ${hit.claim}${score}` +
-          (subject ? ` (subject: ${subject})` : ''),
-      );
-      if (hit.summary && typeof hit.summary === 'string' && hit.summary.trim().length > 0) {
-        // Indent the summary on its own line.
-        lines.push(`  ${hit.summary.trim()}`);
-      }
-    }
-    lines.push('</lastid-memory>');
-    process.stdout.write(lines.join('\n') + '\n');
-  } catch (e) {
-    process.stderr.write(`memory-search: ${e?.message ?? e}\n`);
-    process.exit(0);
-  }
+  // Local-first only (the desktop fallback was removed — the agent uses the IdP
+  // + stdin). Nothing local → emit nothing so the hook injects no context.
+  process.exit(0);
 }
 
 /**
@@ -1077,9 +1004,7 @@ async function cmdPolicyCheck(flags) {
     process.stderr.write('policy-check: --tool required\n');
     process.exit(2);
   }
-  const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
   const { loadAgentVc } = await import('./keychain.js');
-  const { deriveAgentKeypair } = await import('./agent-provisioning.js');
   const loaded = await loadAgentVc(resolveScope(flags));
   if (!loaded) {
     // Not provisioned — fail open. The plugin acts only on
@@ -1088,18 +1013,16 @@ async function cmdPolicyCheck(flags) {
     process.exit(0);
   }
 
-  // Local-first: the synced operator-store IS the operator's rule set
-  // once we've pulled any state, so a SaaS-fed agent enforces rules with
-  // nothing else running. The desktop /policy/check below is the fallback
-  // only before the first sync (cold start / transition). See
-  // saas-migration.md §2.3.
+  // Local-first: the synced operator-store IS the operator's rule set once we've
+  // pulled any state, so a SaaS-fed agent enforces rules with nothing else
+  // running. (The desktop /policy/check fallback was removed — IdP + stdin only.)
   try {
     const { OperatorStore, deriveOperatorStateMacKey } = await import('./operator-store.js');
     // Pass this agent's own DID so per-agent rule EXEMPTIONS are honored — a
     // global rule the operator opted THIS agent out of won't fire here. Key the
     // store so a tampered operator-state.json (deleted deny rule, flipped
-    // exemption) fails the integrity check and we fall back to safe defaults +
-    // the desktop, rather than enforcing the agent's own edit.
+    // exemption) fails the integrity check and we fail open to safe defaults
+    // rather than enforcing the agent's own edit.
     const local = new OperatorStore(resolveScope(flags), undefined, {
       macKey: deriveOperatorStateMacKey(loaded.slotSeed),
     }).policyDecision(tool, input, {
@@ -1110,34 +1033,11 @@ async function cmdPolicyCheck(flags) {
       process.exit(0);
     }
   } catch (e) {
-    // Local store unreadable — fall through to the desktop.
     process.stderr.write(`policy-check(local): ${e?.message ?? e}\n`);
   }
-
-  const { signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid);
-  const client = new DesktopMcpClient({
-    agentDid: loaded.agentDid,
-    vcCompact: loaded.vcCompact,
-    signingKey,
-    signingSeed,
-  });
-  const ok = await client.connect().catch(() => false);
-  if (!ok) {
-    process.exit(0);
-  }
-  try {
-    const res = await client.postJson('/policy/check', {
-      tool,
-      input,
-      agent_dids: [loaded.agentDid],
-    });
-    if (res) {
-      process.stdout.write(JSON.stringify(res));
-    }
-  } catch (e) {
-    process.stderr.write(`policy-check: ${e?.message ?? e}\n`);
-    process.exit(1);
-  }
+  // No local decision → fail open (the plugin acts only on explicitly-authored
+  // rules; absent a hit there is nothing to enforce).
+  process.exit(0);
 }
 
 /**
