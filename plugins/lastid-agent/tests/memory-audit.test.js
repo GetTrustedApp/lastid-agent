@@ -1,7 +1,7 @@
 /**
  * Tests for the agent memory audit chain (lib/memory-audit.js): per-AGENT
- * keying, genesis + chain_id, checkpoints, append + hash-link + Ed25519 sign +
- * verify + tamper detection + per-agent ship cursor, and the memory-tools
+ * keying, genesis + chain_id, checkpoints, append + hash-link + ES256 (P-256)
+ * sign + verify + tamper detection + per-agent ship cursor, and the memory-tools
  * integration (write/update/forget append signed records; drafts do not).
  *
  * The chain is keyed PER AGENT within a scope: a scope can host two agents at
@@ -33,7 +33,7 @@ import {
 } from '../lib/memory-audit.js';
 import { handleMemoryTool } from '../lib/memory-tools.js';
 import { shipMemoryAudit } from '../lib/memory-audit-ship.js';
-import { deriveAgentEd25519Keypair } from '../lib/agent-provisioning.js';
+import { deriveAgentP256Keypair } from '../lib/agent-provisioning.js';
 
 const AGENT = 'did:lastid:agent:zA';
 const AGENT_B = 'did:lastid:agent:zB';
@@ -43,7 +43,7 @@ function freshScope() {
   return { scope, dir: join(homedir(), '.lastid-agent', scope) };
 }
 
-const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
 
 test('canonicalJson: deterministic key order', () => {
   assert.equal(canonicalJson({ b: 1, a: 2 }), '{"a":2,"b":1}');
@@ -118,8 +118,8 @@ test('genesis: an agent\'s first record is seq 0, prev_hash null, with a fresh c
 // interleaves the other and each verifies independently.
 test('per-agent isolation: two agents in one scope keep separate genesis-rooted chains', () => {
   const { scope, dir } = freshScope();
-  const keyA = generateKeyPairSync('ed25519');
-  const keyB = generateKeyPairSync('ed25519');
+  const keyA = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const keyB = generateKeyPairSync('ec', { namedCurve: 'P-256' });
   try {
     // Interleave appends, exactly as two concurrent agents would.
     appendMemoryAudit({ scope, signingKey: keyA.privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'a1' });
@@ -344,7 +344,7 @@ test('ship cursor: per-agent unshipped → ship advances → none left (cursors 
 
 test('shipMemoryAudit: POSTs unshipped records to /audit + advances on 2xx', async () => {
   const { scope, dir } = freshScope();
-  const { signingKey } = deriveAgentEd25519Keypair(Buffer.alloc(32, 9));
+  const { signingKey } = deriveAgentP256Keypair(Buffer.alloc(32, 9));
   try {
     appendMemoryAudit({ scope, signingKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
     let posted = null;
@@ -391,7 +391,7 @@ test('memory tools SPOOL audit records (write/update/forget); draft does NOT; li
     // until the listener (single writer) drains the spool.
     assert.equal(readMemoryAudit(scope, loadedAgent.agentDid).length, 0, 'memory ops must not write the chain directly');
 
-    const { signingKey } = deriveAgentEd25519Keypair(loadedAgent.slotSeed);
+    const { signingKey } = deriveAgentP256Keypair(loadedAgent.slotSeed);
     const { drainAuditSpool } = await import('../lib/audit-spool.js');
     const chained = drainAuditSpool({ scope, signingKey, agentDid: loadedAgent.agentDid });
     assert.equal(chained, 3, 'three CUD events chained (draft excluded)');

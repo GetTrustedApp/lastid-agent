@@ -35,7 +35,9 @@ import { randomUUID } from 'node:crypto';
 
 import { initializeSdkBindings } from './sdk-bindings.js';
 import {
-  deriveAgentEd25519Keypair,
+  deriveAgentP256Keypair,
+  deriveAgentKeypair,
+  signParentAuthorization,
   parseCredentialOffer,
   exchangeToken,
   mintProofJwt,
@@ -197,21 +199,43 @@ export async function provisionSubagent({
   const subagentSeed = Buffer.from(subSeedBytes);
 
   // 3) Sub-agent keypair from seed (same HKDF path as top-level agents).
+  //    Sub-agents are P-256 regardless of the parent's algo, so the WASM
+  //    mintOid4vciProofJwtEs256 path is the right one — but it consumes
+  //    the raw 32-byte scalar (`signingSeed`), NOT the KeyObject. Without
+  //    threading signingSeed here, mintProofJwt falls into its P-256
+  //    branch with signingSeed=undefined and throws
+  //    `signingSeed must be the raw P-256 scalar bytes`, surfaced as
+  //    `subagent self-heal failed: ... mintProofJwt: signingSeed …`.
   const {
     signingKey: subSigningKey,
     publicJwk: subPublicJwk,
-  } = deriveAgentEd25519Keypair(subagentSeed);
-  const subPubkeyBytes = Buffer.from(subPublicJwk.x, 'base64url');
-  const subAgentDid = sdk.agentDidFromPubkey(subPubkeyBytes);
-  const subPubkeyJwkThumb = sdk.ed25519JwkThumbprint(subPubkeyBytes);
+    signingSeed: subSigningSeed,
+    agentDid: subAgentDid,
+  } = deriveAgentP256Keypair(subagentSeed);
+  // SEC1 uncompressed point (0x04 || X || Y) for the WASM helpers that take
+  // raw P-256 pubkey bytes (compressed or uncompressed both accepted).
+  const subPubkeySec1 = Buffer.concat([
+    Buffer.from([0x04]),
+    Buffer.from(subPublicJwk.x, 'base64url'),
+    Buffer.from(subPublicJwk.y, 'base64url'),
+  ]);
+  const subPubkeyJwkThumb = sdk.p256JwkThumbprint(subPubkeySec1);
 
-  // 4) Build parent_authorization claims + sign with parent's key.
-  //    The parent's signing seed comes from re-deriving the keypair from
-  //    its slot_seed; we already have parentSigningKey (KeyObject) for
-  //    DPoP, but the WASM signer wants raw bytes — so call the derivation
-  //    again for the seed-bytes path. Cheap; runs once per provision.
-  const { signingSeed: parentSigningSeed } = deriveAgentEd25519Keypair(
+  // 4) Build parent_authorization claims + sign with the parent's identity key.
+  //
+  //    DUAL-ALGO: the IdP's verifyParentAuthorization feature-detects the
+  //    expected alg from the parent's cnf pubkey (Ed25519 OKP → EdDSA, P-256 EC
+  //    → ES256) and requires header.alg to match. So an existing Ed25519 parent
+  //    signs EdDSA and a new P-256 parent signs ES256 — both accepted. We
+  //    derive the parent keypair from its slot_seed feature-detected to its own
+  //    DID (`deriveAgentKeypair`) so the signingKey is the correct curve, then
+  //    let signParentAuthorization branch on the key type. Sub-agent identity
+  //    itself stays P-256 (above) — only the PARENT's signature alg varies.
+  //
+  //    PURE JS (node:crypto) for both algos — no wasm rebuild.
+  const { signingKey: parentAuthKey } = deriveAgentKeypair(
     parentSlotSeed,
+    parentDid,
   );
 
   const now = Math.floor(Date.now() / 1000);
@@ -229,15 +253,10 @@ export async function provisionSubagent({
     exp: now + SUBAGENT_EXP_WINDOW_SECONDS,
     jti: `urn:uuid:${randomUUID()}`,
   };
-  // claims_json is the EXACT byte sequence the JWS will encode in its
-  // payload. Stringify once; the WASM signer treats the input as the
-  // serialized claims value verbatim.
+  // claims_json is the EXACT byte sequence the JWS will encode in its payload.
+  // Stringify once; the signer treats the input as the serialized claims verbatim.
   const claimsJson = JSON.stringify(claims);
-  const parentAuthorization = sdk.signParentAuthorization(
-    parentSigningSeed,
-    null,
-    claimsJson,
-  );
+  const parentAuthorization = signParentAuthorization(parentAuthKey, claimsJson);
 
   // 4) POST /sub authenticated as parent.
   const subUrl = `${idpUrl}/v1/oid4vci/agent-provision/sub`;
@@ -296,6 +315,7 @@ export async function provisionSubagent({
     agentDid: subAgentDid,
     agentPubkeyJwk: subPublicJwk,
     signingKey: subSigningKey,
+    signingSeed: subSigningSeed,
   });
   const issued = await claimCredential({
     credentialIssuer: offer.credentialIssuer,

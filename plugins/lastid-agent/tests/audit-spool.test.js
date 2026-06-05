@@ -21,7 +21,7 @@ import {
 } from '../lib/audit-spool.js';
 import { readMemoryAudit, verifyMemoryAudit } from '../lib/memory-audit.js';
 
-const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
 
 function freshScope() {
   const scope = `test-${randomUUID()}`;

@@ -50,7 +50,26 @@ import {
   hkdfSync,
 } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { agentDeviceIdFromEd25519Jwk } from './agent-device-id.js';
+import { createRequire } from 'node:module';
+import {
+  agentDeviceIdFromP256Jwk,
+  agentDeviceIdFromEd25519Jwk,
+  machineDeviceIdFromP256Jwk,
+} from './agent-device-id.js';
+import { getMachineSePubkeyJwk as defaultGetMachineSePubkeyJwk } from './broker-client.js';
+
+// The agent's stable identity crypto is owned by the Rust SDK, surfaced
+// through the bundled P-256 WASM. We load it directly here (rather than
+// via sdk-bindings.js) so the synchronous derivation path stays sync and
+// has no init/await dependency — provisioning derives the keypair inline.
+const wasmRequire = createRequire(import.meta.url);
+const agentWasm = wasmRequire('../vendor/lastid-agent-wasm/lastid_agent_wasm.js');
+
+/** serde_wasm_bindgen returns JWKs as a JS Map; normalize to a plain object. */
+function jwkToObject(jwk) {
+  if (jwk instanceof Map) return Object.fromEntries(jwk);
+  return jwk;
+}
 
 // Production IdP by default. Override per-host via the
 // `LASTID_IDP_URL` env var or per-invocation via the CLI's
@@ -70,8 +89,15 @@ const TAG_SIZE = 16;
 const DEK_SIZE = 32;
 const RECIPIENT_TYPE_ECDH_P256 = 0x01;
 
-// HKDF info strings — must match the Rust SDK exactly.
+// HKDF info string — must match the Rust SDK exactly. (The
+// agent-keypair HKDF info now lives Rust-side only; the WASM owns the
+// slot-seed → P-256 scalar derivation.)
 const ECDH_DEK_WRAP_INFO = Buffer.from('lastid/v2/ecdh-p256/dek-wrap', 'utf-8');
+
+// HKDF info string for the Ed25519 backward-compat path — must match the
+// Rust SDK's original Ed25519 agent-keypair derivation exactly. Existing
+// (pre-P256) agents derive their stable Ed25519 seed as
+// HKDF-SHA512(ikm=slot_seed, salt=∅, info=`lastid/agent-keypair/v1`)[:32].
 const AGENT_KEYPAIR_HKDF_INFO = Buffer.from('lastid/agent-keypair/v1', 'utf-8');
 
 function b64url(bytes) {
@@ -136,6 +162,14 @@ export async function initiateProvisioning(opts) {
   };
   if (opts.parentHumanDid) {
     body.parent_human_did = opts.parentHumanDid;
+  }
+  // The broker's per-machine SE pubkey, when available (macOS + a signed
+  // broker present). Lets the wallet sign a `device_authorization` over the
+  // machine `md-` at approval, so the IdP registers a parent-owned machine
+  // device. The CALLER resolves it via the broker bridge (getMachineSePubkeyJwk)
+  // and passes it here; omitted → legacy no-flag-day flow (no machine device).
+  if (opts.machineSePubkeyJwk) {
+    body.machine_se_pubkey_jwk = opts.machineSePubkeyJwk;
   }
   const response = await fetch(`${idp}/v1/oid4vci/agent-provision/initiate`, {
     method: 'POST',
@@ -382,26 +416,40 @@ function sealSlotSeed(slotSeed, recipientPublicJwk) {
 }
 
 /**
- * Derive the agent's Ed25519 stable identity from its 32-byte slot
- * seed. Mirrors `lastid_identity::AgentKeypair::from_seed` exactly:
- * HKDF-SHA512 with info `lastid/agent-keypair/v1` produces the 32-byte
- * Ed25519 signing seed.
+ * Derive the agent's stable NIST P-256 (ES256) identity from its 32-byte
+ * slot seed. The derivation is owned by the Rust SDK
+ * (`lastid_identity::AgentKeypair::from_seed`) and reached through the
+ * bundled P-256 WASM (`agentKeypairFromSeed`) — single source of truth,
+ * so the plugin cannot drift from the SDK/IdP on the seed→DID chain.
  *
- * Returns `{ signingKey, publicJwk, signingSeed }`:
- *   - signingKey:  Node KeyObject (used by `node:crypto` paths — DPoP,
- *                  OID4VCI proof JWT minting).
- *   - publicJwk:   `{ kty, crv, x }` (used to derive `did:lastid:agent:`).
- *   - signingSeed: Raw 32-byte Buffer (used by the wasm side — wasm
- *                  exports take raw seeds, not KeyObjects). The
- *                  SessionFingerprint signer needs this; everything
- *                  else can ignore it.
+ * Returns `{ signingKey, publicJwk, signingSeed, agentDid }`:
+ *   - signingKey:  Node P-256 KeyObject (used by `node:crypto`
+ *                  KeyObject-shaped paths — memory-audit chain signing
+ *                  and any other ECDSA-via-node consumer).
+ *   - publicJwk:   `{ kty:'EC', crv:'P-256', x, y }` (the agent's holder
+ *                  / cnf JWK; backs `did:lastid:agent:` + device-id).
+ *   - signingSeed: Raw 32-byte P-256 private scalar (used by the WASM
+ *                  signing exports — `mintPopJwt`, `mintOid4vciProofJwtEs256`,
+ *                  `signSessionFingerprint`, `signParentAuthorization` — which
+ *                  take raw key bytes, not KeyObjects). Despite the legacy
+ *                  name this is the ECDSA scalar, NOT an Ed25519 seed.
  *
- * The seed is intentionally NOT zeroized here — the caller now owns
- * its lifetime. Callers that only need the KeyObject path should
- * destructure just `{ signingKey, publicJwk }` and let the seed buffer
- * GC normally. Callers that need wasm signing (DesktopMcpClient,
- * sub-agent enrollment) keep the buffer for as long as the session
- * lasts and discard at session teardown.
+ * The seed/scalar is intentionally NOT zeroized here — the caller now
+ * owns its lifetime. Callers that only need the public identity should
+ * destructure `{ publicJwk, agentDid }`; callers that sign keep the
+ * scalar for the session and discard at teardown.
+ */
+/**
+ * BACKWARD-COMPAT (existing Ed25519 agents). Derive the agent's stable
+ * Ed25519 (EdDSA) identity from its 32-byte slot seed. This is the
+ * ORIGINAL pre-P256 derivation — existing agents (`did:lastid:agent:z6Mk…`)
+ * keep it so their DPoP proof stays EdDSA, their VC cnf matches, and their
+ * `ad-` device_id is the Ed25519 one the IdP key-package store is keyed by.
+ *
+ * HKDF-SHA512(ikm=slot_seed, salt=∅, info=`lastid/agent-keypair/v1`) → 32-byte
+ * Ed25519 seed → RFC 8410 PKCS8 → `createPrivateKey`. Returns
+ * `{ signingKey, publicJwk:{kty:'OKP',crv:'Ed25519',x}, signingSeed }`.
+ * PURE JS (no wasm) — mirrors the Rust SDK's original Ed25519 path.
  */
 export function deriveAgentEd25519Keypair(slotSeed) {
   if (!Buffer.isBuffer(slotSeed) || slotSeed.length !== 32) {
@@ -442,27 +490,146 @@ export function deriveAgentEd25519Keypair(slotSeed) {
 }
 
 /**
+ * Feature-detect an existing agent's identity algorithm from its DID.
+ * The canonical multicodec-0xed01 (ed25519-pub) multibase prefix is
+ * `z6Mk`; P-256 (`did:key` p256-pub=0x1200) encodes to `zDn…`. We branch
+ * purely on the multibase suffix so NO key material is needed to pick the
+ * derivation/sign path for a stored agent.
+ *
+ * @param {string} agentDid e.g. `did:lastid:agent:z6Mk…` or `…:zDn…`
+ * @returns {'ed25519'|'p256'}
+ */
+export function agentKeyTypeFromDid(agentDid) {
+  const PREFIX = 'did:lastid:agent:';
+  const multibase =
+    typeof agentDid === 'string' && agentDid.startsWith(PREFIX)
+      ? agentDid.slice(PREFIX.length)
+      : '';
+  return multibase.startsWith('z6Mk') ? 'ed25519' : 'p256';
+}
+
+/**
+ * Dispatcher: derive the right keypair for an EXISTING agent given its
+ * stored DID. Ed25519 agents (`z6Mk…`) get the pure-JS EdDSA path; everyone
+ * else (new agents) gets the wasm-owned P-256 path. The returned shape is
+ * uniform (`{ signingKey, publicJwk, signingSeed, agentDid }`) so call sites
+ * don't branch — the Ed25519 path attaches the passed-in DID (the wasm path
+ * already returns its own derived `agentDid`).
+ *
+ * NEW-agent provisioning does NOT go through here — it calls
+ * `deriveAgentP256Keypair` directly (new agents are always P-256).
+ *
+ * @param {Buffer} slotSeed 32-byte BIP85 slot seed
+ * @param {string} agentDid the agent's stored DID (selects the algo)
+ */
+export function deriveAgentKeypair(slotSeed, agentDid) {
+  if (agentKeyTypeFromDid(agentDid) === 'ed25519') {
+    const kp = deriveAgentEd25519Keypair(slotSeed);
+    return { ...kp, agentDid };
+  }
+  return deriveAgentP256Keypair(slotSeed);
+}
+
+export function deriveAgentP256Keypair(slotSeed) {
+  if (!Buffer.isBuffer(slotSeed) || slotSeed.length !== 32) {
+    throw new Error('slot seed must be a 32-byte Buffer');
+  }
+  // The Rust side runs HKDF-SHA512(info `lastid/agent-keypair/v1`) over the
+  // slot seed → P-256 scalar, then encodes the DID/JWK. We never reimplement
+  // that here; we just call into it.
+  const kp = agentWasm.agentKeypairFromSeed(new Uint8Array(slotSeed));
+  const publicJwk = jwkToObject(kp.publicJwk);
+  const signingSeed = Buffer.from(kp.signingKeyBytes);
+
+  // Build a Node P-256 private KeyObject from the raw 32-byte scalar so the
+  // KeyObject-shaped consumers (memory-audit chain signing) keep working.
+  // PKCS8 for an EC P-256 private key embeds the scalar + the public point.
+  const signingKey = p256PrivateKeyFromScalar(signingSeed, publicJwk);
+
+  return {
+    signingKey,
+    publicJwk,
+    signingSeed,
+    agentDid: kp.agentDid,
+  };
+}
+
+/**
+ * Construct a Node P-256 private `KeyObject` from a raw 32-byte ECDSA
+ * scalar plus the matching public JWK coordinates. Node's JWK importer
+ * accepts an EC private JWK (`d` + `x` + `y`), which is the simplest
+ * lossless path — no manual DER assembly, and it validates the scalar
+ * against the curve.
+ */
+function p256PrivateKeyFromScalar(scalar, publicJwk) {
+  return createPrivateKey({
+    key: {
+      kty: 'EC',
+      crv: 'P-256',
+      d: b64url(scalar),
+      x: publicJwk.x,
+      y: publicJwk.y,
+    },
+    format: 'jwk',
+  });
+}
+
+/**
  * Derive this agent runtime's stable `ad-<hash>` device_id from its 32-byte
  * slot seed. The single source for the device_id across the MLS layer — the
  * KeyPackage publish (`mls-publish`), the shared orchestrator handle, and the
  * MlsClient fallback all call this so the value stamped into the MLS
  * credential matches the one the IdP key-package store is keyed by.
  *
+ * Feature-detects from the agent DID when one is supplied: an existing
+ * Ed25519 agent (`z6Mk…`) derives its `ad-` id from the Ed25519 OKP JWK,
+ * NOT the P-256 one. When `agentDid` is omitted the P-256 path is used —
+ * preserving the current behavior for new-agent callers that don't (yet)
+ * have a stored DID at the call site.
+ *
  * @param {Buffer} slotSeed 32-byte BIP85 slot seed
+ * @param {string} [agentDid] the agent's stored DID (selects the algo)
  * @returns {string} e.g. `ad-1a2b…`
  */
-export function deriveAgentDeviceId(slotSeed) {
-  const { publicJwk } = deriveAgentEd25519Keypair(slotSeed);
-  return agentDeviceIdFromEd25519Jwk(publicJwk);
+export function deriveAgentDeviceId(slotSeed, agentDid) {
+  if (agentDid && agentKeyTypeFromDid(agentDid) === 'ed25519') {
+    return agentDeviceIdFromEd25519Jwk(deriveAgentEd25519Keypair(slotSeed).publicJwk);
+  }
+  const { publicJwk } = deriveAgentP256Keypair(slotSeed);
+  return agentDeviceIdFromP256Jwk(publicJwk);
 }
 
 /**
- * Derive the agent's `did:lastid:agent:` DID from the Ed25519 pubkey
- * JWK. Multibase base58btc-encoded multicodec(ed25519-pub=0xed01) ||
- * pubkey_bytes — matches `lastid_identity::did::agent_did_from_pubkey`.
+ * Resolve this agent runtime's MLS device_id — the ONE value the MLS layer
+ * (credential stamp in `mls-client`, KeyPackage publish in `mls-publish`)
+ * uses, so both sides provably agree (a disagreement here is the multi-device
+ * two-sources class).
  *
- * We don't pull in a base58 library; instead use a small inline
- * implementation matching `multibase z`.
+ * Precedence:
+ *   1. `persistedDeviceId` — the value PINNED at provisioning (a machine-bound
+ *      agent's `md-…`, persisted in the keychain). Stable across plugin/broker
+ *      changes: once set it never re-derives, so a machine-bound agent keeps
+ *      the same id even if the broker later goes missing.
+ *   2. Legacy fallback — `deriveAgentDeviceId(slotSeed, agentDid)`, i.e. the
+ *      agent's own `ad-…`. This is the NO-FLAG-DAY seam: every agent
+ *      provisioned before machine-binding has no persisted id and so keeps its
+ *      current `ad-` device_id byte-for-byte until it is reissued.
+ *
+ * @param {{ persistedDeviceId?: string|null, slotSeed: Buffer, agentDid?: string }} args
+ * @returns {string}
+ */
+export function resolveAgentDeviceId({ persistedDeviceId, slotSeed, agentDid }) {
+  if (typeof persistedDeviceId === 'string' && persistedDeviceId.length > 0) {
+    return persistedDeviceId;
+  }
+  return deriveAgentDeviceId(slotSeed, agentDid);
+}
+
+/**
+ * Multibase base58btc alphabet + encoder for the Ed25519 backward-compat
+ * DID branch. We don't pull in a base58 library; this inline encoder
+ * matches `multibase z` (and the Rust SDK's
+ * `lastid_identity::did::agent_did_from_pubkey` Ed25519 path).
  */
 const BASE58_ALPHABET =
   '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -487,17 +654,43 @@ function base58btcEncode(bytes) {
   return out;
 }
 
+/**
+ * Derive the agent's `did:lastid:agent:` DID from the public JWK.
+ *
+ * Dual-algo / feature-detected from the JWK key type:
+ *   - OKP / Ed25519 (existing agents): multicodec(ed25519-pub=0xed01) ||
+ *     pubkey_bytes, multibase base58btc-encoded → `…:z6Mk…`. PURE JS,
+ *     mirrors `lastid_identity::did::agent_did_from_pubkey` Ed25519 path.
+ *   - EC / P-256 (new agents): did:key P-256 multicodec(p256-pub=0x1200)
+ *     || compressed-SEC1, encoding owned by the Rust SDK and reached
+ *     through the WASM `agentDidFromPubkey` — single source of truth, so
+ *     the plugin can't drift from the SDK/IdP DID form.
+ */
 export function agentDidFromPublicJwk(pubJwk) {
-  if (pubJwk.kty !== 'OKP' || pubJwk.crv !== 'Ed25519') {
-    throw new Error('agent pubkey must be OKP/Ed25519');
+  const jwk = jwkToObject(pubJwk);
+  if (jwk.kty === 'OKP' && jwk.crv === 'Ed25519') {
+    const pub = b64urlDecode(jwk.x);
+    if (pub.length !== 32) {
+      throw new Error(`Ed25519 pubkey must be 32 bytes, got ${pub.length}`);
+    }
+    // multicodec prefix: 0xed 0x01 (ed25519-pub)
+    const multicodec = Buffer.concat([Buffer.from([0xed, 0x01]), pub]);
+    return 'did:lastid:agent:z' + base58btcEncode(multicodec);
   }
-  const pub = b64urlDecode(pubJwk.x);
-  if (pub.length !== 32) {
-    throw new Error(`Ed25519 pubkey must be 32 bytes, got ${pub.length}`);
+  if (jwk.kty !== 'EC' || jwk.crv !== 'P-256') {
+    throw new Error('agent pubkey must be EC/P-256 or OKP/Ed25519');
   }
-  // multicodec prefix: 0xed 0x01 (ed25519-pub)
-  const multicodec = Buffer.concat([Buffer.from([0xed, 0x01]), pub]);
-  return 'did:lastid:agent:z' + base58btcEncode(multicodec);
+  const x = b64urlDecode(jwk.x);
+  const y = b64urlDecode(jwk.y);
+  if (x.length !== 32 || y.length !== 32) {
+    throw new Error(
+      `P-256 pubkey coords must be 32 bytes each, got x=${x.length} y=${y.length}`,
+    );
+  }
+  // Uncompressed SEC1 point: 0x04 || X || Y. The WASM accepts either
+  // compressed (33) or uncompressed (65) and re-encodes canonically.
+  const sec1 = Buffer.concat([Buffer.from([0x04]), x, y]);
+  return agentWasm.agentDidFromPubkey(new Uint8Array(sec1));
 }
 
 /**
@@ -545,30 +738,120 @@ export async function exchangeToken(offer) {
   return { accessToken: body.access_token, cNonce: body.c_nonce };
 }
 
+// Media-type tag for the parent-authorization JWS — MUST match the SDK
+// (`lastid-identity/src/parent_authorization.rs`) and the IdP verifier
+// (`lastid-idp/src/crypto/parent-authorization.ts`). Distinct from the
+// human-auth typ so the IdP can't confuse the two trust sources.
+const PARENT_AUTH_TYP = 'jwt+lastid-parent-auth-v1';
+
+/**
+ * Sign a parent-authorization JWS with the parent agent's identity key —
+ * DUAL-ALGO, PURE JS, no wasm. Feature-detected from the parent's
+ * `signingKey.asymmetricKeyType`, exactly like `dpop.js` mintDpopJwt:
+ *
+ *   - Ed25519 (existing agents): header `alg:'EdDSA'`, raw 64-byte Ed25519
+ *     signature (`cryptoSign(null, …, signingKey)`).
+ *   - P-256 (new agents): header `alg:'ES256'`, raw 64-byte r||s ECDSA
+ *     signature (`cryptoSign('sha256', …, { dsaEncoding: 'ieee-p1363' })`).
+ *
+ * Same wire shape for both:
+ *   header  = { typ: 'jwt+lastid-parent-auth-v1', alg, kid? }
+ *   payload = claimsJson (verbatim bytes — stringify once at the call site)
+ *   sig     = raw signature over `header_b64.payload_b64`, base64url
+ *
+ * The IdP's `verifyParentAuthorization` is DUAL-ALGO: it derives the expected
+ * alg from the parent's cnf pubkey (Ed25519 OKP → EdDSA, P-256 EC → ES256)
+ * and requires `header.alg` to match — so each parent type signs with its own
+ * curve and the IdP accepts it. Built in pure `node:crypto`, so no wasm
+ * rebuild is needed (the bundled WASM `signParentAuthorization` is bypassed —
+ * it only emits one alg and can't feature-detect from a Node KeyObject).
+ *
+ * @param {import('node:crypto').KeyObject} signingKey - parent's Ed25519 or P-256 KeyObject
+ * @param {string} claimsJson - the EXACT serialized claims value (verbatim payload)
+ * @param {string} [kid]
+ * @returns {string} compact JWS (EdDSA or ES256)
+ */
+export function signParentAuthorization(signingKey, claimsJson, kid) {
+  const keyType = signingKey?.asymmetricKeyType;
+  const isEd25519 = keyType === 'ed25519';
+  if (!isEd25519 && keyType !== 'ec') {
+    throw new Error(
+      'signParentAuthorization: requires an Ed25519 or P-256 signing key',
+    );
+  }
+  const header = {
+    typ: PARENT_AUTH_TYP,
+    alg: isEd25519 ? 'EdDSA' : 'ES256',
+    ...(kid ? { kid } : {}),
+  };
+  const headerB64 = b64url(Buffer.from(JSON.stringify(header), 'utf-8'));
+  const payloadB64 = b64url(Buffer.from(claimsJson, 'utf-8'));
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const sig = isEd25519
+    ? // EdDSA: node returns the raw 64-byte Ed25519 signature directly.
+      cryptoSign(null, Buffer.from(signingInput, 'utf-8'), signingKey)
+    : // ES256: SHA-256 + ECDSA over P-256, raw r||s (ieee-p1363) — NOT DER.
+      cryptoSign('sha256', Buffer.from(signingInput, 'utf-8'), {
+        key: signingKey,
+        dsaEncoding: 'ieee-p1363',
+      });
+  return `${signingInput}.${b64url(sig)}`;
+}
+
+/**
+ * Mint the OID4VCI proof JWT. Dual-algo / feature-detected:
+ *
+ *   - Ed25519 (existing agents): when an Ed25519 `signingKey` KeyObject is
+ *     supplied, sign EdDSA over the header/payload directly in JS
+ *     (`cryptoSign(null, …, signingKey)` returns raw 64-byte Ed25519 sig).
+ *     The header embeds the holder JWK as `agentPubkeyJwk`. This is the
+ *     ORIGINAL pre-P256 behavior.
+ *   - P-256 (new agents): `signingSeed` is the agent's raw 32-byte P-256
+ *     scalar (from `deriveAgentP256Keypair`); the header/payload wire shape
+ *     and the ES256 signature are produced by the Rust SDK via the WASM
+ *     `mintOid4vciProofJwtEs256`, so the proof can't drift from what the IdP
+ *     verifies. The WASM embeds the JWK derived from the scalar, so any
+ *     passed `agentPubkeyJwk` is ignored on this path.
+ */
 export function mintProofJwt({
   credentialIssuer,
   cNonce,
   agentDid,
   agentPubkeyJwk,
   signingKey,
+  signingSeed,
 }) {
-  const header = {
-    typ: 'openid4vci-proof+jwt',
-    alg: 'EdDSA',
-    jwk: agentPubkeyJwk,
-  };
+  // Ed25519 backward-compat path: feature-detect on the KeyObject type.
+  if (signingKey && signingKey.asymmetricKeyType === 'ed25519') {
+    const header = {
+      typ: 'openid4vci-proof+jwt',
+      alg: 'EdDSA',
+      jwk: agentPubkeyJwk,
+    };
+    const now = Math.floor(Date.now() / 1000);
+    const payload = {
+      iss: agentDid,
+      aud: credentialIssuer,
+      iat: now,
+      nonce: cNonce,
+    };
+    const headerB64 = b64urlJson(header);
+    const payloadB64 = b64urlJson(payload);
+    const signingInput = `${headerB64}.${payloadB64}`;
+    const sigBytes = cryptoSign(null, Buffer.from(signingInput, 'utf-8'), signingKey);
+    return `${signingInput}.${b64url(sigBytes)}`;
+  }
+  if (!Buffer.isBuffer(signingSeed) && !(signingSeed instanceof Uint8Array)) {
+    throw new Error('mintProofJwt: signingSeed must be the raw P-256 scalar bytes');
+  }
   const now = Math.floor(Date.now() / 1000);
-  const payload = {
-    iss: agentDid,
-    aud: credentialIssuer,
-    iat: now,
-    nonce: cNonce,
-  };
-  const headerB64 = b64urlJson(header);
-  const payloadB64 = b64urlJson(payload);
-  const signingInput = `${headerB64}.${payloadB64}`;
-  const sigBytes = cryptoSign(null, Buffer.from(signingInput, 'utf-8'), signingKey);
-  return `${signingInput}.${b64url(sigBytes)}`;
+  return agentWasm.mintOid4vciProofJwtEs256(
+    new Uint8Array(signingSeed),
+    agentDid,
+    credentialIssuer,
+    cNonce,
+    BigInt(now),
+  );
 }
 
 export async function claimCredential({
@@ -626,14 +909,25 @@ export async function provisionAgent({
   onUserCode,
   intervalSeconds = 5,
   timeoutSeconds = 600,
+  // Injectable broker bridge (tests supply a fake; production uses the real
+  // signed broker). Returns this machine's SE pubkey JWK, or null when no
+  // broker is present → legacy no-machine-device provisioning.
+  getMachineSePubkeyJwk = defaultGetMachineSePubkeyJwk,
 }) {
   const ephemeral = generateEphemeralEnvelopeKeypair();
+  // Ask the signed broker for this machine's SE pubkey (macOS only); null →
+  // omitted, provisioning falls back to the legacy no-machine-device flow.
+  // When present, this same key both (a) is presented to /initiate so the
+  // wallet signs a device_authorization registering the parent-owned machine
+  // device, and (b) pins this agent's MLS device_id to that machine's `md-…`.
+  const machineSePubkeyJwk = getMachineSePubkeyJwk();
   const initiate = await initiateProvisioning({
     idpUrl,
     parentHumanDid,
     runtimeName,
     projectHint,
     ephemeralPubkeyJwk: ephemeral.publicJwk,
+    machineSePubkeyJwk,
   });
   if (typeof onUserCode === 'function') {
     await onUserCode({
@@ -649,9 +943,9 @@ export async function provisionAgent({
   });
 
   // Unseal the wallet-derived slot seed and immediately derive our
-  // Ed25519 identity. Ephemeral private key is no longer needed.
+  // P-256 identity. Ephemeral private key is no longer needed.
   const slotSeed = unsealSlotSeed(approved.sealedSlotSeed, ephemeral.privateKey);
-  const { signingKey, publicJwk } = deriveAgentEd25519Keypair(slotSeed);
+  const { publicJwk, signingSeed } = deriveAgentP256Keypair(slotSeed);
 
   // Unseal the operator's project-memory root seed too, if the wallet sealed
   // one to the same ephemeral recipient (the envelope format is identical, so
@@ -688,7 +982,7 @@ export async function provisionAgent({
     cNonce,
     agentDid: derivedDid,
     agentPubkeyJwk: publicJwk,
-    signingKey,
+    signingSeed,
   });
   const issued = await claimCredential({
     credentialIssuer: offer.credentialIssuer,
@@ -696,12 +990,23 @@ export async function provisionAgent({
     proofJwt,
   });
 
+  // Pin the MLS device_id at provisioning (L5). When a machine SE key was
+  // presented, this agent is machine-bound: its device_id is the machine's
+  // `md-…` (byte-identical to the IdP's machine device + the Rust derivation).
+  // Otherwise null → the keychain stores nothing and the MLS layer falls back
+  // to the legacy `ad-` derivation (no-flag-day). The agent's IDENTITY is
+  // always its own key; only the device LABEL becomes the machine.
+  const deviceId = machineSePubkeyJwk
+    ? machineDeviceIdFromP256Jwk(machineSePubkeyJwk)
+    : null;
+
   return {
     agentDid: derivedDid,
     slotSeed,
     projectRootSeed,
     slotIndex: approved.slotIndex,
     publicJwk,
+    deviceId,
     vcCompact: issued.credential,
     cNonce: issued.c_nonce ?? null,
     cNonceExpiresIn: issued.c_nonce_expires_in ?? null,
@@ -715,6 +1020,7 @@ export const _internal = {
   b64urlDecode,
   unsealSlotSeed,
   sealSlotSeed,
+  deriveAgentP256Keypair,
   deriveAgentEd25519Keypair,
   agentDidFromPublicJwk,
   base58btcEncode,

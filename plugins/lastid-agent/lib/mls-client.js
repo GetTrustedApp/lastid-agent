@@ -29,7 +29,7 @@
  */
 import { createRequire } from 'node:module';
 import { diskKvCallbacks } from './mls-state-store.js';
-import { deriveAgentDeviceId } from './agent-provisioning.js';
+import { resolveAgentDeviceId } from './agent-provisioning.js';
 
 const localRequire = createRequire(import.meta.url);
 const wasm = localRequire('../vendor/lastid-mls-wasm/lastid_mls_wasm.js');
@@ -61,18 +61,20 @@ export class MlsClient {
   /** @type {import('../vendor/lastid-mls-wasm/lastid_mls_wasm.js').PersistentBotMlsClient} */
   #handle;
   #agentDid;
-  #slotSeed;
-  #scope;
+  // This client's resolved MLS device_id (`md-…` machine-bound, or the legacy
+  // `ad-…`). The SINGLE source the KeyPackage publish reads (mls-publish uses
+  // `mls.deviceId`), so the credential the handle stamps and the device_id the
+  // KP is stored under can never disagree (the multi-device two-sources class).
+  #deviceId;
   // True when this client OWNS the wasm handle (it opened it via `open`) and
   // may free it. False for `fromOrchestrator` wrappers, which borrow the
   // shared orchestrator handle the listener frees exactly once on shutdown.
   #ownsHandle;
 
-  constructor({ handle, agentDid, slotSeed, scope, ownsHandle = true }) {
+  constructor({ handle, agentDid, deviceId = null, ownsHandle = true }) {
     this.#handle = handle;
     this.#agentDid = agentDid;
-    this.#slotSeed = slotSeed;
-    this.#scope = scope ?? 'main';
+    this.#deviceId = deviceId ?? null;
     this.#ownsHandle = ownsHandle;
   }
 
@@ -82,22 +84,29 @@ export class MlsClient {
    * are flushed back via flushBlob after every state-mutating op. If the
    * file is missing or unparseable we start fresh.
    */
-  static async open({ agentDid, slotSeed, scope }) {
+  static async open({ agentDid, slotSeed, scope, deviceId: persistedDeviceId }) {
     const resolvedScope = scope ?? 'main';
     // Stamp this agent's device_id into every credential this client builds so
     // peers can map our leaf→device (matches the orchestrator handle + the
-    // device_id the IdP key-package store is keyed by). Falls back to a bare-DID
-    // credential if the seed isn't a valid 32-byte buffer.
+    // device_id the IdP key-package store is keyed by). `resolveAgentDeviceId`
+    // returns the value PINNED at provisioning (`md-…` for a machine-bound
+    // agent) or the legacy `ad-…` derivation when none was persisted — the
+    // no-flag-day seam, byte-identical to today for existing agents. Falls back
+    // to a bare-DID credential if the seed isn't a valid 32-byte buffer.
     const deviceId =
       slotSeed instanceof Uint8Array && slotSeed.length === 32
-        ? deriveAgentDeviceId(Buffer.from(slotSeed))
+        ? resolveAgentDeviceId({
+            persistedDeviceId,
+            slotSeed: Buffer.from(slotSeed),
+            agentDid,
+          })
         : undefined;
     const handle = await wasm.createPersistentBotClientWithCallbacks(
       agentDid,
       diskKvCallbacks({ slotSeed, scope: resolvedScope }),
       deviceId,
     );
-    return new MlsClient({ handle, agentDid, slotSeed, scope: resolvedScope });
+    return new MlsClient({ handle, agentDid, deviceId: deviceId ?? null });
   }
 
   /**
@@ -117,14 +126,26 @@ export class MlsClient {
    * disk-backed RawKv (it was built with the same diskKvCallbacks), so this
    * wrapper never opens a file of its own.
    */
-  static fromOrchestrator(handle, agentDid) {
+  static fromOrchestrator(handle, agentDid, deviceId = null) {
     if (!handle) throw new Error('MlsClient.fromOrchestrator: handle required');
     if (!agentDid) throw new Error('MlsClient.fromOrchestrator: agentDid required');
-    return new MlsClient({ handle, agentDid, ownsHandle: false });
+    // `deviceId` is the SAME value the orchestrator handle was built with (the
+    // listener resolves it once and threads it here) so KeyPackage publish via
+    // this wrapper reports the device_id the shared handle's credentials carry.
+    return new MlsClient({ handle, agentDid, deviceId, ownsHandle: false });
   }
 
   get agentDid() {
     return this.#agentDid;
+  }
+
+  /**
+   * This client's resolved MLS device_id — the single source the KeyPackage
+   * publish path reads so the KP's `device_id` matches the credential the
+   * handle stamps. Null only for a test/bare-DID handle built without a seed.
+   */
+  get deviceId() {
+    return this.#deviceId;
   }
 
   /**

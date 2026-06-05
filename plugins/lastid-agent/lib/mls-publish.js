@@ -20,15 +20,13 @@
  *   body: { key_packages: [{ key_package, device_id, is_last_resort? }] }
  *   GET  /v1/mls/keypackages/me?device_id=<id>
  *
- * device_id is derived from the agent's Ed25519 public key via
- * `agentDeviceIdFromEd25519Jwk`. Stable across reinstalls,
+ * device_id is derived from the agent's P-256 public key via
+ * `agentDeviceIdFromP256Jwk`. Stable across reinstalls,
  * deterministic, colon-free.
  */
 import { MlsClient } from './mls-client.js';
 import { mintDpopJwt } from './dpop.js';
-import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
-import { agentDeviceIdFromEd25519Jwk } from './agent-device-id.js';
-import { createPublicKey } from 'node:crypto';
+import { deriveAgentKeypair, resolveAgentDeviceId } from './agent-provisioning.js';
 
 /** How many regular (consumable) KeyPackages to keep on file. */
 const REGULAR_COUNT = 5;
@@ -61,10 +59,12 @@ const TOPUP_THRESHOLD = 2;
  *   (mem_01KSNXSY4TY7DK7EJTREPNY5RH). Omit ONLY at provision time, before any
  *   listener exists (no concurrent instance, so a throwaway client is safe).
  *
- * @returns {Promise<{ ok: true, ref?: string }>}
- *   On the IdP success path the body includes a `ref` field; we
- *   pass it through verbatim. Errors throw — the caller decides
- *   whether to surface them (we log + continue from cmdProvision).
+ * @returns {Promise<{ ok: true, refs: string[], count: number }>}
+ *   On the IdP success path the body includes a `refs` array (one per
+ *   published KeyPackage); we pass it through verbatim (or `[]` if the
+ *   IdP omits it). `count` is how many KeyPackages this call published.
+ *   Errors throw — the caller decides whether to surface them (we log +
+ *   continue from cmdProvision).
  */
 export async function publishAgentKeyPackage({
   idpUrl,
@@ -72,6 +72,10 @@ export async function publishAgentKeyPackage({
   vcCompact,
   slotSeed,
   scope,
+  // The device_id PINNED at provisioning (`md-…`), from the keychain install
+  // record. Threaded into the throwaway-client (provision-time) path; the
+  // listener passes `mls` and the device_id rides on that shared handle.
+  deviceId: persistedDeviceId,
   mls: sharedMls,
 }) {
   const trimmed = String(idpUrl ?? '').replace(/\/$/, '');
@@ -82,32 +86,34 @@ export async function publishAgentKeyPackage({
     throw new Error('publishAgentKeyPackage: slotSeed must be 32 bytes');
   }
 
-  const { signingKey } = deriveAgentEd25519Keypair(slotSeed);
-
-  // device_id for the IdP's key-package store. The IdP keys set
-  // entries as `${deviceId}:${ref}` and splits on `:` to parse them
-  // back — passing the agent DID directly breaks that parsing
-  // because DIDs contain colons. Derive a stable colon-free
-  // identifier from the agent's Ed25519 public key, matching the
-  // bot pattern in lastid-idp/packages/credential-service/src/mls/
-  // bot-device-id.ts.
-  const publicJwk = createPublicKey(signingKey).export({ format: 'jwk' });
-  const deviceId = agentDeviceIdFromEd25519Jwk({
-    kty: 'OKP',
-    crv: 'Ed25519',
-    x: publicJwk.x,
-  });
+  const { signingKey } = deriveAgentKeypair(slotSeed, agentDid);
 
   // Reuse the listener's shared handle when given (B1 convergence — see the
   // `mls` param doc). Only fall back to a throwaway client at provision time,
-  // when no listener (and so no competing instance) exists.
+  // when no listener (and so no competing instance) exists. The throwaway
+  // client resolves its device_id from the persisted (`md-…`) value when one
+  // was pinned at provisioning, else the legacy `ad-…` derivation.
   const mls =
     sharedMls ??
     (await MlsClient.open({
       agentDid,
       slotSeed,
       scope: scope ?? 'main',
+      deviceId: persistedDeviceId,
     }));
+
+  // device_id for the IdP's key-package store — READ FROM THE HANDLE, so the
+  // KP is stored under exactly the device_id the handle's credentials carry.
+  // No independent derivation here = the KP and the credential cannot disagree
+  // (the multi-device two-sources class). The IdP keys set entries as
+  // `${deviceId}:${ref}` and splits on `:`, so a colon-free `ad-`/`md-` id is
+  // required (DIDs contain colons). Fall back to the resolved derivation only
+  // for a handle built without a device_id (test / bare-DID).
+  const deviceId =
+    mls.deviceId ??
+    (Buffer.isBuffer(slotSeed) && slotSeed.length === 32
+      ? resolveAgentDeviceId({ persistedDeviceId, slotSeed, agentDid })
+      : undefined);
 
   // Mint REGULAR_COUNT consumable KPs + 1 last-resort. Each
   // generateKeyPackage call mints a fresh KP with its own private
@@ -183,6 +189,7 @@ export async function maintainAgentKeyPackages({
   vcCompact,
   slotSeed,
   scope,
+  deviceId: persistedDeviceId,
   mls: sharedMls,
 }) {
   const trimmed = String(idpUrl ?? '').replace(/\/$/, '');
@@ -190,7 +197,7 @@ export async function maintainAgentKeyPackages({
   if (!Buffer.isBuffer(slotSeed) || slotSeed.length !== 32) {
     throw new Error('maintainAgentKeyPackages: slotSeed must be 32 bytes');
   }
-  const { signingKey } = deriveAgentEd25519Keypair(slotSeed);
+  const { signingKey } = deriveAgentKeypair(slotSeed, agentDid);
 
   const htu = `${trimmed}/v1/mls/keypackages/me`;
   const dpop = mintDpopJwt({
@@ -230,6 +237,7 @@ export async function maintainAgentKeyPackages({
     vcCompact,
     slotSeed,
     scope,
+    deviceId: persistedDeviceId,
     mls: sharedMls,
   });
   return { available, replenished: true, refs: result.refs };

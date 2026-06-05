@@ -10,7 +10,7 @@
  * Best-effort: a metrics failure must NEVER disrupt the vault flow, so callers
  * fire-and-forget and this never throws.
  */
-import { mintAgentPopJwt } from './sdk-bindings.js';
+import { mintDpopJwt } from './dpop.js';
 
 /** Build the credentialed-use body for one handle event. Pure + exported so the
  *  field mapping (handle → wire row) is unit-tested. `kind` is 'mint'|'consume'. */
@@ -45,20 +45,25 @@ export async function publishCredentialedUse({
   idpUrl,
   agentDid,
   vcCompact,
-  signingSeed,
+  signingKey,
   kind,
   handle,
   metrics,
   fetchImpl = globalThis.fetch,
 }) {
   try {
-    if (!vcCompact || !signingSeed || !handle?.itemId) return;
+    if (!vcCompact || !signingKey || !handle?.itemId) return;
     const body = credentialedUseBody(kind, handle, metrics);
     const url = `${idpUrl}/v2/agents/${encodeURIComponent(agentDid)}/credentialed-use`;
-    const popJwt = await mintAgentPopJwt(
-      { signingKeyBytes: new Uint8Array(signingSeed) },
-      { agentDid, method: 'POST', uri: url },
-    );
+    // mintDpopJwt feature-detects alg from the KeyObject (Ed25519→EdDSA,
+    // P-256→ES256). Best-effort: a metrics failure must NEVER disrupt the
+    // vault flow, so the outer try/catch still swallows everything.
+    const popJwt = mintDpopJwt({
+      agentDid,
+      httpMethod: 'POST',
+      httpUri: url,
+      signingKey,
+    });
     await fetchImpl(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${vcCompact}`, DPoP: popJwt, 'Content-Type': 'application/json' },

@@ -19,7 +19,7 @@ import { publishAgentMemory } from '../lib/agent-memory-publish.js';
 import { decodeRecord } from '../lib/agent-state-sync.js';
 import { MemoryStore } from '../lib/memory-store.js';
 import { deriveProjectRoutingId } from '../lib/project-crypto.js';
-import { deriveAgentEd25519Keypair, agentDidFromPublicJwk } from '../lib/agent-provisioning.js';
+import { deriveAgentP256Keypair, agentDidFromPublicJwk } from '../lib/agent-provisioning.js';
 import { verifyRecordSignature } from '../lib/agent-sig-verify.js';
 
 const PROJECT_ROOT_SEED = crypto.createHash('sha256').update('operator-project-root').digest(); // 32B
@@ -28,7 +28,7 @@ const SLOT_A = crypto.createHash('sha256').update('agent-A-slot').digest();
 const SLOT_B = crypto.createHash('sha256').update('agent-B-slot').digest();
 const IDP = 'github.com/gettrustedapp/gettrusted-idp';
 // The real did:lastid:agent DID for SLOT_A's key (so its signatures verify).
-const A_DID = agentDidFromPublicJwk(deriveAgentEd25519Keypair(SLOT_A).publicJwk);
+const A_DID = agentDidFromPublicJwk(deriveAgentP256Keypair(SLOT_A).publicJwk);
 
 const DIR = mkdtempSync(join(tmpdir(), 'lastid-projsync-'));
 import { after } from 'node:test';

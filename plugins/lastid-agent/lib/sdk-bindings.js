@@ -12,9 +12,14 @@
  *   deriveFreshAgentKeypair()               → not implemented (use
  *                                              agent-provisioning.js)
  *   verifyAgentVc(jws, opts)                → { ok, claims?, error? }
- *   mintAgentPopJwt(keypair, opts)          → compact JWT string
  *   mintOid4vciProofJwt(keypair, opts)      → compact JWT string
- *   computeEd25519JwkThumbprint(jwk)        → base64url SHA-256 thumbprint
+ *
+ *   (mintAgentPopJwt was a P-256/ES256-only PoP minter — REMOVED. Use
+ *   `mintDpopJwt` from `./dpop.js` instead: a KeyObject-driven dual-algo
+ *   helper that picks EdDSA for Ed25519 agents and ES256 for P-256 ones.
+ *   The old single-alg path was a regression for Ed25519 agents — the IdP
+ *   rejected the ES256 proof with "header.alg must be 'EdDSA'…".)
+ *   computeP256JwkThumbprint(jwk)           → base64url SHA-256 thumbprint
  *
  * Anything that hasn't been ported off the stub will throw a clear
  * message pointing at the lib that owns the real path (e.g. fresh
@@ -44,8 +49,8 @@ export async function initializeSdkBindings() {
     parseAgentDid(did) {
       return wasm.parseAgentDid(did);
     },
-    ed25519JwkThumbprint(pubkeyBytes) {
-      return wasm.ed25519JwkThumbprint(pubkeyBytes);
+    p256JwkThumbprint(pubkeyBytes) {
+      return wasm.p256JwkThumbprint(pubkeyBytes);
     },
     deriveAgentSlotSeed(aiAgentSeed, slotIndex) {
       return wasm.deriveAgentSlotSeed(aiAgentSeed, slotIndex);
@@ -54,18 +59,18 @@ export async function initializeSdkBindings() {
       return wasm.deriveSubAgentSeed(parentSlotSeed, classSlug, index);
     },
 
-    // ── Signing ────────────────────────────────────────────────────
-    signEd25519(signingKeyBytes, payload) {
-      return wasm.signEd25519(signingKeyBytes, payload);
+    // ── Signing (P-256 / ES256) ────────────────────────────────────
+    signP256(signingKeyBytes, payload) {
+      return wasm.signP256(signingKeyBytes, payload);
     },
-    verifyEd25519(pubkeyBytes, payload, signature) {
-      return wasm.verifyEd25519(pubkeyBytes, payload, signature);
+    verifyP256(pubkeyBytes, payload, signature) {
+      return wasm.verifyP256(pubkeyBytes, payload, signature);
     },
 
     // ── Parent-authorization JWS (parent agent → sub-agent issuance) ──
-    // Compact JWS signed with the parent's existing Ed25519 agent signing
-    // key. Used by the listener when it acts as issuer for an operator-
-    // published sub-agent. Mirrors sign_human_authorization but EdDSA,
+    // Compact JWS signed with the parent's existing P-256 (ES256) agent
+    // signing key. Used by the listener when it acts as issuer for an
+    // operator-published sub-agent. Mirrors sign_human_authorization,
     // verified by the IdP against the parent's VC cnf.jwk.
     signParentAuthorization(signingKeyBytes, kid, claimsJson) {
       return wasm.signParentAuthorization(signingKeyBytes, kid ?? undefined, claimsJson);
@@ -113,14 +118,14 @@ export async function initializeSdkBindings() {
       return wasm.computeShareId(agentDid, itemId);
     },
 
-    // ── OID4VCI proof JWT (EdDSA, agent-side) ──────────────────────
+    // ── OID4VCI proof JWT (ES256 / P-256, agent-side) ──────────────
     async mintOid4vciProofJwt(keypair, opts) {
       const signingKey = keypair.signingKeyBytes ?? keypair.signing_key_bytes;
       if (!signingKey) {
         throw new Error('mintOid4vciProofJwt: keypair must include signingKeyBytes');
       }
       const now = typeof opts.now === 'bigint' ? opts.now : BigInt(opts.now ?? Math.floor(Date.now() / 1000));
-      return wasm.mintOid4vciProofJwtEdDsa(
+      return wasm.mintOid4vciProofJwtEs256(
         signingKey,
         opts.holderDid,
         opts.audience,
@@ -130,21 +135,10 @@ export async function initializeSdkBindings() {
     },
 
     // ── DPoP / PoP JWT (agent steady-state auth) ───────────────────
-    async mintAgentPopJwt(keypair, opts) {
-      const signingKey = keypair.signingKeyBytes ?? keypair.signing_key_bytes;
-      if (!signingKey) {
-        throw new Error('mintAgentPopJwt: keypair must include signingKeyBytes');
-      }
-      const now = typeof opts.now === 'bigint' ? opts.now : BigInt(opts.now ?? Math.floor(Date.now() / 1000));
-      return wasm.mintPopJwt(
-        signingKey,
-        opts.agentDid,
-        opts.httpMethod ?? opts.method,
-        opts.httpUri ?? opts.uri,
-        opts.accessToken ?? null,
-        now,
-      );
-    },
+    // Minter intentionally removed — use `mintDpopJwt` from `./dpop.js`
+    // (KeyObject-driven, dual-algo). Verification stays here because it
+    // reconstructs the pubkey from the `kid` (the agent DID) and the WASM
+    // verifier already handles both Ed25519 and P-256 paths.
 
     async verifyPopJwt(jwt, opts) {
       const now = typeof opts.now === 'bigint' ? opts.now : BigInt(opts.now ?? Math.floor(Date.now() / 1000));
@@ -223,13 +217,16 @@ export async function initializeSdkBindings() {
     },
 
     // ── Convenience wrappers matching the previous stub shape ──────
-    async computeEd25519JwkThumbprint(jwk) {
-      if (typeof jwk === 'object' && jwk?.x) {
-        // OKP JWK → decode x → call the raw helper.
-        const xBytes = Buffer.from(jwk.x.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
-        return wasm.ed25519JwkThumbprint(new Uint8Array(xBytes));
+    async computeP256JwkThumbprint(jwk) {
+      const obj = jwk instanceof Map ? Object.fromEntries(jwk) : jwk;
+      if (obj && typeof obj === 'object' && obj.x && obj.y) {
+        // EC P-256 JWK → SEC1 uncompressed point (0x04 || X || Y) → raw helper.
+        const x = Buffer.from(obj.x.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+        const y = Buffer.from(obj.y.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+        const sec1 = Buffer.concat([Buffer.from([0x04]), x, y]);
+        return wasm.p256JwkThumbprint(new Uint8Array(sec1));
       }
-      throw new Error('computeEd25519JwkThumbprint: expected an OKP/Ed25519 JWK');
+      throw new Error('computeP256JwkThumbprint: expected an EC/P-256 JWK with x and y');
     },
 
     // Identity-derivation does not happen in this shim. The wallet
@@ -267,19 +264,14 @@ export async function verifyAgentVc(jws, opts) {
   return sdk.verifyAgentVc(jws, opts);
 }
 
-export async function mintAgentPopJwt(keypair, opts) {
-  const sdk = await initializeSdkBindings();
-  return sdk.mintAgentPopJwt(keypair, opts);
-}
-
 export async function mintOid4vciProofJwt(keypair, opts) {
   const sdk = await initializeSdkBindings();
   return sdk.mintOid4vciProofJwt(keypair, opts);
 }
 
-export async function computeEd25519JwkThumbprint(jwk) {
+export async function computeP256JwkThumbprint(jwk) {
   const sdk = await initializeSdkBindings();
-  return sdk.computeEd25519JwkThumbprint(jwk);
+  return sdk.computeP256JwkThumbprint(jwk);
 }
 
 export async function genVaultHandleKeypair() {

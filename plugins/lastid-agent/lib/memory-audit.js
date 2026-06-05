@@ -2,8 +2,14 @@
  * Agent memory audit chain (local, signed) — PER-AGENT, genesis + checkpointed.
  *
  * Every memory/tool CUD appends a record to an append-only chain. Each record is
- * blake3-linked to its predecessor (prev_hash) and Ed25519-signed with the
- * agent's stable key (deriveAgentEd25519Keypair) — tamper-evident + provenance.
+ * blake3-linked to its predecessor (prev_hash) and ES256 (P-256)-signed with the
+ * agent's stable key (deriveAgentP256Keypair) — tamper-evident + provenance.
+ *
+ * NOTE (cross-system contract): the console's chain verifier
+ * (lastid.co `agent-audit-verify.ts`) must verify the SAME ES256 (P-256)
+ * raw r||s signature over the canonical core bytes. The agent identity
+ * migrated Ed25519→P-256; the console verifier must match or shipped
+ * chains read as `signature_invalid`.
  *
  * KEYED PER AGENT, not per scope. A scope (~/.lastid-agent/<scope>/) can host
  * TWO agents at once (e.g. two slots both running in 'main'); a single
@@ -24,7 +30,7 @@
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { sign as edSign, verify as edVerify, createPublicKey, randomBytes } from 'node:crypto';
+import { sign as ecSign, verify as ecVerify, createPublicKey, randomBytes } from 'node:crypto';
 import { blake3 } from '@noble/hashes/blake3.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 
@@ -145,7 +151,9 @@ function signAndWrite(scope, agentDid, signingKey, core) {
   let signature = null;
   if (signingKey) {
     try {
-      signature = edSign(null, bytes, signingKey).toString('base64');
+      // ES256: SHA-256 + ECDSA P-256, raw r||s (ieee-p1363) — matches the
+      // agent's identity alg and the console verifier.
+      signature = ecSign('sha256', bytes, { key: signingKey, dsaEncoding: 'ieee-p1363' }).toString('base64');
     } catch (err) {
       process.stderr.write(`[lastid-agent] memory-audit sign failed: ${err?.message ?? err}\n`);
     }
@@ -209,7 +217,7 @@ export function maybeCheckpoint({ scope = 'main', signingKey, agentDid = null } 
 /**
  * Verify THIS agent's chain: each record's integrity_hash matches blake3(core),
  * prev_hash links correctly (seq 0 ⇒ prev_hash null = genesis), and (when
- * publicKey given) the Ed25519 signature verifies. Returns { intact, total,
+ * publicKey given) the ES256 (P-256) signature verifies. Returns { intact, total,
  * firstFailure? }.
  */
 export function verifyMemoryAudit(scope = 'main', agentDid = null, publicKey = null) {
@@ -225,7 +233,7 @@ export function verifyMemoryAudit(scope = 'main', agentDid = null, publicKey = n
       return { intact: false, total: all.length, firstFailure: { seq: r.seq, kind: 'hash_link_mismatch' } };
     }
     if (publicKey && r.signature) {
-      const ok = edVerify(null, bytes, publicKey, Buffer.from(r.signature, 'base64'));
+      const ok = ecVerify('sha256', bytes, { key: publicKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(r.signature, 'base64'));
       if (!ok) {
         return { intact: false, total: all.length, firstFailure: { seq: r.seq, kind: 'signature_invalid' } };
       }

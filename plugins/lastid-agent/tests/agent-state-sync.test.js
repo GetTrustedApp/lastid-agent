@@ -25,12 +25,12 @@ import { OperatorStore } from '../lib/operator-store.js';
 import { encryptJson } from '../lib/agent-content-crypto.js';
 import { sha256Hex } from '../lib/agent-sig-verify.js';
 import {
-  deriveAgentEd25519Keypair,
+  deriveAgentP256Keypair,
   agentDidFromPublicJwk,
 } from '../lib/agent-provisioning.js';
 
 const SEED = Buffer.alloc(32, 0x5a);
-const { signingKey, publicJwk } = deriveAgentEd25519Keypair(SEED);
+const { signingKey, publicJwk } = deriveAgentP256Keypair(SEED);
 const AGENT_DID = agentDidFromPublicJwk(publicJwk);
 
 const auth = {

@@ -18,10 +18,52 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { createPrivateKey, sign as nodeSign } from 'node:crypto';
+import { createPrivateKey, generateKeyPairSync, sign as nodeSign } from 'node:crypto';
 
-import { parseApprovalRequiredResult } from '../lib/use-approval-loop.js';
+import {
+  parseApprovalRequiredResult,
+  runApprovalLoop,
+} from '../lib/use-approval-loop.js';
 import { initializeSdkBindings } from '../lib/sdk-bindings.js';
+
+function decodeJwtHeader(jwt) {
+  const headB64 = jwt.split('.')[0];
+  const padded = headB64 + '='.repeat((4 - (headB64.length % 4)) % 4);
+  return JSON.parse(
+    Buffer.from(
+      padded.replace(/-/g, '+').replace(/_/g, '/'),
+      'base64',
+    ).toString('utf-8'),
+  );
+}
+
+/**
+ * Stand in for `globalThis.fetch` for one runApprovalLoop turn. The first
+ * call is the POST /v1/agent-use-approvals — that's where the create-row
+ * DPoP lands; we capture it and return a valid approval_id. The second
+ * call is the GET poll — we return `status:'denied'` so the loop
+ * terminates immediately without us having to mint a real decision JWS.
+ */
+function makeApprovalFetchStub() {
+  const captured = { postDpop: null, getDpop: null };
+  let calls = 0;
+  const fetchStub = async (_url, init = {}) => {
+    calls += 1;
+    if (calls === 1) {
+      captured.postDpop = init.headers?.DPoP ?? null;
+      return new Response(JSON.stringify({ approval_id: 'appr-123' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    captured.getDpop = init.headers?.DPoP ?? null;
+    return new Response(JSON.stringify({ status: 'denied' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  return { fetchStub, captured };
+}
 
 test('parseApprovalRequiredResult recognises the structured rejection', () => {
   const result = {
@@ -149,6 +191,67 @@ test('verifyDecisionJws round-trips an ES256 approval JWS', async () => {
   assert.equal(claims.decision, 'approved');
   assert.equal(claims.approval_id, payload.approval_id);
   assert.equal(claims.ttl_secs, 300);
+});
+
+// Regression: an Ed25519 agent VC's PoP proof MUST be signed EdDSA. The
+// IdP rejects an ES256 DPoP for an OKP cnf.jwk with
+// `agent_pop: header.alg must be 'EdDSA'… got 'ES256'`. The orchestrator
+// has to defer to the dual-algo `mintDpopJwt` helper (KeyObject driven)
+// instead of the ES256-only WASM path.
+test('runApprovalLoop signs DPoP EdDSA for an Ed25519 signingKey', async () => {
+  const { privateKey } = generateKeyPairSync('ed25519');
+  const { fetchStub, captured } = makeApprovalFetchStub();
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = fetchStub;
+  try {
+    const outcome = await runApprovalLoop({
+      approvalBody: {
+        approval_request: {
+          agent_did: 'did:lastid:agent:z6MkEdRegression',
+          parent_human_did: 'did:lastid:zHUMAN',
+          share_id: 'share::did:lastid:agent:z6MkEdRegression::item-1',
+        },
+      },
+      originalArgs: { item_id: 'item-1' },
+      agentDid: 'did:lastid:agent:z6MkEdRegression',
+      vcCompact: 'vc.compact.stub',
+      signingKey: privateKey,
+    });
+    // We made the poll return `denied`, so the loop exits cleanly.
+    assert.ok(outcome.denied, 'expected denied outcome from stubbed poll');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+  assert.ok(captured.postDpop, 'no DPoP captured on create POST');
+  assert.ok(captured.getDpop, 'no DPoP captured on poll GET');
+  assert.equal(decodeJwtHeader(captured.postDpop).alg, 'EdDSA');
+  assert.equal(decodeJwtHeader(captured.getDpop).alg, 'EdDSA');
+});
+
+test('runApprovalLoop signs DPoP ES256 for a P-256 signingKey', async () => {
+  const { privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const { fetchStub, captured } = makeApprovalFetchStub();
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = fetchStub;
+  try {
+    await runApprovalLoop({
+      approvalBody: {
+        approval_request: {
+          agent_did: 'did:lastid:agent:zDnRegression',
+          parent_human_did: 'did:lastid:zHUMAN',
+          share_id: 'share::did:lastid:agent:zDnRegression::item-1',
+        },
+      },
+      originalArgs: { item_id: 'item-1' },
+      agentDid: 'did:lastid:agent:zDnRegression',
+      vcCompact: 'vc.compact.stub',
+      signingKey: privateKey,
+    });
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+  assert.equal(decodeJwtHeader(captured.postDpop).alg, 'ES256');
+  assert.equal(decodeJwtHeader(captured.getDpop).alg, 'ES256');
 });
 
 test('verifyDecisionJws rejects a JWS whose share_id does not match', async () => {

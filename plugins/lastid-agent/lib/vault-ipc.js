@@ -112,15 +112,18 @@ export async function handleVaultRequest(req, deps) {
         session_id: randomUUID(),
       };
       // Run the loop inline. The listener (startVaultServer's caller in
-      // cli.js cmdListen) MUST inject signingSeed/agentDid/vcCompact into
+      // cli.js cmdListen) MUST inject signingKey/agentDid/vcCompact into
       // deps; we don't have any other source for the DPoP-signing material
-      // in this process. Tests can inject `runApprovalLoop: <fn>` as a dep
-      // override so a unit test doesn't hit the real IdP.
-      if (!deps.signingSeed || !deps.vcCompact) {
+      // in this process. `signingKey` is a Node KeyObject (Ed25519 OR
+      // P-256) so runApprovalLoop's `mintDpopJwt` picks the right alg per
+      // agent identity — an ES256-only path here used to 401 Ed25519 agents.
+      // Tests can inject `runApprovalLoop: <fn>` as a dep override so a
+      // unit test doesn't hit the real IdP.
+      if (!deps.signingKey || !deps.vcCompact) {
         return {
           error: 'policy_approval_unavailable',
           reason_detail:
-            'listener missing signing material — approval loop cannot run without signingSeed + vcCompact in deps',
+            'listener missing signing material — approval loop cannot run without signingKey + vcCompact in deps',
         };
       }
       const runLoop = deps.runApprovalLoop
@@ -132,7 +135,7 @@ export async function handleVaultRequest(req, deps) {
           originalArgs: { item_id: itemId },
           agentDid,
           vcCompact: deps.vcCompact,
-          signingSeed: deps.signingSeed,
+          signingKey: deps.signingKey,
         });
       } catch (err) {
         return {

@@ -66,6 +66,44 @@ export async function authedIdpFetch({
 }
 
 /**
+ * Self-revoke one of the agent's OWN devices by device_id
+ * (DELETE /v1/identity/devices/:device_identity — subject-scoped to the
+ * authenticated agent). Used by the reissue flow to retire the agent's OLD
+ * `ad-`/`md-` device before the new identity takes over: the IdP evicts that
+ * device's leaf from every group AND purges its KeyPackages, so no peer can
+ * re-add the dead device via a stale KP (NoMatchingKeyPackage on the welcome).
+ *
+ * Pass the OLD identity's credentials (the device belongs to the old DID).
+ *
+ * @param {object} a
+ * @param {string} a.idpUrl
+ * @param {string} a.deviceId   - the device to revoke (`ad-`/`md-`)
+ * @param {string} a.agentDid   - the OLD agent DID (subject of the old VC)
+ * @param {string} a.vcCompact  - the OLD agent VC SD-JWT (bearer)
+ * @param {import('node:crypto').KeyObject} a.signingKey - the OLD signing key (DPoP)
+ * @param {typeof fetch} [a.fetchImpl]
+ */
+export async function revokeAgentDevice({
+  idpUrl,
+  deviceId,
+  agentDid,
+  vcCompact,
+  signingKey,
+  fetchImpl = fetch,
+}) {
+  if (!deviceId) throw new Error('revokeAgentDevice: deviceId required');
+  return authedIdpFetch({
+    idpUrl,
+    method: 'DELETE',
+    path: `/v1/identity/devices/${encodeURIComponent(deviceId)}`,
+    agentDid,
+    vcCompact,
+    signingKey,
+    fetchImpl,
+  });
+}
+
+/**
  * GET /v1/mls/keypackages/:did — claim the peer's published KeyPackage(s).
  * `perDevice` (default true) asks the IdP for ONE KeyPackage per device,
  * deduped + sorted server-side — so inviting all of the operator's devices

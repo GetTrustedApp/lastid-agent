@@ -53,7 +53,7 @@ function detectRuntimeName() {
   if (env.OPENAI_ASSISTANT_ID) return `OpenAI Assistant${here}`;
   return `lastid-agent${here}`;
 }
-import { provisionAgent } from '../lib/agent-provisioning.js';
+import { provisionAgent, resolveAgentDeviceId } from '../lib/agent-provisioning.js';
 import { recordGroup } from '../lib/agent-groups.js';
 import { resolveScope } from '../lib/scope.js';
 import { persistAgentVc, loadAgentVc } from '../lib/keychain.js';
@@ -420,6 +420,33 @@ async function cmdProvision(flags) {
     const { stopListener, clearScopeState } = await import('./listener-daemon.js');
     console.log('');
     console.log('Reissue — resetting local state for the new identity…');
+    // Retire the OLD device at the IdP first, using the OLD identity's creds:
+    // the IdP evicts its leaf from every group AND purges its KeyPackages, so
+    // no peer can re-add the now-dead device via a stale KP (NoMatchingKeyPackage
+    // on the welcome). Best-effort — a failure here (e.g. the old VC already
+    // expired) must not block the reissue.
+    try {
+      const { deriveAgentKeypair } = await import('./agent-provisioning.js');
+      const { revokeAgentDevice } = await import('./mls-groups-api.js');
+      const oldDeviceId = resolveAgentDeviceId({
+        persistedDeviceId: existing.deviceId,
+        slotSeed: existing.slotSeed,
+        agentDid: existing.agentDid,
+      });
+      const { signingKey } = deriveAgentKeypair(existing.slotSeed, existing.agentDid);
+      await revokeAgentDevice({
+        idpUrl: existing.idpUrl ?? idpUrl,
+        deviceId: oldDeviceId,
+        agentDid: existing.agentDid,
+        vcCompact: existing.vcCompact,
+        signingKey,
+      });
+      console.log(`   old device: revoked ${oldDeviceId} (evicted from groups, KeyPackages purged)`);
+    } catch (err) {
+      console.error(
+        `   old device: revoke skipped — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     try {
       const stopped = await stopListener({ scope });
       console.log(`   listener:   ${stopped.status} (old WebSocket closed)`);
@@ -446,6 +473,11 @@ async function cmdProvision(flags) {
       vcCompact: provisioned.vcCompact,
       slotSeed: provisioned.slotSeed,
       scope,
+      // The device_id pinned at provisioning (`md-…` when machine-bound) so the
+      // first KeyPackages publish under the machine device, matching the
+      // credential the throwaway client stamps. null for a legacy agent → the
+      // client derives the legacy `ad-…`.
+      deviceId: provisioned.deviceId,
     });
     console.log('   mls keypkg: published');
   } catch (err) {
@@ -641,8 +673,8 @@ async function cmdMemoryRetrieve(flags) {
   // Desktop fallback (transition): the old TCB still holds memories until
   // they're migrated. Soft-fail to no output if unreachable.
   const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
-  const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
-  const { signingKey, signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
+  const { deriveAgentKeypair } = await import('./agent-provisioning.js');
+  const { signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid);
   const client = new DesktopMcpClient({
     agentDid: loaded.agentDid,
     vcCompact: loaded.vcCompact,
@@ -915,8 +947,8 @@ async function cmdMemorySearch(flags) {
   }
 
   const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
-  const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
-  const { signingKey, signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
+  const { deriveAgentKeypair } = await import('./agent-provisioning.js');
+  const { signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid);
   const client = new DesktopMcpClient({
     agentDid: loaded.agentDid,
     vcCompact: loaded.vcCompact,
@@ -1046,7 +1078,7 @@ async function cmdPolicyCheck(flags) {
   }
   const { DesktopMcpClient } = await import('./desktop-mcp-client.js');
   const { loadAgentVc } = await import('./keychain.js');
-  const { deriveAgentEd25519Keypair } = await import('./agent-provisioning.js');
+  const { deriveAgentKeypair } = await import('./agent-provisioning.js');
   const loaded = await loadAgentVc(resolveScope(flags));
   if (!loaded) {
     // Not provisioned — fail open. The plugin acts only on
@@ -1081,7 +1113,7 @@ async function cmdPolicyCheck(flags) {
     process.stderr.write(`policy-check(local): ${e?.message ?? e}\n`);
   }
 
-  const { signingKey, signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
+  const { signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid);
   const client = new DesktopMcpClient({
     agentDid: loaded.agentDid,
     vcCompact: loaded.vcCompact,
@@ -1146,7 +1178,7 @@ async function cmdSelfProtectionStatus(flags) {
  */
 async function runAgentStateSync(loaded, scope, opts = {}) {
   const [
-    { deriveAgentEd25519Keypair },
+    { deriveAgentKeypair },
     { OperatorStore, deriveOperatorStateMacKey },
     { syncAgentState },
     { MemoryStore },
@@ -1159,7 +1191,7 @@ async function runAgentStateSync(loaded, scope, opts = {}) {
     import('./vc-claims.js'),
   ]);
   const idpUrl = loaded.idpUrl ?? env.LASTID_IDP_URL ?? 'https://human.lastid.co';
-  const { signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed);
+  const { signingKey } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid);
   // The listener is the SINGLE writer of operator-state — key it so every save
   // stamps the anti-tamper MAC (off the slot_seed, which isn't in the file).
   const store = new OperatorStore(scope, undefined, {
@@ -1235,7 +1267,7 @@ async function cmdListen(flags) {
   const idpUrl = loaded.idpUrl ?? env.LASTID_IDP_URL ?? 'https://human.lastid.co';
 
   const [
-    { deriveAgentEd25519Keypair },
+    { deriveAgentKeypair },
     { MlsClient },
     { LastIdWsClient },
     { MlsDispatcher },
@@ -1297,7 +1329,7 @@ async function cmdListen(flags) {
       );
   });
 
-  const { signingKey, signingSeed } = deriveAgentEd25519Keypair(loaded.slotSeed);
+  const { signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid);
 
   // Drain the audit spool into the signed chain, then ship it to the IdP
   // (operator-visible cross-device). The listener is the SINGLE chain writer:
@@ -1373,6 +1405,20 @@ async function cmdListen(flags) {
   // client while ensure/reconcile built a SEPARATE orchestrator on a phantom
   // IndexedDB backend, so a group one created was invisible to the other — the
   // multi-device welcome bug (mem_01KSNXSY4TY7DK7EJTREPNY5RH).
+  // L5: resolve this agent's MLS device_id ONCE — the keychain-pinned `md-…`
+  // for a machine-bound (reissued) agent, else the legacy `ad-…` derivation
+  // (no-flag-day; existing agents unchanged). The SAME value is threaded into
+  // the orchestrator handle (via ctx.deviceId) and the MlsClient wrapper, so
+  // the credential the shared handle stamps and the device_id KeyPackage
+  // publish reports can never disagree (the multi-device two-sources class).
+  const resolvedDeviceId =
+    Buffer.isBuffer(loaded.slotSeed) && loaded.slotSeed.length === 32
+      ? resolveAgentDeviceId({
+          persistedDeviceId: loaded.deviceId,
+          slotSeed: loaded.slotSeed,
+          agentDid: loaded.agentDid,
+        })
+      : null;
   const listenerCtx = {
     scope,
     agentDid: loaded.agentDid,
@@ -1381,10 +1427,11 @@ async function cmdListen(flags) {
     vcCompact: loaded.vcCompact,
     signingKey,
     slotSeed: loaded.slotSeed,
+    deviceId: resolvedDeviceId,
     log: (l) => process.stderr.write(`${l}\n`),
   };
   const orchestrator = await getOrchestrator(listenerCtx);
-  const mls = MlsClient.fromOrchestrator(orchestrator, loaded.agentDid);
+  const mls = MlsClient.fromOrchestrator(orchestrator, loaded.agentDid, resolvedDeviceId);
 
   // One-time repair of the persisted group map: re-seed the idp→openmls
   // mapping for every valid group into the live MLS client (the agent only
@@ -1418,6 +1465,7 @@ async function cmdListen(flags) {
         vcCompact: loaded.vcCompact,
         slotSeed: loaded.slotSeed,
         scope,
+        deviceId: loaded.deviceId,
         // Mint into the listener's ONE shared MLS instance, NOT a competing
         // client — otherwise the KP private parts the operator's welcome needs
         // get clobbered by the orchestrator's next flush → NoMatchingKeyPackage
@@ -1761,10 +1809,15 @@ async function cmdListen(flags) {
       scope,
       deps: {
         agentDid: loaded.agentDid,
-        // signingSeed + vcCompact let the listener run the cross-device
-        // approval loop INSIDE vault_use (single dispatch site — see
-        // vault-ipc.js). Callers don't need to know about the loop; they
-        // just await vault_use and get back ok+handle or a clean error.
+        // signingKey (a Node KeyObject — Ed25519 or P-256) + vcCompact let
+        // the listener run the cross-device approval loop INSIDE vault_use
+        // (single dispatch site — see vault-ipc.js). Dual-algo: the
+        // KeyObject's asymmetricKeyType picks the DPoP alg, so an Ed25519
+        // agent doesn't 401 on an ES256 proof. Callers don't need to know
+        // about the loop; they just await vault_use and get back ok+handle
+        // or a clean error. signingSeed stays in deps for the secret-fetch
+        // + credentialed-use telemetry paths below (still seed-based).
+        signingKey,
         signingSeed,
         vcCompact: loaded.vcCompact,
         handles: vaultHandles,
@@ -1793,7 +1846,7 @@ async function cmdListen(flags) {
                 idpUrl,
                 agentDid: loaded.agentDid,
                 vcCompact: loaded.vcCompact,
-                signingSeed,
+                signingKey,
                 id,
                 handlePubB64,
                 handleId,
@@ -1821,7 +1874,7 @@ async function cmdListen(flags) {
             idpUrl,
             agentDid: loaded.agentDid,
             vcCompact: loaded.vcCompact,
-            signingSeed,
+            signingKey,
             kind,
             handle: h,
             metrics: m,

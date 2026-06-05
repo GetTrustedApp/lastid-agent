@@ -11,3 +11,6 @@ plugins/lastid-agent/package-lock.json
 build/
 *.dylib.dSYM
 target/
+
+# Claude Code local state (skills, worktrees) — not committed
+.claude/

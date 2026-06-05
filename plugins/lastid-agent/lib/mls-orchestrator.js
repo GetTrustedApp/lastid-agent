@@ -47,7 +47,7 @@ import {
   fetchActiveDevicesForDid,
 } from './mls-groups-api.js';
 import { diskKvCallbacks } from './mls-state-store.js';
-import { deriveAgentDeviceId } from './agent-provisioning.js';
+import { resolveAgentDeviceId } from './agent-provisioning.js';
 
 const localRequire = createRequire(import.meta.url);
 const wasm = localRequire('../vendor/lastid-mls-wasm/lastid_mls_wasm.js');
@@ -433,11 +433,19 @@ export async function getOrchestrator(ctx, { deps = {}, wasmImpl = wasm } = {}) 
   // This agent's stable device_id, stamped into every MLS credential the
   // orchestrator's openmls instance builds (own leaf + KeyPackages) so peers —
   // including a member welcomed into a group it didn't build — can map our
-  // leaf→device. Only derivable with the real slot seed; a test backend
-  // (deps.makeKvCallbacks, no seed) leaves it undefined → bare-DID credential.
+  // leaf→device. `resolveAgentDeviceId` returns the value PINNED at
+  // provisioning (`ctx.deviceId` = the keychain `md-…` for a machine-bound
+  // agent) or the legacy `ad-…` derivation when none was persisted — the
+  // no-flag-day seam (existing agents unchanged). Only derivable with the real
+  // slot seed; a test backend (deps.makeKvCallbacks, no seed) leaves it
+  // undefined → bare-DID credential.
   const deviceId =
     ctx.slotSeed instanceof Uint8Array && ctx.slotSeed.length === 32
-      ? deriveAgentDeviceId(Buffer.from(ctx.slotSeed))
+      ? resolveAgentDeviceId({
+          persistedDeviceId: ctx.deviceId,
+          slotSeed: Buffer.from(ctx.slotSeed),
+          agentDid: ctx.agentDid,
+        })
       : undefined;
 
   ctx.__mlsOrchestratorPending = (async () => {

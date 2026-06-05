@@ -20,7 +20,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { DesktopMcpClient } from './desktop-mcp-client.js';
-import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
+import { deriveAgentKeypair } from './agent-provisioning.js';
 import { loadAgentVc } from './keychain.js';
 import { decodeVcClaims, hasCapability } from './vc-claims.js';
 import {
@@ -775,16 +775,16 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
  * failure (the plugin still serves its own tools).
  */
 async function tryConnectDesktop({ loadedAgent }) {
-  if (!loadedAgent) return { client: null, signingSeed: null };
+  if (!loadedAgent) return { client: null, signingKey: null, signingSeed: null };
   let signingKey;
   let signingSeed;
   try {
-    ({ signingKey, signingSeed } = deriveAgentEd25519Keypair(loadedAgent.slotSeed));
+    ({ signingKey, signingSeed } = deriveAgentKeypair(loadedAgent.slotSeed, loadedAgent.agentDid));
   } catch (err) {
     process.stderr.write(
       `[lastid-agent] desktop bridge: keypair derivation failed: ${err.message}\n`,
     );
-    return { client: null, signingSeed: null };
+    return { client: null, signingKey: null, signingSeed: null };
   }
   const client = new DesktopMcpClient({
     agentDid: loadedAgent.agentDid,
@@ -793,7 +793,7 @@ async function tryConnectDesktop({ loadedAgent }) {
     signingSeed,
   });
   const ok = await client.connect();
-  return { client: ok ? client : null, signingSeed };
+  return { client: ok ? client : null, signingKey, signingSeed };
 }
 
 // True when the on-disk credential differs from the one this server cached.
@@ -837,13 +837,15 @@ async function buildServer({ scope }) {
   // Cached state. Connect once at build time; tools/list re-attempts
   // the desktop connection only when no client is currently held
   // (handles "wallet came up mid-session"). tools/call leans on the
-  // client's own re-handshake on 401 / expiry. signingSeed is held
-  // alongside the client so the use-approval orchestrator can sign
-  // DPoP JWTs against /v1/agent-use-approvals without re-deriving.
+  // client's own re-handshake on 401 / expiry. signingKey (a Node
+  // KeyObject — Ed25519 or P-256) is held alongside the client so the
+  // use-approval orchestrator can mint dual-algo (EdDSA / ES256) DPoP
+  // JWTs against /v1/agent-use-approvals without re-deriving the
+  // keypair on each call.
   let loadedAgent = await loadAgentVc(scope);
   let desktopConn = await tryConnectDesktop({ loadedAgent });
   let desktopClient = desktopConn.client;
-  let signingSeed = desktopConn.signingSeed;
+  let signingKey = desktopConn.signingKey;
   // When we last re-read the credential from disk (gates the reissue TTL below).
   let lastAgentReadAt = Date.now();
   // Re-read the credential at most this often (ms) to catch a reissue.
@@ -870,14 +872,14 @@ async function buildServer({ scope }) {
     // session restart. Re-read on a short TTL and swap when the on-disk identity
     // changed; the TTL keeps the common no-change path a single in-process check
     // rather than a credential read per tool call. Drop the desktop connection
-    // so signingSeed re-derives from the new slot seed.
+    // so signingKey re-derives from the new slot seed.
     if (Date.now() - lastAgentReadAt >= AGENT_REFRESH_TTL_MS) {
       lastAgentReadAt = Date.now();
       const fresh = await loadAgentVc(scope);
       if (agentCredentialChanged(loadedAgent, fresh)) {
         loadedAgent = fresh;
         desktopClient = null;
-        signingSeed = null;
+        signingKey = null;
       }
     }
   };
@@ -887,7 +889,7 @@ async function buildServer({ scope }) {
     await reloadAgentIfStale();
     desktopConn = await tryConnectDesktop({ loadedAgent });
     desktopClient = desktopConn.client;
-    signingSeed = desktopConn.signingSeed;
+    signingKey = desktopConn.signingKey;
     return desktopClient;
   };
 
@@ -918,7 +920,7 @@ async function buildServer({ scope }) {
         // `policy_approval_required`, drive the cross-device approval
         // round-trip transparently so the LLM caller sees one tool
         // result (either the handle or a structured denial).
-        if (name === 'vault_use' && loadedAgent && signingSeed) {
+        if (name === 'vault_use' && loadedAgent && signingKey) {
           const approvalBody = parseApprovalRequiredResult(initial);
           if (approvalBody) {
             const outcome = await runApprovalLoop({
@@ -926,7 +928,7 @@ async function buildServer({ scope }) {
               originalArgs: args ?? {},
               agentDid: loadedAgent.agentDid,
               vcCompact: loadedAgent.vcCompact,
-              signingSeed,
+              signingKey,
             });
             if (outcome.retryArgs) {
               return await client.callTool(name, outcome.retryArgs);

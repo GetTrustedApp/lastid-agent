@@ -2,8 +2,8 @@
  * mls-groups-api (lib/mls-groups-api.js) — the agent-side IdP group REST
  * calls used by the conversation self-heal. These lock the HTTP shaping
  * (method, URL, Bearer + DPoP headers, JSON body), the response parsing,
- * and the argument validation. A real Ed25519 key is generated so the
- * DPoP minting runs for real; the network is stubbed via fetchImpl.
+ * and the argument validation. A real P-256 key is generated so the
+ * DPoP minting (ES256) runs for real; the network is stubbed via fetchImpl.
  */
 
 import { test } from 'node:test';
@@ -16,9 +16,10 @@ import {
   fetchActiveDevicesForDid,
   createGroupOnIdp,
   addGroupMember,
+  revokeAgentDevice,
 } from '../lib/mls-groups-api.js';
 
-const { privateKey: signingKey } = generateKeyPairSync('ed25519');
+const { privateKey: signingKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
 const AUTH = {
   idpUrl: 'https://idp.test/',
   agentDid: 'did:lastid:agent:zAgentTest',
@@ -303,4 +304,34 @@ test('addGroupMember: validates required fields', async () => {
   await assert.rejects(() => addGroupMember({ ...AUTH, inviteeDid: 'd', mlsWelcomeB64: 'w', fetchImpl: f }), /groupId required/);
   await assert.rejects(() => addGroupMember({ ...AUTH, groupId: 'g', mlsWelcomeB64: 'w', fetchImpl: f }), /inviteeDid required/);
   await assert.rejects(() => addGroupMember({ ...AUTH, groupId: 'g', inviteeDid: 'd', fetchImpl: f }), /mlsWelcomeB64 required/);
+});
+
+// ── revokeAgentDevice — reissue self-revoke of the OLD device ──────────────
+
+test('revokeAgentDevice: DELETEs /v1/identity/devices/{id} with Bearer + DPoP, no body', async () => {
+  const fetchImpl = recordingFetch(res({ success: true }));
+  const out = await revokeAgentDevice({ ...AUTH, deviceId: 'ad-1ef73378e49013f06656bc0a223f46ad', fetchImpl });
+  assert.deepEqual(out, { success: true });
+  assert.equal(fetchImpl.calls.length, 1);
+  const { url, init } = fetchImpl.calls[0];
+  assert.equal(url, 'https://idp.test/v1/identity/devices/ad-1ef73378e49013f06656bc0a223f46ad');
+  assert.equal(init.method, 'DELETE');
+  assert.equal(init.body, undefined);
+  assert.equal(init.headers.Authorization, 'Bearer header.payload.sig');
+  assert.match(init.headers.DPoP, /^[\w-]+\.[\w-]+\.[\w-]+$/); // a real ES256 JWS
+});
+
+test('revokeAgentDevice: an md- device id round-trips unescaped (no reserved chars)', async () => {
+  const fetchImpl = recordingFetch(res({ success: true }));
+  await revokeAgentDevice({ ...AUTH, deviceId: 'md-deadbeefdeadbeefdeadbeefdeadbeef', fetchImpl });
+  assert.equal(
+    fetchImpl.calls[0].url,
+    'https://idp.test/v1/identity/devices/md-deadbeefdeadbeefdeadbeefdeadbeef',
+  );
+});
+
+test('revokeAgentDevice: missing deviceId throws (never DELETEs the collection)', async () => {
+  const fetchImpl = recordingFetch(res({}));
+  await assert.rejects(() => revokeAgentDevice({ ...AUTH, fetchImpl }), /deviceId required/);
+  assert.equal(fetchImpl.calls.length, 0);
 });

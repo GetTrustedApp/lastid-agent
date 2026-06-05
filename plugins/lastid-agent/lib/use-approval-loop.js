@@ -22,7 +22,8 @@
  * it returns the handle or a structured denial.
  */
 
-import { initializeSdkBindings, mintAgentPopJwt } from './sdk-bindings.js';
+import { initializeSdkBindings } from './sdk-bindings.js';
+import { mintDpopJwt } from './dpop.js';
 
 const IDP_BASE_URL = process.env.LASTID_IDP_URL ?? 'https://human.lastid.co';
 const POLL_INTERVAL_MS = 3000;
@@ -62,23 +63,25 @@ async function createApprovalRow({
   request,
   agentDid,
   vcCompact,
-  signingSeed,
+  signingKey,
 }) {
   if (!vcCompact) {
     throw new Error(
       'use-approval: no agent VC available — agent must be provisioned',
     );
   }
-  if (!signingSeed) {
+  if (!signingKey) {
     throw new Error(
-      'use-approval: no signingSeed available — required to mint DPoP proof',
+      'use-approval: no signingKey available — required to mint DPoP proof',
     );
   }
   const url = `${IDP_BASE_URL}/v1/agent-use-approvals`;
-  const popJwt = await mintAgentPopJwt(
-    { signingKeyBytes: new Uint8Array(signingSeed) },
-    { agentDid, method: 'POST', uri: url },
-  );
+  const popJwt = mintDpopJwt({
+    agentDid,
+    httpMethod: 'POST',
+    httpUri: url,
+    signingKey,
+  });
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -104,7 +107,7 @@ async function pollApprovalRow({
   approvalId,
   agentDid,
   vcCompact,
-  signingSeed,
+  signingKey,
   intervalMs = POLL_INTERVAL_MS,
   timeoutMs = PENDING_TTL_MS,
 }) {
@@ -113,10 +116,12 @@ async function pollApprovalRow({
   while (Date.now() < deadlineMs) {
     // Mint a fresh DPoP proof per poll so iat stays inside the IdP's
     // ±60s window even if the operator takes a while to decide.
-    const popJwt = await mintAgentPopJwt(
-      { signingKeyBytes: new Uint8Array(signingSeed) },
-      { agentDid, method: 'GET', uri: url },
-    );
+    const popJwt = mintDpopJwt({
+      agentDid,
+      httpMethod: 'GET',
+      httpUri: url,
+      signingKey,
+    });
     const res = await fetch(url, {
       method: 'GET',
       headers: {
@@ -154,7 +159,7 @@ export async function runApprovalLoop({
   originalArgs,
   agentDid,
   vcCompact,
-  signingSeed,
+  signingKey,
 }) {
   const request = approvalBody.approval_request;
   let created;
@@ -163,7 +168,7 @@ export async function runApprovalLoop({
       request,
       agentDid,
       vcCompact,
-      signingSeed,
+      signingKey,
     });
   } catch (err) {
     return {
@@ -182,7 +187,7 @@ export async function runApprovalLoop({
       approvalId,
       agentDid,
       vcCompact,
-      signingSeed,
+      signingKey,
     });
   } catch (err) {
     if (err.message?.includes('did not decide')) {

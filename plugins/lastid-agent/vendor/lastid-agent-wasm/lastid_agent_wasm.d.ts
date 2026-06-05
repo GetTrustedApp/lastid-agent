@@ -59,13 +59,13 @@ export class VerifiedPopJs {
 }
 
 /**
- * Encode a raw Ed25519 public key (32 bytes) as a
- * `did:lastid:agent:` DID.
+ * Encode a raw P-256 public key (SEC1 compressed 33 bytes or
+ * uncompressed 65 bytes) as a `did:lastid:agent:` DID.
  */
 export function agentDidFromPubkey(pubkey_bytes: Uint8Array): string;
 
 /**
- * Derive an agent's stable Ed25519 keypair from a 32-byte seed.
+ * Derive an agent's stable P-256 (ES256) keypair from a 32-byte seed.
  */
 export function agentKeypairFromSeed(seed: Uint8Array): AgentKeypairJs;
 
@@ -132,11 +132,6 @@ export function deriveIdentityFromMnemonic(mnemonic_words: any, master_password:
 export function deriveSubAgentSeed(parent_slot_seed: Uint8Array, class_slug: string, index: number): Uint8Array;
 
 /**
- * Compute the RFC 7638 JWK thumbprint of a raw Ed25519 pubkey.
- */
-export function ed25519JwkThumbprint(pubkey_bytes: Uint8Array): string;
-
-/**
  * Generate a fresh 24-word BIP39 mnemonic using the browser's
  * `crypto.getRandomValues` (via `getrandom`'s `js` feature). Returns
  * the word list as a JS array of strings — display once with the
@@ -178,28 +173,34 @@ export function generateRecoveryQr(mnemonic_words: any, master_password: string)
 export function init(): void;
 
 /**
- * Mint an Ed25519 OID4VCI proof JWT. Called by the agent runtime
- * after the IdP returns a `c_nonce` from `POST /oauth/token`. The
- * signing key is the agent's stable identity key (derived via
+ * Mint a P-256 (ES256) OID4VCI proof JWT. Called by the agent
+ * runtime after the IdP returns a `c_nonce` from `POST /oauth/token`.
+ * The signing key is the agent's stable identity key (derived via
  * `agentKeypairFromSeed`).
  *
- * Header: `{ "alg": "EdDSA", "typ": "openid4vci-proof+jwt",
- *            "jwk": { "kty":"OKP","crv":"Ed25519","x":"..." } }`
+ * Header: `{ "alg": "ES256", "typ": "openid4vci-proof+jwt",
+ *            "jwk": { "kty":"EC","crv":"P-256","x":"...","y":"..." } }`
  * Payload: `{ "iss": holder_did, "aud": audience,
  *             "iat": now, "nonce": c_nonce }`
  */
-export function mintOid4vciProofJwtEdDsa(signing_key_bytes: Uint8Array, holder_did: string, audience: string, c_nonce: string, now: bigint): string;
+export function mintOid4vciProofJwtEs256(signing_key_bytes: Uint8Array, holder_did: string, audience: string, c_nonce: string, now: bigint): string;
 
 /**
- * Build a DPoP-shaped PoP JWT signed by the agent's Ed25519 key.
- * `access_token` is optional: pass `None` to skip the `ath` claim,
- * pass `Some(token)` to bind this PoP to a specific token.
+ * Build a DPoP-shaped PoP JWT signed by the agent's P-256 (ES256)
+ * key. `access_token` is optional: pass `None` to skip the `ath`
+ * claim, pass `Some(token)` to bind this PoP to a specific token.
  */
 export function mintPopJwt(signing_key_bytes: Uint8Array, agent_did: string, http_method: string, http_uri: string, access_token: string | null | undefined, now: bigint): string;
 
 /**
- * Parse a `did:lastid:agent:` DID and return the encoded
- * Ed25519 public key as 32 bytes.
+ * Compute the RFC 7638 JWK thumbprint of a raw P-256 pubkey (SEC1
+ * compressed 33 bytes or uncompressed 65 bytes).
+ */
+export function p256JwkThumbprint(pubkey_bytes: Uint8Array): string;
+
+/**
+ * Parse a `did:lastid:agent:` DID and return the encoded P-256
+ * public key as compressed SEC1 bytes (33 bytes).
  */
 export function parseAgentDid(did: string): Uint8Array;
 
@@ -851,21 +852,21 @@ export function sdkVaultSyncEncrypt(payload: Uint8Array): Promise<string>;
 export function sdkVaultSyncStart(): Promise<any>;
 
 /**
- * Sign an arbitrary payload with an Ed25519 signing key. Returns the
- * raw 64-byte signature. The keypair this wraps is the agent's
- * stable identity keypair, derived earlier via
+ * Sign an arbitrary payload with a P-256 (ES256) signing key.
+ * Returns the raw 64-byte (r||s) signature. The keypair this wraps
+ * is the agent's stable identity keypair, derived earlier via
  * `agentKeypairFromSeed`. Use for the agent-side audit log signing
  * and any custom challenge protocols.
  */
-export function signEd25519(signing_key_bytes: Uint8Array, payload: Uint8Array): Uint8Array;
+export function signP256(signing_key_bytes: Uint8Array, payload: Uint8Array): Uint8Array;
 
 /**
  * Sign a compact JWS authorizing a sub-agent VC issuance. Used by
  * the parent agent's listener when it acts as issuer for an
  * operator-published sub-agent. Mirrors `sign_human_authorization`
- * but Ed25519 (the parent's existing agent signing key).
+ * but signed with ES256 (the parent's existing P-256 agent key).
  *
- * `signing_key_bytes` — the parent agent's 32-byte Ed25519 secret
+ * `signing_key_bytes` — the parent agent's 32-byte P-256 scalar
  * (`AgentKeypair::signing_key().to_bytes()`). `claims_json` — a
  * JSON-serialized claims object the IdP will verify (`iss`, `sub`,
  * `agent_pubkey_jwk_thumb`, `capabilities`, `may_delegate`, `iat`,
@@ -876,7 +877,7 @@ export function signEd25519(signing_key_bytes: Uint8Array, payload: Uint8Array):
 export function signParentAuthorization(signing_key_bytes: Uint8Array, kid: string | null | undefined, claims_json: string): string;
 
 /**
- * Sign a SessionFingerprint with the agent's Ed25519 signing key.
+ * Sign a SessionFingerprint with the agent's P-256 signing key.
  * Plugin path: SessionStart hook builds the unsigned fingerprint
  * (session_id, agent_did, project, timestamps, optional
  * parent_session_id), passes it here, gets back the same object
@@ -942,18 +943,19 @@ export function verifyAgentVcWithHumanAuthorization(jws_compact: string, idp_pub
 export function verifyDecisionJws(jws_compact: string, operator_jwk_x_b64u: string, operator_jwk_y_b64u: string, now_epoch_sec: bigint, expected_approval_id?: string | null, expected_parent_human_did?: string | null, expected_agent_did?: string | null, expected_share_id?: string | null): any;
 
 /**
- * Verify a raw Ed25519 signature. Returns true on valid, false on
- * invalid (never throws for a structurally-correct but
- * cryptographically-wrong signature).
- */
-export function verifyEd25519(pubkey_bytes: Uint8Array, payload: Uint8Array, signature_bytes: Uint8Array): boolean;
-
-/**
  * Verify a standalone human-authorization JWS against the human's
  * delegation P-256 pubkey. Useful for consumers that have a
  * human_authorization string outside the context of an outer VC.
  */
 export function verifyHumanAuthorization(jws_compact: string, human_pubkey_jwk: any, now: bigint): VerifiedHumanAuthorizationJs;
+
+/**
+ * Verify a raw P-256 (ES256) signature. `pubkey_bytes` is the SEC1
+ * compressed (33-byte) or uncompressed (65-byte) public key.
+ * Returns true on valid, false on invalid (never throws for a
+ * structurally-correct but cryptographically-wrong signature).
+ */
+export function verifyP256(pubkey_bytes: Uint8Array, payload: Uint8Array, signature_bytes: Uint8Array): boolean;
 
 /**
  * Verify a DPoP-shaped PoP JWT. Pubkey is extracted from the `kid`
@@ -962,7 +964,7 @@ export function verifyHumanAuthorization(jws_compact: string, human_pubkey_jwk: 
 export function verifyPopJwt(jwt: string, expected_method: string, expected_uri: string, expected_access_token: string | null | undefined, now: bigint, max_age_seconds: number): VerifiedPopJs;
 
 /**
- * Verify a SessionFingerprint by reconstructing the Ed25519
+ * Verify a SessionFingerprint by reconstructing the P-256
  * verifying key from its `agent_did` field. Returns `true` on
  * valid; throws (a `JsError` with a precise reason) on any
  * failure. Useful on the desktop side and for integration tests

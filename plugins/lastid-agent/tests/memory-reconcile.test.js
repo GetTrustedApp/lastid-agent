@@ -14,7 +14,7 @@ import { MemoryStore } from '../lib/memory-store.js';
 import { OperatorStore } from '../lib/operator-store.js';
 import { syncAgentState } from '../lib/agent-state-sync.js';
 import { encryptContent } from '../lib/agent-content-crypto.js';
-import { deriveAgentEd25519Keypair } from '../lib/agent-provisioning.js';
+import { deriveAgentP256Keypair } from '../lib/agent-provisioning.js';
 
 function memStore() {
   return new MemoryStore('test', join(tmpdir(), `mem-${randomUUID()}.json`), {
@@ -77,7 +77,7 @@ test('applySync: revoke drops a present id (any author)', () => {
 
 test('sync routes an agent-authored memory to memory-store, NOT operator-store', async () => {
   const slotSeed = Buffer.alloc(32, 3);
-  const { signingKey } = deriveAgentEd25519Keypair(slotSeed);
+  const { signingKey } = deriveAgentP256Keypair(slotSeed);
   const enc_b64 = encryptContent(slotSeed, Buffer.from(JSON.stringify(content({ claim: 'from another session' })), 'utf8')).toString('base64');
   const record = { id: 'mem_x', kind: 'memory', target: 'global', version: 1, status: 'active', author: 'agent', enc_b64, cursor: 1 };
 

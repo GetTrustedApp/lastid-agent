@@ -1,6 +1,6 @@
 /**
  * lastid_sign — sign an arbitrary payload under the agent's identity
- * for a named scope. Returns the Ed25519 signature plus a thumbprint
+ * for a named scope. Returns the ES256 (P-256) signature plus a thumbprint
  * of the agent's VC so verifiers can correlate the signature to the
  * specific capability grant in effect at signing time.
  *

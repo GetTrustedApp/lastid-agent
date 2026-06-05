@@ -13,10 +13,10 @@
  *   - `provisionAgent` independently re-derives the DID from the
  *     unsealed seed and refuses to continue unless it matches the
  *     agent_did the IdP claimed. A green run therefore PROVES the
- *     seal -> unseal -> Ed25519-derive -> DID chain end to end.
- *   - The mock verifies the agent's EdDSA OID4VCI proof JWT (signature
- *     against the embedded jwk + nonce + audience) before issuing,
- *     exercising the real `mintProofJwt` path.
+ *     seal -> unseal -> P-256-derive -> DID chain end to end.
+ *   - The mock verifies the agent's ES256 (P-256) OID4VCI proof JWT
+ *     (signature against the embedded jwk + nonce + audience) before
+ *     issuing, exercising the real `mintProofJwt` path.
  *
  * What it intentionally does NOT cover: verifying the issued VC's
  * signature against LastID's trust anchors — the provisioning client
@@ -34,14 +34,14 @@ import {
   _internal,
 } from '../../lib/agent-provisioning.js';
 
-const { sealSlotSeed, deriveAgentEd25519Keypair, agentDidFromPublicJwk } = _internal;
+const { sealSlotSeed, deriveAgentP256Keypair, agentDidFromPublicJwk } = _internal;
 
 function fromB64url(s) {
   return Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
 }
 
 function didForSeed(slotSeed) {
-  return agentDidFromPublicJwk(deriveAgentEd25519Keypair(slotSeed).publicJwk);
+  return agentDidFromPublicJwk(deriveAgentP256Keypair(slotSeed).publicJwk);
 }
 
 function readBody(req) {
@@ -145,11 +145,11 @@ async function startMockIdp(opts) {
       const payload = JSON.parse(fromB64url(p));
       const sigOk =
         header.typ === 'openid4vci-proof+jwt' &&
-        header.alg === 'EdDSA' &&
+        header.alg === 'ES256' &&
         cryptoVerify(
-          null,
+          'sha256',
           Buffer.from(`${h}.${p}`, 'utf-8'),
-          createPublicKey({ key: header.jwk, format: 'jwk' }),
+          { key: createPublicKey({ key: header.jwk, format: 'jwk' }), dsaEncoding: 'ieee-p1363' },
           fromB64url(s),
         );
       if (!sigOk || payload.nonce !== state.cNonce || payload.aud !== state.issuer) {
@@ -205,6 +205,51 @@ test('provisions a fresh agent end-to-end against a mock IdP', async () => {
     assert.ok(idp.calls.poll >= 1);
     assert.equal(idp.calls.token, 1);
     assert.equal(idp.calls.credential, 1);
+  } finally {
+    await idp.close();
+  }
+});
+
+test('L5: a machine-bound agent pins its device_id to the machine md- (broker present)', async () => {
+  const slotSeed = Buffer.alloc(32, 0x5a);
+  const idp = await startMockIdp({ slotSeed, slotIndex: 3 });
+  // The signed broker yields this machine's SE pubkey; provisionAgent must pin
+  // the returned device_id to `md-<hash of that key>` (byte-identical to the
+  // IdP/Rust derivation), which persistAgentVc then stores as the MLS device_id.
+  const MACHINE_JWK = {
+    kty: 'EC',
+    crv: 'P-256',
+    x: '7QzUQKKfT8idSUWe6yEMhAhyCylEwH4BI1AUWsn4TAk',
+    y: 'CFK9En0kVMCifo6MSOiM7TKaVuLj62Kiyh7j_fHKvdU',
+  };
+  try {
+    const result = await provisionAgent({
+      idpUrl: idp.url,
+      parentHumanDid: 'did:lastid:zHumanOperatorExample',
+      onUserCode: () => {},
+      getMachineSePubkeyJwk: () => MACHINE_JWK,
+      ...FAST,
+    });
+    assert.equal(result.deviceId, 'md-1ef73378e49013f06656bc0a223f46ad');
+  } finally {
+    await idp.close();
+  }
+});
+
+test('L5: no broker → device_id is null → agent stays on the legacy ad- path (no-flag-day)', async () => {
+  const slotSeed = Buffer.alloc(32, 0x5a);
+  const idp = await startMockIdp({ slotSeed, slotIndex: 3 });
+  try {
+    const result = await provisionAgent({
+      idpUrl: idp.url,
+      parentHumanDid: 'did:lastid:zHumanOperatorExample',
+      onUserCode: () => {},
+      getMachineSePubkeyJwk: () => null,
+      ...FAST,
+    });
+    // null → persistAgentVc writes no device_id → loadAgentVc returns null →
+    // the MLS layer derives the legacy ad-. Existing agents are unchanged.
+    assert.equal(result.deviceId, null);
   } finally {
     await idp.close();
   }

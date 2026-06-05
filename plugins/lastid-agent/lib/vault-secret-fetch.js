@@ -9,7 +9,7 @@
  * The IdP returns ciphertext only — it never sees plaintext and the wrap binds
  * the delivery to this one handle (single-use, replay-proof).
  */
-import { mintAgentPopJwt } from './sdk-bindings.js';
+import { mintDpopJwt } from './dpop.js';
 
 /**
  * @returns {Promise<string|null>} the base64 `wrapped_secret_b64`, or null when
@@ -19,20 +19,25 @@ export async function fetchWrappedVaultSecret({
   idpUrl,
   agentDid,
   vcCompact,
-  signingSeed,
+  signingKey,
   id,
   handlePubB64,
   handleId,
   fetchImpl = globalThis.fetch,
 }) {
   if (!vcCompact) throw new Error('no agent VC — cannot fetch vault secret');
-  if (!signingSeed) throw new Error('no signingSeed — cannot mint DPoP for vault secret');
+  if (!signingKey) throw new Error('no signingKey — cannot mint DPoP for vault secret');
   if (!handlePubB64 || !handleId) throw new Error('handle pubkey + id required to wrap the secret');
   const url = `${idpUrl}/v1/agent-state/vault/${encodeURIComponent(id)}/secret`;
-  const popJwt = await mintAgentPopJwt(
-    { signingKeyBytes: new Uint8Array(signingSeed) },
-    { agentDid, method: 'POST', uri: url },
-  );
+  // mintDpopJwt feature-detects the alg from the KeyObject (Ed25519→EdDSA,
+  // P-256→ES256) so an Ed25519 agent doesn't 401 on `agent_pop: header.alg
+  // must be 'EdDSA' for a Ed25519 cnf.jwk, got 'ES256'`.
+  const popJwt = mintDpopJwt({
+    agentDid,
+    httpMethod: 'POST',
+    httpUri: url,
+    signingKey,
+  });
   const res = await fetchImpl(url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${vcCompact}`, DPoP: popJwt, 'Content-Type': 'application/json' },

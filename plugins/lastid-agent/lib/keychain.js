@@ -37,6 +37,13 @@ const SERVICE_SLOT_SEED = 'lastid.co/agent-slot-seed';
 const SERVICE_PROJECT_ROOT_SEED = 'lastid.co/agent-project-root-seed';
 const SERVICE_SLOT_INDEX = 'lastid.co/agent-slot-index';
 const SERVICE_AGENT_DID = 'lastid.co/agent-did';
+// The agent's MLS device_id, PINNED at provisioning (L5). A machine-bound
+// (reissued) agent persists its `md-<machine SE key>` here; the value is the
+// single source the MLS layer stamps into credentials + key-packages. Absent
+// for every agent provisioned before machine-binding — loadAgentVc returns
+// null and the caller falls back to the legacy `ad-` derivation, so existing
+// agents keep their current device_id byte-for-byte until they are reissued.
+const SERVICE_DEVICE_ID = 'lastid.co/agent-device-id';
 const SERVICE_VC = 'lastid.co/agent-vc';
 const SERVICE_IDP_URL = 'lastid.co/agent-idp-url';
 const SERVICE_SUB_SLOT_SEED = 'lastid.co/sub-agent-slot-seed';
@@ -52,6 +59,7 @@ export async function loadAgentVc(scope = 'main') {
   if (!seedB64 || !vcCompact) return null;
   const slotIndexStr = await readSecret(`${SERVICE_SLOT_INDEX}:${scope}`);
   const agentDid = await readSecret(`${SERVICE_AGENT_DID}:${scope}`);
+  const deviceId = await readSecret(`${SERVICE_DEVICE_ID}:${scope}`);
   const idpUrl = await readSecret(`${SERVICE_IDP_URL}:${scope}`);
   const projectRootSeedB64 = await readSecret(`${SERVICE_PROJECT_ROOT_SEED}:${scope}`);
   return {
@@ -63,6 +71,10 @@ export async function loadAgentVc(scope = 'main') {
       : null,
     slotIndex: slotIndexStr ? Number.parseInt(slotIndexStr, 10) : null,
     agentDid: agentDid ?? null,
+    // Optional — null for agents provisioned before machine-binding (L5).
+    // The MLS layer falls back to the legacy `ad-` derivation when null, so
+    // existing agents are unchanged until reissued machine-bound.
+    deviceId: deviceId ?? null,
     vcCompact,
     // Persisted IdP base URL for the env this agent was provisioned
     // against. Falls back to null when the entry is absent (older
@@ -92,6 +104,13 @@ export async function persistAgentVc(provisioned, scope = 'main') {
     String(provisioned.slotIndex),
   );
   await writeSecret(`${SERVICE_AGENT_DID}:${scope}`, provisioned.agentDid);
+  // Persist the machine-bound MLS device_id (`md-…`) when provisioning bound
+  // this agent to a machine device. Optional: omitted when no machine SE key
+  // was presented (legacy / no-broker) — loadAgentVc then returns null and the
+  // MLS layer derives the legacy `ad-` id, so existing agents never churn.
+  if (provisioned.deviceId) {
+    await writeSecret(`${SERVICE_DEVICE_ID}:${scope}`, provisioned.deviceId);
+  }
   await writeSecret(`${SERVICE_VC}:${scope}`, provisioned.vcCompact);
   // Persist the IdP we bound this agent to so subsequent sessions
   // route to the same environment automatically — no need to keep
@@ -134,6 +153,7 @@ export async function deleteAgentVc(scope = 'main') {
   await deleteSecret(`${SERVICE_PROJECT_ROOT_SEED}:${scope}`);
   await deleteSecret(`${SERVICE_SLOT_INDEX}:${scope}`);
   await deleteSecret(`${SERVICE_AGENT_DID}:${scope}`);
+  await deleteSecret(`${SERVICE_DEVICE_ID}:${scope}`);
   await deleteSecret(`${SERVICE_VC}:${scope}`);
   await deleteSecret(`${SERVICE_IDP_URL}:${scope}`);
 }

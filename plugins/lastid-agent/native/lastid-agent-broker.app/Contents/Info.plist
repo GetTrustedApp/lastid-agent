@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>co.lastid.agentBroker</string>
+<key>CFBundleExecutable</key><string>lastid-agent-broker</string>
+<key>CFBundleName</key><string>lastid-agent-broker</string>
+<key>CFBundleVersion</key><string>1.0</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>

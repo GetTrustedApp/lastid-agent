@@ -14,13 +14,13 @@ import {
   computeProjectFingerprint,
 } from '../lib/session-fingerprint.js';
 import {
-  deriveAgentEd25519Keypair,
+  deriveAgentP256Keypair,
   agentDidFromPublicJwk,
 } from '../lib/agent-provisioning.js';
 
 function fixtureAgent() {
   const slotSeed = Buffer.alloc(32, 7);
-  const { signingSeed, publicJwk } = deriveAgentEd25519Keypair(slotSeed);
+  const { signingSeed, publicJwk } = deriveAgentP256Keypair(slotSeed);
   return {
     agentDid: agentDidFromPublicJwk(publicJwk),
     signingSeed,
@@ -83,7 +83,7 @@ test('two distinct agents produce distinguishable signatures over the same paylo
   const a = fixtureAgent();
   const b = (() => {
     const slotSeed = Buffer.alloc(32, 8);
-    const { signingSeed, publicJwk } = deriveAgentEd25519Keypair(slotSeed);
+    const { signingSeed, publicJwk } = deriveAgentP256Keypair(slotSeed);
     return { agentDid: agentDidFromPublicJwk(publicJwk), signingSeed };
   })();
   assert.notEqual(a.agentDid, b.agentDid);

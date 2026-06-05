@@ -78,12 +78,12 @@ test('vault_use needing approval → runs loop inside listener, returns handle o
   // round-trip internally. This is the consolidated path; mcp-server.js
   // and cli.js no longer have their own dispatch sites.
   let loopCalls = 0;
-  const SIGNING = Buffer.alloc(32, 1);
+  const SIGNING_KEY = { _stub: 'KeyObject', asymmetricKeyType: 'ed25519' };
   const d = deps({
     resolveShare: async () => ({ ...SHARE, require_approval_per_use: true, title: 'AWS' }),
-    signingSeed: SIGNING,
+    signingKey: SIGNING_KEY,
     vcCompact: 'eyJ.test.vc',
-    runApprovalLoop: async ({ approvalBody, agentDid, vcCompact, signingSeed }) => {
+    runApprovalLoop: async ({ approvalBody, agentDid, vcCompact, signingKey }) => {
       loopCalls += 1;
       // The loop receives the constructed approval_request body with all
       // IdP-required fields populated.
@@ -95,9 +95,11 @@ test('vault_use needing approval → runs loop inside listener, returns handle o
       assert.ok(approvalBody.approval_request.reason_detail?.length > 0);
       assert.match(approvalBody.approval_request.session_id, /^[0-9a-f-]{36}$/i);
       // Listener also forwards identity material so the loop can sign DPoP.
+      // signingKey is a Node KeyObject (Ed25519 OR P-256) so the loop's
+      // mintDpopJwt picks the right alg per agent identity.
       assert.ok(agentDid);
       assert.equal(vcCompact, 'eyJ.test.vc');
-      assert.equal(signingSeed, SIGNING);
+      assert.equal(signingKey, SIGNING_KEY);
       return { retryArgs: { approval_id: 'ap_1' } };
     },
   });
@@ -111,7 +113,7 @@ test('vault_use needing approval → runs loop inside listener, returns handle o
 test('vault_use approval DENIED → returns clean error, no handle minted', async () => {
   const d = deps({
     resolveShare: async () => ({ ...SHARE, require_approval_per_use: true }),
-    signingSeed: Buffer.alloc(32, 1),
+    signingKey: { _stub: 'KeyObject', asymmetricKeyType: 'ed25519' },
     vcCompact: 'eyJ.test.vc',
     runApprovalLoop: async () => ({
       denied: true,
@@ -127,7 +129,7 @@ test('vault_use approval DENIED → returns clean error, no handle minted', asyn
 test('vault_use approval EXPIRED → returns policy_approval_expired error', async () => {
   const d = deps({
     resolveShare: async () => ({ ...SHARE, require_approval_per_use: true }),
-    signingSeed: Buffer.alloc(32, 1),
+    signingKey: { _stub: 'KeyObject', asymmetricKeyType: 'ed25519' },
     vcCompact: 'eyJ.test.vc',
     runApprovalLoop: async () => ({ expired: true }),
   });
@@ -137,9 +139,9 @@ test('vault_use approval EXPIRED → returns policy_approval_expired error', asy
   assert.equal(d.handles.size, 0);
 })
 
-test('vault_use approval-required without signingSeed in deps → clean error, never throws', async () => {
+test('vault_use approval-required without signingKey in deps → clean error, never throws', async () => {
   // Defense: if the listener's startVaultServer caller forgot to thread
-  // signingSeed/vcCompact, we surface the misconfig instead of crashing
+  // signingKey/vcCompact, we surface the misconfig instead of crashing
   // mid-loop or running with bogus material.
   const d = deps({ resolveShare: async () => ({ ...SHARE, require_approval_per_use: true }) });
   const r = await handleVaultRequest({ op: 'vault_use', item_id: 'vault_1' }, d);
@@ -156,7 +158,7 @@ test('vault_use re-called with approved:true skips the loop entirely (idempotent
   let loopCalls = 0;
   const d = deps({
     resolveShare: async () => ({ ...SHARE, require_approval_per_use: true }),
-    signingSeed: Buffer.alloc(32, 1),
+    signingKey: { _stub: 'KeyObject', asymmetricKeyType: 'ed25519' },
     vcCompact: 'eyJ.test.vc',
     runApprovalLoop: async () => { loopCalls += 1; return { retryArgs: { approval_id: 'ap_1' } }; },
   });

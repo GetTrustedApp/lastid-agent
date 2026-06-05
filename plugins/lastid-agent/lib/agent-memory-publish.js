@@ -15,7 +15,7 @@
  */
 import { encryptContent } from './agent-content-crypto.js';
 import { deriveProjectRoutingId, encryptProjectContent } from './project-crypto.js';
-import { deriveAgentEd25519Keypair } from './agent-provisioning.js';
+import { deriveAgentKeypair } from './agent-provisioning.js';
 import { signAgentRecordJws, sha256Hex } from './agent-sig-verify.js';
 import { mintDpopJwt } from './dpop.js';
 
@@ -66,13 +66,16 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
   const agentDid = loaded.agentDid;
   const ver = Number.isInteger(version) ? version : Number(memory.version) || 1;
 
-  // The agent signs EVERY memory write with its Ed25519 key so each carries
-  // verifiable provenance — the sync verifier is fail-closed (no sig, no
-  // apply). The sig binds the canonical record + a hash of the PLAINTEXT
-  // content (never the plaintext — the sig is stored server-side).
+  // The agent signs EVERY memory write with its P-256 (ES256) key so each
+  // carries verifiable provenance — the sync verifier is fail-closed (no
+  // sig, no apply). The sig binds the canonical record + a hash of the
+  // PLAINTEXT content (never the plaintext — the sig is stored server-side).
+  // signingKey (KeyObject) is for the DPoP header; signingSeed (raw scalar)
+  // is for the ES256 record signature via the WASM signer.
   let signingKey;
+  let signingSeed;
   try {
-    ({ signingKey } = deriveAgentEd25519Keypair(loaded.slotSeed));
+    ({ signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid));
   } catch {
     return false;
   }
@@ -92,7 +95,9 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
       status: recStatus,
       ...(contentBytes ? { content_sha256: sha256Hex(contentBytes) } : {}),
     },
-    signingKey,
+    // Dual-algo signer: the Ed25519 KeyObject selects EdDSA for an existing
+    // Ed25519 agent; the raw P-256 scalar selects ES256 for a new agent.
+    { signingKey, signingSeed },
   );
 
   let body;

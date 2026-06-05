@@ -240,8 +240,8 @@ if (Symbol.dispose) VerifiedPopJs.prototype[Symbol.dispose] = VerifiedPopJs.prot
 exports.VerifiedPopJs = VerifiedPopJs;
 
 /**
- * Encode a raw Ed25519 public key (32 bytes) as a
- * `did:lastid:agent:` DID.
+ * Encode a raw P-256 public key (SEC1 compressed 33 bytes or
+ * uncompressed 65 bytes) as a `did:lastid:agent:` DID.
  * @param {Uint8Array} pubkey_bytes
  * @returns {string}
  */
@@ -268,7 +268,7 @@ function agentDidFromPubkey(pubkey_bytes) {
 exports.agentDidFromPubkey = agentDidFromPubkey;
 
 /**
- * Derive an agent's stable Ed25519 keypair from a 32-byte seed.
+ * Derive an agent's stable P-256 (ES256) keypair from a 32-byte seed.
  * @param {Uint8Array} seed
  * @returns {AgentKeypairJs}
  */
@@ -458,33 +458,6 @@ function deriveSubAgentSeed(parent_slot_seed, class_slug, index) {
 exports.deriveSubAgentSeed = deriveSubAgentSeed;
 
 /**
- * Compute the RFC 7638 JWK thumbprint of a raw Ed25519 pubkey.
- * @param {Uint8Array} pubkey_bytes
- * @returns {string}
- */
-function ed25519JwkThumbprint(pubkey_bytes) {
-    let deferred3_0;
-    let deferred3_1;
-    try {
-        const ptr0 = passArray8ToWasm0(pubkey_bytes, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.ed25519JwkThumbprint(ptr0, len0);
-        var ptr2 = ret[0];
-        var len2 = ret[1];
-        if (ret[3]) {
-            ptr2 = 0; len2 = 0;
-            throw takeFromExternrefTable0(ret[2]);
-        }
-        deferred3_0 = ptr2;
-        deferred3_1 = len2;
-        return getStringFromWasm0(ptr2, len2);
-    } finally {
-        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
-    }
-}
-exports.ed25519JwkThumbprint = ed25519JwkThumbprint;
-
-/**
  * Generate a fresh 24-word BIP39 mnemonic using the browser's
  * `crypto.getRandomValues` (via `getrandom`'s `js` feature). Returns
  * the word list as a JS array of strings — display once with the
@@ -549,13 +522,13 @@ function init() {
 exports.init = init;
 
 /**
- * Mint an Ed25519 OID4VCI proof JWT. Called by the agent runtime
- * after the IdP returns a `c_nonce` from `POST /oauth/token`. The
- * signing key is the agent's stable identity key (derived via
+ * Mint a P-256 (ES256) OID4VCI proof JWT. Called by the agent
+ * runtime after the IdP returns a `c_nonce` from `POST /oauth/token`.
+ * The signing key is the agent's stable identity key (derived via
  * `agentKeypairFromSeed`).
  *
- * Header: `{ "alg": "EdDSA", "typ": "openid4vci-proof+jwt",
- *            "jwk": { "kty":"OKP","crv":"Ed25519","x":"..." } }`
+ * Header: `{ "alg": "ES256", "typ": "openid4vci-proof+jwt",
+ *            "jwk": { "kty":"EC","crv":"P-256","x":"...","y":"..." } }`
  * Payload: `{ "iss": holder_did, "aud": audience,
  *             "iat": now, "nonce": c_nonce }`
  * @param {Uint8Array} signing_key_bytes
@@ -565,7 +538,7 @@ exports.init = init;
  * @param {bigint} now
  * @returns {string}
  */
-function mintOid4vciProofJwtEdDsa(signing_key_bytes, holder_did, audience, c_nonce, now) {
+function mintOid4vciProofJwtEs256(signing_key_bytes, holder_did, audience, c_nonce, now) {
     let deferred6_0;
     let deferred6_1;
     try {
@@ -577,7 +550,7 @@ function mintOid4vciProofJwtEdDsa(signing_key_bytes, holder_did, audience, c_non
         const len2 = WASM_VECTOR_LEN;
         const ptr3 = passStringToWasm0(c_nonce, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len3 = WASM_VECTOR_LEN;
-        const ret = wasm.mintOid4vciProofJwtEdDsa(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, now);
+        const ret = wasm.mintOid4vciProofJwtEs256(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, now);
         var ptr5 = ret[0];
         var len5 = ret[1];
         if (ret[3]) {
@@ -591,12 +564,12 @@ function mintOid4vciProofJwtEdDsa(signing_key_bytes, holder_did, audience, c_non
         wasm.__wbindgen_free(deferred6_0, deferred6_1, 1);
     }
 }
-exports.mintOid4vciProofJwtEdDsa = mintOid4vciProofJwtEdDsa;
+exports.mintOid4vciProofJwtEs256 = mintOid4vciProofJwtEs256;
 
 /**
- * Build a DPoP-shaped PoP JWT signed by the agent's Ed25519 key.
- * `access_token` is optional: pass `None` to skip the `ath` claim,
- * pass `Some(token)` to bind this PoP to a specific token.
+ * Build a DPoP-shaped PoP JWT signed by the agent's P-256 (ES256)
+ * key. `access_token` is optional: pass `None` to skip the `ath`
+ * claim, pass `Some(token)` to bind this PoP to a specific token.
  * @param {Uint8Array} signing_key_bytes
  * @param {string} agent_did
  * @param {string} http_method
@@ -636,8 +609,36 @@ function mintPopJwt(signing_key_bytes, agent_did, http_method, http_uri, access_
 exports.mintPopJwt = mintPopJwt;
 
 /**
- * Parse a `did:lastid:agent:` DID and return the encoded
- * Ed25519 public key as 32 bytes.
+ * Compute the RFC 7638 JWK thumbprint of a raw P-256 pubkey (SEC1
+ * compressed 33 bytes or uncompressed 65 bytes).
+ * @param {Uint8Array} pubkey_bytes
+ * @returns {string}
+ */
+function p256JwkThumbprint(pubkey_bytes) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const ptr0 = passArray8ToWasm0(pubkey_bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.p256JwkThumbprint(ptr0, len0);
+        var ptr2 = ret[0];
+        var len2 = ret[1];
+        if (ret[3]) {
+            ptr2 = 0; len2 = 0;
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+    }
+}
+exports.p256JwkThumbprint = p256JwkThumbprint;
+
+/**
+ * Parse a `did:lastid:agent:` DID and return the encoded P-256
+ * public key as compressed SEC1 bytes (33 bytes).
  * @param {string} did
  * @returns {Uint8Array}
  */
@@ -1801,21 +1802,21 @@ function sdkVaultSyncStart() {
 exports.sdkVaultSyncStart = sdkVaultSyncStart;
 
 /**
- * Sign an arbitrary payload with an Ed25519 signing key. Returns the
- * raw 64-byte signature. The keypair this wraps is the agent's
- * stable identity keypair, derived earlier via
+ * Sign an arbitrary payload with a P-256 (ES256) signing key.
+ * Returns the raw 64-byte (r||s) signature. The keypair this wraps
+ * is the agent's stable identity keypair, derived earlier via
  * `agentKeypairFromSeed`. Use for the agent-side audit log signing
  * and any custom challenge protocols.
  * @param {Uint8Array} signing_key_bytes
  * @param {Uint8Array} payload
  * @returns {Uint8Array}
  */
-function signEd25519(signing_key_bytes, payload) {
+function signP256(signing_key_bytes, payload) {
     const ptr0 = passArray8ToWasm0(signing_key_bytes, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passArray8ToWasm0(payload, wasm.__wbindgen_malloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.signEd25519(ptr0, len0, ptr1, len1);
+    const ret = wasm.signP256(ptr0, len0, ptr1, len1);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -1823,15 +1824,15 @@ function signEd25519(signing_key_bytes, payload) {
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v3;
 }
-exports.signEd25519 = signEd25519;
+exports.signP256 = signP256;
 
 /**
  * Sign a compact JWS authorizing a sub-agent VC issuance. Used by
  * the parent agent's listener when it acts as issuer for an
  * operator-published sub-agent. Mirrors `sign_human_authorization`
- * but Ed25519 (the parent's existing agent signing key).
+ * but signed with ES256 (the parent's existing P-256 agent key).
  *
- * `signing_key_bytes` — the parent agent's 32-byte Ed25519 secret
+ * `signing_key_bytes` — the parent agent's 32-byte P-256 scalar
  * (`AgentKeypair::signing_key().to_bytes()`). `claims_json` — a
  * JSON-serialized claims object the IdP will verify (`iss`, `sub`,
  * `agent_pubkey_jwk_thumb`, `capabilities`, `may_delegate`, `iat`,
@@ -1870,7 +1871,7 @@ function signParentAuthorization(signing_key_bytes, kid, claims_json) {
 exports.signParentAuthorization = signParentAuthorization;
 
 /**
- * Sign a SessionFingerprint with the agent's Ed25519 signing key.
+ * Sign a SessionFingerprint with the agent's P-256 signing key.
  * Plugin path: SessionStart hook builds the unsigned fingerprint
  * (session_id, agent_did, project, timestamps, optional
  * parent_session_id), passes it here, gets back the same object
@@ -2005,30 +2006,6 @@ function verifyDecisionJws(jws_compact, operator_jwk_x_b64u, operator_jwk_y_b64u
 exports.verifyDecisionJws = verifyDecisionJws;
 
 /**
- * Verify a raw Ed25519 signature. Returns true on valid, false on
- * invalid (never throws for a structurally-correct but
- * cryptographically-wrong signature).
- * @param {Uint8Array} pubkey_bytes
- * @param {Uint8Array} payload
- * @param {Uint8Array} signature_bytes
- * @returns {boolean}
- */
-function verifyEd25519(pubkey_bytes, payload, signature_bytes) {
-    const ptr0 = passArray8ToWasm0(pubkey_bytes, wasm.__wbindgen_malloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ptr1 = passArray8ToWasm0(payload, wasm.__wbindgen_malloc);
-    const len1 = WASM_VECTOR_LEN;
-    const ptr2 = passArray8ToWasm0(signature_bytes, wasm.__wbindgen_malloc);
-    const len2 = WASM_VECTOR_LEN;
-    const ret = wasm.verifyEd25519(ptr0, len0, ptr1, len1, ptr2, len2);
-    if (ret[2]) {
-        throw takeFromExternrefTable0(ret[1]);
-    }
-    return ret[0] !== 0;
-}
-exports.verifyEd25519 = verifyEd25519;
-
-/**
  * Verify a standalone human-authorization JWS against the human's
  * delegation P-256 pubkey. Useful for consumers that have a
  * human_authorization string outside the context of an outer VC.
@@ -2047,6 +2024,31 @@ function verifyHumanAuthorization(jws_compact, human_pubkey_jwk, now) {
     return VerifiedHumanAuthorizationJs.__wrap(ret[0]);
 }
 exports.verifyHumanAuthorization = verifyHumanAuthorization;
+
+/**
+ * Verify a raw P-256 (ES256) signature. `pubkey_bytes` is the SEC1
+ * compressed (33-byte) or uncompressed (65-byte) public key.
+ * Returns true on valid, false on invalid (never throws for a
+ * structurally-correct but cryptographically-wrong signature).
+ * @param {Uint8Array} pubkey_bytes
+ * @param {Uint8Array} payload
+ * @param {Uint8Array} signature_bytes
+ * @returns {boolean}
+ */
+function verifyP256(pubkey_bytes, payload, signature_bytes) {
+    const ptr0 = passArray8ToWasm0(pubkey_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(payload, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArray8ToWasm0(signature_bytes, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.verifyP256(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0] !== 0;
+}
+exports.verifyP256 = verifyP256;
 
 /**
  * Verify a DPoP-shaped PoP JWT. Pubkey is extracted from the `kid`
@@ -2077,7 +2079,7 @@ function verifyPopJwt(jwt, expected_method, expected_uri, expected_access_token,
 exports.verifyPopJwt = verifyPopJwt;
 
 /**
- * Verify a SessionFingerprint by reconstructing the Ed25519
+ * Verify a SessionFingerprint by reconstructing the P-256
  * verifying key from its `agent_did` field. Returns `true` on
  * valid; throws (a `JsError` with a precise reason) on any
  * failure. Useful on the desktop side and for integration tests
@@ -2889,7 +2891,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1603, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1605, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h07eda6f9933457e4);
             return ret;
         },
@@ -2904,12 +2906,12 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1273, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1283, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h3c6c61154a9359bf);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 638, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 639, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h23499dd81690a033);
             return ret;
         },
