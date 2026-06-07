@@ -28,8 +28,7 @@ function freshScope() {
   return { scope, dir: join(homedir(), '.lastid-agent', scope) };
 }
 
-test('enqueue writes a parseable spool file; nothing touches the chain yet', () => {
-  const { scope, dir } = freshScope();
+test('enqueue writes a parseable spool file; nothing touches the chain yet', async () => {  const { scope, dir } = freshScope();
   try {
     const p = enqueueAuditEvent({ scope, eventType: 'tool_call', metadata: { tool: 'Bash' } });
     assert.ok(p && p.endsWith('.json'), 'returns the published path');
@@ -44,14 +43,13 @@ test('enqueue writes a parseable spool file; nothing touches the chain yet', () 
   }
 });
 
-test('drain chains spooled events IN ORDER, signs them, and unlinks the spool', () => {
-  const { scope, dir } = freshScope();
+test('drain chains spooled events IN ORDER, signs them, and unlinks the spool', async () => {  const { scope, dir } = freshScope();
   try {
     enqueueAuditEvent({ scope, eventType: 'tool_call', metadata: { tool: 'Read', n: 1 } });
     enqueueAuditEvent({ scope, eventType: 'tool_result', metadata: { tool: 'Read', n: 2 } });
     enqueueAuditEvent({ scope, eventType: 'tool_call', metadata: { tool: 'Edit', n: 3 } });
 
-    const chained = drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
+    const chained = await drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
     assert.equal(chained, 3);
 
     const chain = readMemoryAudit(scope, 'did:a');
@@ -66,12 +64,11 @@ test('drain chains spooled events IN ORDER, signs them, and unlinks the spool', 
   }
 });
 
-test('tool_use_id rides into the chain metadata so a result correlates to its call', () => {
-  const { scope, dir } = freshScope();
+test('tool_use_id rides into the chain metadata so a result correlates to its call', async () => {  const { scope, dir } = freshScope();
   try {
     enqueueAuditEvent({ scope, eventType: 'tool_call', metadata: { tool: 'Bash' }, toolUseId: 'tu_42' });
     enqueueAuditEvent({ scope, eventType: 'tool_result', metadata: { tool: 'Bash', status: 'success' }, toolUseId: 'tu_42' });
-    drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
+    await drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
     const chain = readMemoryAudit(scope, 'did:a');
     assert.equal(chain[0].metadata.tool_use_id, 'tu_42');
     assert.equal(chain[1].metadata.tool_use_id, 'tu_42');
@@ -82,15 +79,14 @@ test('tool_use_id rides into the chain metadata so a result correlates to its ca
   }
 });
 
-test('a corrupt spool file is dropped and never wedges the drain', () => {
-  const { scope, dir } = freshScope();
+test('a corrupt spool file is dropped and never wedges the drain', async () => {  const { scope, dir } = freshScope();
   try {
     enqueueAuditEvent({ scope, eventType: 'tool_call', metadata: { tool: 'Read' } });
     // Drop a garbage file directly into the spool.
     writeFileSync(join(auditSpoolDir(scope), '000000000000001-bad.json'), '{not json');
     enqueueAuditEvent({ scope, eventType: 'tool_call', metadata: { tool: 'Edit' } });
 
-    const chained = drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
+    const chained = await drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
     assert.equal(chained, 2, 'the two valid events chain; the corrupt one is skipped');
     assert.equal(listSpooled(scope).length, 0, 'corrupt file removed too');
     assert.equal(verifyMemoryAudit(scope, 'did:a', publicKey).intact, true);
@@ -99,8 +95,7 @@ test('a corrupt spool file is dropped and never wedges the drain', () => {
   }
 });
 
-test('an append failure is retryable: chained-so-far are unlinked, the rest stay', () => {
-  const { scope, dir } = freshScope();
+test('an append failure is retryable: chained-so-far are unlinked, the rest stay', async () => {  const { scope, dir } = freshScope();
   try {
     enqueueAuditEvent({ scope, eventType: 'tool_call', metadata: { n: 1 } });
     enqueueAuditEvent({ scope, eventType: 'tool_call', metadata: { n: 2 } });
@@ -112,12 +107,12 @@ test('an append failure is retryable: chained-so-far are unlinked, the rest stay
       calls += 1;
       if (calls === 2) throw new Error('disk full');
     };
-    const chained = drainAuditSpool({ scope, signingKey: privateKey, append: flakyAppend });
+    const chained = await drainAuditSpool({ scope, signingKey: privateKey, append: flakyAppend });
     assert.equal(chained, 1, 'stopped after the first success');
     assert.equal(listSpooled(scope).length, 2, 'failed + remaining left for retry — no double-append');
 
     // A second drain (now healthy, real append) finishes the job in order.
-    const more = drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
+    const more = await drainAuditSpool({ scope, signingKey: privateKey, agentDid: 'did:a' });
     assert.equal(more, 2);
     assert.deepEqual(readMemoryAudit(scope, 'did:a').map((r) => r.metadata.n), [2, 3]);
   } finally {
@@ -125,7 +120,6 @@ test('an append failure is retryable: chained-so-far are unlinked, the rest stay
   }
 });
 
-test('enqueue is best-effort: a bad arg returns null, never throws', () => {
-  assert.equal(enqueueAuditEvent({ scope: 'x', eventType: '' }), null);
+test('enqueue is best-effort: a bad arg returns null, never throws', async () => {  assert.equal(enqueueAuditEvent({ scope: 'x', eventType: '' }), null);
   assert.equal(enqueueAuditEvent(), null);
 });

@@ -145,19 +145,34 @@ function tailIntact(rec) {
   return blake3Hex(Buffer.from(canonicalJson(coreFromRecord(rec)), 'utf-8')) === rec.integrity_hash;
 }
 
-function signAndWrite(scope, agentDid, signingKey, core) {
+/**
+ * Compute the record signature. `signer` is EITHER:
+ *   - a node KeyObject (LEGACY agent): sign in-process with the seed-derived key.
+ *   - an async `(bytes) => Promise<string>` (BROKER-NATIVE agent): the broker
+ *     holds the key + raw-ES256-signs the bytes, returning the same base64 sig —
+ *     so the seed never enters node yet the audit chain stays fully signed.
+ *   - falsy: no signature (records are still hash-linked).
+ * Returns the base64 signature or null. Never throws (logs + degrades).
+ */
+async function computeAuditSignature(signer, bytes) {
+  if (!signer) return null;
+  try {
+    if (typeof signer === 'function') {
+      return await signer(bytes);
+    }
+    // ES256: SHA-256 + ECDSA P-256, raw r||s (ieee-p1363) — matches the agent's
+    // identity alg and the console verifier (and the broker's raw sign).
+    return ecSign('sha256', bytes, { key: signer, dsaEncoding: 'ieee-p1363' }).toString('base64');
+  } catch (err) {
+    process.stderr.write(`[lastid-agent] memory-audit sign failed: ${err?.message ?? err}\n`);
+    return null;
+  }
+}
+
+async function signAndWrite(scope, agentDid, signingKey, core) {
   const bytes = Buffer.from(canonicalJson(core), 'utf-8');
   const integrity_hash = blake3Hex(bytes);
-  let signature = null;
-  if (signingKey) {
-    try {
-      // ES256: SHA-256 + ECDSA P-256, raw r||s (ieee-p1363) — matches the
-      // agent's identity alg and the console verifier.
-      signature = ecSign('sha256', bytes, { key: signingKey, dsaEncoding: 'ieee-p1363' }).toString('base64');
-    } catch (err) {
-      process.stderr.write(`[lastid-agent] memory-audit sign failed: ${err?.message ?? err}\n`);
-    }
-  }
+  const signature = await computeAuditSignature(signingKey, bytes);
   const record = { ...core, integrity_hash, signature };
   const path = memoryAuditPath(scope, agentDid);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -172,7 +187,7 @@ function signAndWrite(scope, agentDid, signingKey, core) {
  * Best-effort caller wrapping recommended — a failed audit append should not
  * fail the underlying op, but it SHOULD be logged.
  */
-export function appendMemoryAudit({ scope = 'main', signingKey, agentDid = null, eventType, memoryId = null, metadata = {} }) {
+export async function appendMemoryAudit({ scope = 'main', signingKey, agentDid = null, eventType, memoryId = null, metadata = {} }) {
   let prev = lastEntry(scope, agentDid);
   // ON-BREAK SELF-HEAL: never chain onto a corrupt tail. If the head record's
   // hash no longer matches its core (tampered/truncated/partial write), re-root
@@ -185,13 +200,13 @@ export function appendMemoryAudit({ scope = 'main', signingKey, agentDid = null,
     metadata = { ...(metadata ?? {}), healed_from_break: true, broke_after_seq: Number(prev.seq) };
     prev = null;
   }
-  const record = signAndWrite(scope, agentDid, signingKey, recordCore(prev, { agentDid, eventType, memoryId, metadata }));
+  const record = await signAndWrite(scope, agentDid, signingKey, recordCore(prev, { agentDid, eventType, memoryId, metadata }));
   // Checkpoint boundary: stamp a ChainCheckpoint right after the record that
   // crosses a multiple of the interval. Never recurse on checkpoints.
   if (eventType !== CHECKPOINT_EVENT) {
     const seq = Number(record.seq);
     if (seq > 0 && (seq + 1) % CHECKPOINT_INTERVAL === 0) {
-      maybeCheckpoint({ scope, signingKey, agentDid });
+      await maybeCheckpoint({ scope, signingKey, agentDid });
     }
   }
   return record;
@@ -203,7 +218,7 @@ export function appendMemoryAudit({ scope = 'main', signingKey, agentDid = null,
  * head integrity_hash so a verifier (or a partial/drained view) can re-root
  * from it. The console renders checkpoints as segment dividers.
  */
-export function maybeCheckpoint({ scope = 'main', signingKey, agentDid = null } = {}) {
+export async function maybeCheckpoint({ scope = 'main', signingKey, agentDid = null } = {}) {
   const prev = lastEntry(scope, agentDid);
   if (!prev) return null; // nothing to checkpoint yet (no genesis)
   return signAndWrite(scope, agentDid, signingKey, recordCore(prev, {
@@ -263,7 +278,7 @@ export function publicKeyFor(signingKey) {
  * The listener runs this RANDOMLY (not only on demand). Returns the report
  * (with healed:true when a reset was written). Best-effort; never throws.
  */
-export function auditSelfCheck({ scope = 'main', signingKey, agentDid = null, publicKey = null } = {}) {
+export async function auditSelfCheck({ scope = 'main', signingKey, agentDid = null, publicKey = null } = {}) {
   let report;
   try {
     report = verifyMemoryAudit(scope, agentDid, publicKey);
@@ -277,7 +292,7 @@ export function auditSelfCheck({ scope = 'main', signingKey, agentDid = null, pu
       `(${report.firstFailure?.kind}) — checkpoint + re-genesis\n`,
   );
   try {
-    signAndWrite(scope, agentDid, signingKey, recordCore(null, {
+    await signAndWrite(scope, agentDid, signingKey, recordCore(null, {
       agentDid,
       eventType: CHECKPOINT_EVENT,
       memoryId: null,

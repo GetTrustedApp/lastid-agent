@@ -32,6 +32,7 @@ import {
   brokerProvisionPoll,
   brokerDeriveMlsStateKey,
   brokerEncryptContent,
+  brokerSignAuditRecord,
 } from '../lib/broker-ipc.js';
 
 let _n = 0;
@@ -379,6 +380,43 @@ test('brokerSignParentAuthorization: broker error → throws', async () => {
     await assert.rejects(
       brokerSignParentAuthorization({ socketPath: srv.socketPath, token: 't', claimsJson: '{}' }),
       /sign_parent_authorization failed: broker not_implemented/,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+// ── MLS-custody: audit-record signing through the broker ────────────────────
+
+test('brokerSignAuditRecord: sends kind=sign_audit_record + core_b64, returns the signature', async () => {
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: true,
+    status: 200,
+    body: { signature_b64: 'c2lnbmF0dXJl' },
+  }));
+  try {
+    const core = Buffer.from('{"chain_id":"c1","seq":0,"event_type":"AgentMemoryWritten"}', 'utf8');
+    const sig = await brokerSignAuditRecord({ socketPath: srv.socketPath, token: 't', coreBytes: core });
+    assert.equal(sig, 'c2lnbmF0dXJl');
+    const req = srv.received[0];
+    assert.equal(req.kind, 'sign_audit_record');
+    assert.equal(Buffer.from(req.core_b64, 'base64').toString('utf8'), core.toString('utf8'));
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerSignAuditRecord: broker rejection (non-audit payload) → throws', async () => {
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: false,
+    error: { code: 'bad_request', message: 'payload is not an audit-record core' },
+  }));
+  try {
+    await assert.rejects(
+      brokerSignAuditRecord({ socketPath: srv.socketPath, token: 't', coreBytes: Buffer.from('{}') }),
+      /sign_audit_record failed: broker bad_request.*not an audit-record/,
     );
   } finally {
     await srv.close();

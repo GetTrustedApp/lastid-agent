@@ -45,8 +45,7 @@ function freshScope() {
 
 const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
 
-test('canonicalJson: deterministic key order', () => {
-  assert.equal(canonicalJson({ b: 1, a: 2 }), '{"a":2,"b":1}');
+test('canonicalJson: deterministic key order', async () => {  assert.equal(canonicalJson({ b: 1, a: 2 }), '{"a":2,"b":1}');
   assert.equal(canonicalJson({ a: { y: 1, x: 2 } }), '{"a":{"x":2,"y":1}}');
 });
 
@@ -74,7 +73,7 @@ test('integrity_hash is blake3 over canonicalJson(core) — cross-runtime vector
   // chain uses blake3 over the chain_id-bearing core).
   const { scope, dir } = freshScope();
   try {
-    const r = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm', metadata: {} });
+    const r = await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm', metadata: {} });
     const rcore = {
       chain_id: r.chain_id,
       seq: r.seq,
@@ -92,11 +91,10 @@ test('integrity_hash is blake3 over canonicalJson(core) — cross-runtime vector
   }
 });
 
-test('genesis: an agent\'s first record is seq 0, prev_hash null, with a fresh chain_id', () => {
-  const { scope, dir } = freshScope();
+test('genesis: an agent\'s first record is seq 0, prev_hash null, with a fresh chain_id', async () => {  const { scope, dir } = freshScope();
   try {
-    const a = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'mem_1', metadata: { kind: 'fact' } });
-    const b = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryUpdated', memoryId: 'mem_1', metadata: { fields_changed: 'claim' } });
+    const a = await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'mem_1', metadata: { kind: 'fact' } });
+    const b = await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryUpdated', memoryId: 'mem_1', metadata: { fields_changed: 'claim' } });
     assert.equal(a.seq, 0);
     assert.equal(a.prev_hash, null, 'genesis has no predecessor');
     assert.ok(/^[0-9a-f]{32}$/.test(a.chain_id), 'genesis mints a chain_id');
@@ -116,16 +114,15 @@ test('genesis: an agent\'s first record is seq 0, prev_hash null, with a fresh c
 // THE REGRESSION for the operator's "all my chains are broken": two agents in
 // ONE scope each get their own genesis-rooted, single-writer chain — so neither
 // interleaves the other and each verifies independently.
-test('per-agent isolation: two agents in one scope keep separate genesis-rooted chains', () => {
-  const { scope, dir } = freshScope();
+test('per-agent isolation: two agents in one scope keep separate genesis-rooted chains', async () => {  const { scope, dir } = freshScope();
   const keyA = generateKeyPairSync('ec', { namedCurve: 'P-256' });
   const keyB = generateKeyPairSync('ec', { namedCurve: 'P-256' });
   try {
     // Interleave appends, exactly as two concurrent agents would.
-    appendMemoryAudit({ scope, signingKey: keyA.privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'a1' });
-    appendMemoryAudit({ scope, signingKey: keyB.privateKey, agentDid: AGENT_B, eventType: 'AgentMemoryWritten', memoryId: 'b1' });
-    appendMemoryAudit({ scope, signingKey: keyA.privateKey, agentDid: AGENT, eventType: 'AgentMemoryUpdated', memoryId: 'a1' });
-    appendMemoryAudit({ scope, signingKey: keyB.privateKey, agentDid: AGENT_B, eventType: 'AgentMemoryForgotten', memoryId: 'b1' });
+    await appendMemoryAudit({ scope, signingKey: keyA.privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'a1' });
+    await appendMemoryAudit({ scope, signingKey: keyB.privateKey, agentDid: AGENT_B, eventType: 'AgentMemoryWritten', memoryId: 'b1' });
+    await appendMemoryAudit({ scope, signingKey: keyA.privateKey, agentDid: AGENT, eventType: 'AgentMemoryUpdated', memoryId: 'a1' });
+    await appendMemoryAudit({ scope, signingKey: keyB.privateKey, agentDid: AGENT_B, eventType: 'AgentMemoryForgotten', memoryId: 'b1' });
 
     const chainA = readMemoryAudit(scope, AGENT);
     const chainB = readMemoryAudit(scope, AGENT_B);
@@ -149,11 +146,10 @@ test('per-agent isolation: two agents in one scope keep separate genesis-rooted 
   }
 });
 
-test('verify detects a tampered record', () => {
-  const { scope, dir } = freshScope();
+test('verify detects a tampered record', async () => {  const { scope, dir } = freshScope();
   try {
-    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'mem_1' });
-    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryForgotten', memoryId: 'mem_1' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'mem_1' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryForgotten', memoryId: 'mem_1' });
     // Tamper: rewrite the file with a mutated metadata on entry 0.
     const path = memoryAuditPath(scope, AGENT);
     const lines = readMemoryAudit(scope, AGENT);
@@ -167,10 +163,9 @@ test('verify detects a tampered record', () => {
   }
 });
 
-test('publicKeyFor: derives a verifying key from the private key', () => {
-  const { scope, dir } = freshScope();
+test('publicKeyFor: derives a verifying key from the private key', async () => {  const { scope, dir } = freshScope();
   try {
-    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm' });
     const pub = publicKeyFor(privateKey);
     assert.ok(pub);
     assert.equal(verifyMemoryAudit(scope, AGENT, pub).intact, true);
@@ -181,11 +176,10 @@ test('publicKeyFor: derives a verifying key from the private key', () => {
 
 // ── on-break self-heal ─────────────────────────────────────────────
 
-test('self-heal: a corrupt tail re-roots a NEW generation instead of chaining onto it', () => {
-  const { scope, dir } = freshScope();
+test('self-heal: a corrupt tail re-roots a NEW generation instead of chaining onto it', async () => {  const { scope, dir } = freshScope();
   try {
-    const a = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm0' });
-    const b = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
+    const a = await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm0' });
+    const b = await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
     // Tamper the TAIL record on disk (its integrity_hash no longer matches core).
     const path = memoryAuditPath(scope, AGENT);
     const lines = readMemoryAudit(scope, AGENT);
@@ -193,7 +187,7 @@ test('self-heal: a corrupt tail re-roots a NEW generation instead of chaining on
     writeFileSync(path, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
 
     // Next append must NOT link onto the broken tail — it re-genesises.
-    const healed = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm2' });
+    const healed = await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm2' });
     assert.equal(healed.seq, 0, 're-rooted at a fresh genesis');
     assert.equal(healed.prev_hash, null, 'genesis has no predecessor');
     assert.notEqual(healed.chain_id, a.chain_id, 'a new generation');
@@ -215,13 +209,12 @@ test('self-heal: a corrupt tail re-roots a NEW generation instead of chaining on
   }
 });
 
-test('auditSelfCheck: intact chain is a no-op (no reset record added)', () => {
-  const { scope, dir } = freshScope();
+test('auditSelfCheck: intact chain is a no-op (no reset record added)', async () => {  const { scope, dir } = freshScope();
   try {
-    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm0' });
-    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm0' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
     const before = readMemoryAudit(scope, AGENT).length;
-    const r = auditSelfCheck({ scope, signingKey: privateKey, agentDid: AGENT, publicKey });
+    const r = await auditSelfCheck({ scope, signingKey: privateKey, agentDid: AGENT, publicKey });
     assert.equal(r.intact, true);
     assert.equal(r.healed, undefined);
     assert.equal(readMemoryAudit(scope, AGENT).length, before, 'no record added when intact');
@@ -234,19 +227,18 @@ test('auditSelfCheck: intact chain is a no-op (no reset record added)', () => {
 // tampered (the tail still verifies). auditSelfCheck must detect it and re-root
 // a clean generation via a genesis ChainCheckpoint, so future events chain off
 // the reset, not the broken generation.
-test('auditSelfCheck: a deep (middle) break → checkpoint + re-genesis reset', () => {
-  const { scope, dir } = freshScope();
+test('auditSelfCheck: a deep (middle) break → checkpoint + re-genesis reset', async () => {  const { scope, dir } = freshScope();
   try {
-    const a = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm0' });
-    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
-    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm2' });
+    const a = await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm0' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm2' });
     // Tamper the MIDDLE record (seq 1); the tail (seq 2) still verifies on its own.
     const path = memoryAuditPath(scope, AGENT);
     const lines = readMemoryAudit(scope, AGENT);
     lines[1].memory_id = 'm1_TAMPERED';
     writeFileSync(path, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
 
-    const r = auditSelfCheck({ scope, signingKey: privateKey, agentDid: AGENT, publicKey });
+    const r = await auditSelfCheck({ scope, signingKey: privateKey, agentDid: AGENT, publicKey });
     assert.equal(r.intact, false);
     assert.equal(r.healed, true);
     assert.equal(r.firstFailure.seq, 1, 'detected the middle break');
@@ -262,7 +254,7 @@ test('auditSelfCheck: a deep (middle) break → checkpoint + re-genesis reset', 
     assert.equal(reset.metadata.broke_at_seq, 1);
 
     // A subsequent append chains onto the clean reset (seq 1, same new chain_id).
-    const next = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm3' });
+    const next = await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm3' });
     assert.equal(next.chain_id, reset.chain_id);
     assert.equal(next.seq, 1);
     assert.equal(next.prev_hash, reset.integrity_hash);
@@ -273,12 +265,11 @@ test('auditSelfCheck: a deep (middle) break → checkpoint + re-genesis reset', 
 
 // ── checkpoints ────────────────────────────────────────────────────
 
-test('maybeCheckpoint: anchors the head with a signed, linked ChainCheckpoint', () => {
-  const { scope, dir } = freshScope();
+test('maybeCheckpoint: anchors the head with a signed, linked ChainCheckpoint', async () => {  const { scope, dir } = freshScope();
   try {
-    const a = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
-    const b = appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm2' });
-    const cp = maybeCheckpoint({ scope, signingKey: privateKey, agentDid: AGENT });
+    const a = await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
+    const b = await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm2' });
+    const cp = await maybeCheckpoint({ scope, signingKey: privateKey, agentDid: AGENT });
     assert.equal(cp.event_type, CHECKPOINT_EVENT);
     assert.equal(cp.seq, 2, 'checkpoint links onto the head');
     assert.equal(cp.prev_hash, b.integrity_hash);
@@ -288,17 +279,16 @@ test('maybeCheckpoint: anchors the head with a signed, linked ChainCheckpoint', 
     // The chain (incl. the checkpoint) still verifies end-to-end.
     assert.equal(verifyMemoryAudit(scope, AGENT, publicKey).intact, true);
     // No-op when there is nothing to anchor (a fresh agent's empty chain).
-    assert.equal(maybeCheckpoint({ scope, signingKey: privateKey, agentDid: AGENT_B }), null);
+    assert.equal(await maybeCheckpoint({ scope, signingKey: privateKey, agentDid: AGENT_B }), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('auto-checkpoint: crossing CHECKPOINT_INTERVAL stamps a ChainCheckpoint', () => {
-  const { scope, dir } = freshScope();
+test('auto-checkpoint: crossing CHECKPOINT_INTERVAL stamps a ChainCheckpoint', async () => {  const { scope, dir } = freshScope();
   try {
     for (let i = 0; i < CHECKPOINT_INTERVAL; i += 1) {
-      appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentToolInvoked', memoryId: `m${i}` });
+      await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentToolInvoked', memoryId: `m${i}` });
     }
     const chain = readMemoryAudit(scope, AGENT);
     // INTERVAL data records + 1 auto-checkpoint stamped at the boundary.
@@ -317,9 +307,9 @@ test('auto-checkpoint: crossing CHECKPOINT_INTERVAL stamps a ChainCheckpoint', (
 test('ship cursor: per-agent unshipped → ship advances → none left (cursors independent)', async () => {
   const { scope, dir } = freshScope();
   try {
-    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
-    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm2' });
-    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT_B, eventType: 'AgentMemoryWritten', memoryId: 'b1' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm2' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT_B, eventType: 'AgentMemoryWritten', memoryId: 'b1' });
     assert.equal(unshippedEntries(scope, AGENT).length, 2);
     assert.equal(unshippedEntries(scope, AGENT_B).length, 1, 'B has its own cursor');
 
@@ -331,7 +321,7 @@ test('ship cursor: per-agent unshipped → ship advances → none left (cursors 
     assert.equal(unshippedEntries(scope, AGENT_B).length, 1, 'B untouched by A\'s ship');
 
     // A failed post must NOT advance the cursor.
-    appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryForgotten', memoryId: 'm1' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryForgotten', memoryId: 'm1' });
     const n2 = await shipUnshipped(scope, AGENT, async () => false);
     assert.equal(n2, 0);
     assert.equal(unshippedEntries(scope, AGENT).length, 1, 'still pending after failed ship');
@@ -346,7 +336,7 @@ test('shipMemoryAudit: POSTs unshipped records to /audit + advances on 2xx', asy
   const { scope, dir } = freshScope();
   const { signingKey } = deriveAgentP256Keypair(Buffer.alloc(32, 9));
   try {
-    appendMemoryAudit({ scope, signingKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
+    await appendMemoryAudit({ scope, signingKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
     let posted = null;
     const okFetch = async (url, opts) => {
       posted = { url, headers: opts.headers, body: JSON.parse(opts.body) };
@@ -362,7 +352,7 @@ test('shipMemoryAudit: POSTs unshipped records to /audit + advances on 2xx', asy
     assert.equal(unshippedEntries(scope, AGENT).length, 0, 'cursor advanced');
 
     // A 500 must NOT advance the cursor.
-    appendMemoryAudit({ scope, signingKey, agentDid: AGENT, eventType: 'AgentMemoryForgotten', memoryId: 'm1' });
+    await appendMemoryAudit({ scope, signingKey, agentDid: AGENT, eventType: 'AgentMemoryForgotten', memoryId: 'm1' });
     const n2 = await shipMemoryAudit({ idpUrl: 'https://idp.example', scope, agentDid: AGENT, vcCompact: 'vc.jwt', signingKey, fetchImpl: async () => ({ ok: false, status: 500 }) });
     assert.equal(n2, 0);
     assert.equal(unshippedEntries(scope, AGENT).length, 1, 'still pending after failed ship');
@@ -393,7 +383,7 @@ test('memory tools SPOOL audit records (write/update/forget); draft does NOT; li
 
     const { signingKey } = deriveAgentP256Keypair(loadedAgent.slotSeed);
     const { drainAuditSpool } = await import('../lib/audit-spool.js');
-    const chained = drainAuditSpool({ scope, signingKey, agentDid: loadedAgent.agentDid });
+    const chained = await drainAuditSpool({ scope, signingKey, agentDid: loadedAgent.agentDid });
     assert.equal(chained, 3, 'three CUD events chained (draft excluded)');
 
     const chain = readMemoryAudit(scope, loadedAgent.agentDid);
@@ -416,7 +406,7 @@ test('shipUnshipped drains a large backlog in size-bounded chunks (per-chunk cur
   const { scope, dir } = freshScope();
   try {
     for (let i = 0; i < 250; i += 1) {
-      appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentToolInvoked', memoryId: `m${i}`, metadata: { input: 'x'.repeat(3000) } });
+      await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentToolInvoked', memoryId: `m${i}`, metadata: { input: 'x'.repeat(3000) } });
     }
     const batchSizes = [];
     const shipped = await shipUnshipped(scope, AGENT, async (recs) => { batchSizes.push(recs.length); return true; }, { maxBatchBytes: 50 * 1024 });
@@ -433,7 +423,7 @@ test('shipUnshipped: a failed chunk stops + leaves the cursor (offline-safe, res
   const { scope, dir } = freshScope();
   try {
     for (let i = 0; i < 300; i += 1) {
-      appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentToolInvoked', memoryId: `m${i}`, metadata: { input: 'x'.repeat(3000) } });
+      await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentToolInvoked', memoryId: `m${i}`, metadata: { input: 'x'.repeat(3000) } });
     }
     let call = 0;
     const shipped1 = await shipUnshipped(scope, AGENT, async () => (++call === 1), { maxBatchBytes: 50 * 1024 });

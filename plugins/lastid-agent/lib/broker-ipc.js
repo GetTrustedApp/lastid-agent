@@ -293,6 +293,49 @@ export async function brokerSignAgentRecord({
 }
 
 /**
+ * Sign an AUDIT-CHAIN record core via the signed broker (MLS-custody). The broker
+ * holds the agent identity key and returns the raw ES256 (SHA-256, r||s, standard
+ * base64) signature over the canonical core bytes — byte-identical to node
+ * `memory-audit.js`'s `ecSign(...).toString('base64')`, so the IdP
+ * `agent-audit-verify.ts` accepts it. The broker validates the payload is a
+ * well-formed audit-record core first (scoped oracle). A broker-native agent's
+ * audit chain stays fully signed without the seed reaching node.
+ *
+ * @param {object} a
+ * @param {string} [a.scope]
+ * @param {Buffer|Uint8Array} a.coreBytes  - the canonical JSON audit-record core
+ * @returns {Promise<string>} the standard-base64 signature (matches record.signature)
+ */
+export async function brokerSignAuditRecord({
+  scope = 'main',
+  coreBytes,
+  socketPath,
+  token,
+  connect,
+  timeoutMs,
+} = {}) {
+  const sp = socketPath ?? brokerSocketPath(scope);
+  const tok = token ?? (await readBrokerToken(scope));
+  const resp = await brokerIpcCall({
+    socketPath: sp,
+    token: tok,
+    kind: 'sign_audit_record',
+    fields: { core_b64: Buffer.from(coreBytes).toString('base64') },
+    connect,
+    timeoutMs,
+  });
+  if (resp.error) {
+    const code = resp.error.code ?? 'broker_error';
+    throw new Error(`sign_audit_record failed: broker ${code}: ${resp.error.message ?? ''}`);
+  }
+  const sig = resp.body?.signature_b64;
+  if (typeof sig !== 'string' || sig.length === 0) {
+    throw new Error(`sign_audit_record: unexpected broker response ${JSON.stringify(resp.body)}`);
+  }
+  return sig;
+}
+
+/**
  * Decrypt an operator-distributed rule/memory envelope via the signed broker
  * (FORK1 Phase 3). The broker holds the slot_seed (+ project_root_seed) and
  * returns the PLAINTEXT — byte-identical to JS `agent-content-crypto.js

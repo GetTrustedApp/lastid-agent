@@ -129,12 +129,15 @@ export function listSpooled(scope = 'main') {
  * tool_use_id rides in metadata so a PostToolUse 'tool_result' correlates to
  * its PreToolUse 'tool_call'. `append` is injectable for tests.
  */
-export function drainAuditSpool({ scope = 'main', signingKey, agentDid = null, append = appendMemoryAudit } = {}) {
+export async function drainAuditSpool({ scope = 'main', signingKey, agentDid = null, append = appendMemoryAudit } = {}) {
   const pending = listSpooled(scope);
   let chained = 0;
   for (const { file, rec } of pending) {
     try {
-      append({
+      // `signingKey` is a node KeyObject (legacy) OR an async broker signer
+      // (broker-native) — appendMemoryAudit awaits whichever, so each drained
+      // record is signed by the agent identity key without the seed in node.
+      await append({
         scope,
         signingKey,
         agentDid,
