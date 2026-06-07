@@ -234,7 +234,8 @@ export async function syncAgentState({
     // Refresh the non-secret CLI binding index so the PreToolUse hook can
     // transparently rewrite a bound binary (`aws …` → `lastid-agent run …`)
     // without a per-call keychain read. Derived only from env-injection shares.
-    refreshCliBindings(scope, slotSeed);
+    // Broker-native (no seed in node) decrypts the shares via the broker.
+    await refreshCliBindings(scope, slotSeed);
   } catch (err) {
     safely(onReject, { id: 'vault-cache', kind: 'vault' }, `vault cache: ${err?.message ?? err}`);
   }

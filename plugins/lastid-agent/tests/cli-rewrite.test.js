@@ -108,7 +108,7 @@ const headerShareBytes = () =>
     'utf8',
   );
 
-test('refreshCliBindings: writes only env-share bindings, never a secret', () => {
+test('refreshCliBindings: writes only env-share bindings, never a secret', async () => {
   const scope = `test-${randomUUID()}`;
   const dir = join(homedir(), '.lastid-agent', scope);
   try {
@@ -119,7 +119,7 @@ test('refreshCliBindings: writes only env-share bindings, never a secret', () =>
       ],
       decrypt: (_seed, enc) => (enc === 'x' ? envShareBytes() : headerShareBytes()),
     };
-    const written = refreshCliBindings(scope, Buffer.alloc(32), deps);
+    const written = await refreshCliBindings(scope, Buffer.alloc(32), deps);
     assert.deepEqual(written, [{ item_id: 'vault_aws', binaries: ['aws'] }], 'env share bound; header share skipped');
     assert.deepEqual(readCliBindings(scope), [{ item_id: 'vault_aws', binaries: ['aws'] }]);
     const raw = readFileSync(join(dir, 'cli-bindings.json'), 'utf8');

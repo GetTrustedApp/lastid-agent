@@ -162,21 +162,21 @@ test('summarizeConstraints: renders recurring schedule + rate in plain language'
 // must resolve to null so neither vault_list nor inject can use it.
 const SLOT = Buffer.alloc(32, 9);
 
-test('resolveVaultShare: missing share → null', () => {
+test('resolveVaultShare: missing share → null', async () => {
   const { scope, dir } = freshScope();
   try {
-    assert.equal(resolveVaultShare(scope, 'nope', { slotSeed: SLOT, operatorJwk: null }), null);
+    assert.equal(await resolveVaultShare(scope, 'nope', { slotSeed: SLOT, operatorJwk: null }), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('resolveVaultShare: undecryptable blob (wrong slot_seed) → null + onReject', () => {
+test('resolveVaultShare: undecryptable blob (wrong slot_seed) → null + onReject', async () => {
   const { scope, dir } = freshScope();
   try {
     applyVaultRecords(scope, [{ id: 'v', version: 1, status: 'active', enc_b64: 'bm90LXNlYWxlZA==', sig: 'x', target: 'did:a' }]);
     let rejected = null;
-    const r = resolveVaultShare(scope, 'v', { slotSeed: SLOT, operatorJwk: null, onReject: (_id, why) => (rejected = why) });
+    const r = await resolveVaultShare(scope, 'v', { slotSeed: SLOT, operatorJwk: null, onReject: (_id, why) => (rejected = why) });
     assert.equal(r, null);
     assert.match(rejected, /undecryptable/);
   } finally {
@@ -184,7 +184,7 @@ test('resolveVaultShare: undecryptable blob (wrong slot_seed) → null + onRejec
   }
 });
 
-test('resolveVaultShare: decrypts but UNSIGNED → null (fails the operator-sig gate)', () => {
+test('resolveVaultShare: decrypts but UNSIGNED → null (fails the operator-sig gate)', async () => {
   const { scope, dir } = freshScope();
   try {
     // A real slot_seed-sealed bundle (decrypt will succeed)…
@@ -193,7 +193,7 @@ test('resolveVaultShare: decrypts but UNSIGNED → null (fails the operator-sig 
     // …but stored with NO signature → must be rejected (provenance unproven).
     applyVaultRecords(scope, [{ id: 'v', version: 1, status: 'active', enc_b64, sig: null, target: 'did:a' }]);
     let rejected = null;
-    const r = resolveVaultShare(scope, 'v', { slotSeed: SLOT, operatorJwk: { x_b64u: 'x', y_b64u: 'y' }, onReject: (_id, why) => (rejected = why) });
+    const r = await resolveVaultShare(scope, 'v', { slotSeed: SLOT, operatorJwk: { x_b64u: 'x', y_b64u: 'y' }, onReject: (_id, why) => (rejected = why) });
     assert.equal(r, null, 'unsigned share must not resolve');
     assert.match(rejected, /unverified/);
   } finally {
@@ -236,6 +236,36 @@ test('resolveVaultSecret: opens the wrap, unseals, returns the secret bound to t
   assert.equal(out.secret_secondary, 'refresh-q');
   assert.equal(typeof out.zeroize, 'function');
   out.zeroize(); // wipes the decrypted buffers; must not throw
+});
+
+test('resolveVaultSecret: BROKER-NATIVE (null seed) unseals the inner layer via the broker', async () => {
+  // The handle unwrap (outer) stays node-side — the handle private key lives in
+  // the listener, never the broker. Only the INNER slot-sealed layer routes to
+  // the broker (it holds the seed). Assert the inner Buffer is forwarded with the
+  // no-seed posture, and the released secret is returned + id-bound as usual.
+  const innerBuf = Buffer.from('inner-slot-sealed-bytes');
+  let sawSeed = 'unset';
+  let sawScope = null;
+  let sawEnv = null;
+  const out = await resolveVaultSecret('v', {
+    scope: 'sc',
+    slotSeed: null, // broker-native
+    handle: HANDLE,
+    fetchWrappedSecret: async () => 'WRAPPED-b64',
+    openWithHandle: () => innerBuf,
+    _decrypt: async (s, seed, env) => {
+      sawScope = s;
+      sawSeed = seed;
+      sawEnv = env;
+      return Buffer.from(JSON.stringify({ item_id: 'v', secret: 'sk-broker' }), 'utf8');
+    },
+  });
+  assert.equal(sawScope, 'sc');
+  assert.equal(sawSeed, null, 'inner unseal forwarded the no-seed posture (→ broker)');
+  assert.ok(Buffer.isBuffer(sawEnv) && sawEnv.equals(innerBuf), 'the handle-unwrapped inner bytes are what the broker unseals');
+  assert.equal(out.secret, 'sk-broker');
+  assert.equal(typeof out.zeroize, 'function');
+  out.zeroize();
 });
 
 test('resolveVaultSecret: a handle with no keypair cannot unwrap → null', async () => {
@@ -328,11 +358,11 @@ test('resolveVaultSecret: an empty released secret → null', async () => {
 // 0 items. The shape is now `{ items, undecryptable }` so the count of
 // open-failures is visible at every caller.
 
-test('decryptedVaultViews returns {items, undecryptable} (shape contract)', () => {
+test('decryptedVaultViews returns {items, undecryptable} (shape contract)', async () => {
   const { scope, dir } = freshScope();
   try {
     // Empty store: items=[], undecryptable=[].
-    const out = decryptedVaultViews(scope, SLOT);
+    const out = await decryptedVaultViews(scope, SLOT);
     assert.deepEqual(out.items, []);
     assert.deepEqual(out.undecryptable, []);
   } finally {
@@ -340,7 +370,7 @@ test('decryptedVaultViews returns {items, undecryptable} (shape contract)', () =
   }
 });
 
-test('decryptedVaultViews surfaces undecryptable shares (the wrong-key-bug guard)', () => {
+test('decryptedVaultViews surfaces undecryptable shares (the wrong-key-bug guard)', async () => {
   const { scope, dir } = freshScope();
   try {
     // Seal a bundle under WRONG_SLOT, store it, then try to read it back
@@ -355,7 +385,7 @@ test('decryptedVaultViews surfaces undecryptable shares (the wrong-key-bug guard
     applyVaultRecords(scope, [
       { id: 'v-mismatch', version: 1, status: 'active', enc_b64: enc, sig: 'x', target: 'did:a' },
     ]);
-    const out = decryptedVaultViews(scope, SLOT);
+    const out = await decryptedVaultViews(scope, SLOT);
     assert.equal(out.items.length, 0);
     assert.equal(out.undecryptable.length, 1);
     assert.equal(out.undecryptable[0].id, 'v-mismatch');
@@ -366,7 +396,7 @@ test('decryptedVaultViews surfaces undecryptable shares (the wrong-key-bug guard
   }
 });
 
-test('decryptedVaultViews mixes openable + unopenable correctly', () => {
+test('decryptedVaultViews mixes openable + unopenable correctly', async () => {
   const { scope, dir } = freshScope();
   try {
     const good = JSON.stringify({ item_id: 'v-ok', service: 'github' });
@@ -378,11 +408,100 @@ test('decryptedVaultViews mixes openable + unopenable correctly', () => {
       { id: 'v-ok', version: 1, status: 'active', enc_b64: goodEnc, sig: 'x', target: 'did:a' },
       { id: 'v-bad', version: 1, status: 'active', enc_b64: badEnc, sig: 'x', target: 'did:a' },
     ]);
-    const out = decryptedVaultViews(scope, SLOT);
+    const out = await decryptedVaultViews(scope, SLOT);
     assert.equal(out.items.length, 1);
     assert.equal(out.items[0].id, 'v-ok');
     assert.equal(out.undecryptable.length, 1);
     assert.equal(out.undecryptable[0].id, 'v-bad');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── BROKER-NATIVE vault decrypt (broker-credential-custody Phase 3 — 2026-06-07)
+// A broker-native agent has NO slot seed in node (slotSeed null/undefined). The
+// vault shares are sealed under the slot-seed KEK; the signed broker — which
+// holds the seed — opens them via its decrypt_agent_content op. The vault path
+// must route the no-seed case to the broker (same plaintext) instead of failing.
+
+test('decryptedVaultViews: BROKER-NATIVE (null seed) decrypts via the broker, returns items', async () => {
+  const { scope, dir } = freshScope();
+  try {
+    // The cached enc_b64 is opaque to node here (no seed). The broker returns the
+    // plaintext bundle bytes; we mock it to assert the wiring + the args it gets.
+    const bundle = { item_id: 'v-broker', service: 'aws', injection: { type: 'env' } };
+    const plaintext = Buffer.from(JSON.stringify(bundle), 'utf8');
+    let sawArgs = null;
+    const brokerDecrypt = async (args) => {
+      sawArgs = args;
+      return plaintext;
+    };
+    applyVaultRecords(scope, [
+      { id: 'v-broker', version: 1, status: 'active', enc_b64: 'c2VhbGVkLW9wYXF1ZQ==', sig: 'x', target: 'did:a' },
+    ]);
+    // slotSeed null → the helper must take the broker branch.
+    const out = await decryptedVaultViews(scope, null, { brokerDecrypt });
+    assert.equal(out.undecryptable.length, 0, 'broker decrypt succeeded → nothing undecryptable');
+    assert.equal(out.items.length, 1);
+    assert.equal(out.items[0].id, 'v-broker');
+    // Wiring contract: the broker got the scope + the standard-base64 envelope.
+    assert.equal(sawArgs.scope, scope);
+    assert.equal(sawArgs.envelopeB64, 'c2VhbGVkLW9wYXF1ZQ==');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('decryptedVaultViews: BROKER-NATIVE broker failure is SURFACED (undecryptable), never swallowed', async () => {
+  const { scope, dir } = freshScope();
+  try {
+    // Broker down / wrong agent / tamper → throw. Must surface as undecryptable
+    // (the wrong-key-bug guard applies to the broker path too), not a silent 0.
+    const brokerDecrypt = async () => {
+      throw new Error('decrypt_agent_content failed: broker upstream_unavailable');
+    };
+    applyVaultRecords(scope, [
+      { id: 'v-down', version: 1, status: 'active', enc_b64: 'c2VhbGVk', sig: 'x', target: 'did:a' },
+    ]);
+    const out = await decryptedVaultViews(scope, null, { brokerDecrypt });
+    assert.equal(out.items.length, 0);
+    assert.equal(out.undecryptable.length, 1);
+    assert.equal(out.undecryptable[0].id, 'v-down');
+    assert.match(out.undecryptable[0].reason, /broker/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolveVaultShare: BROKER-NATIVE forwards the no-seed posture to the decrypt layer', async () => {
+  const { scope, dir } = freshScope();
+  try {
+    applyVaultRecords(scope, [
+      { id: 'v', version: 1, status: 'active', enc_b64: 'c2VhbGVk', sig: 'x', target: 'did:a' },
+    ]);
+    let sawSeed = 'unset';
+    let sawScope = null;
+    // Inject the decrypt layer to assert resolveVaultShare passes (scope, null, env)
+    // through unchanged — that null seed is what makes the real helper pick the
+    // broker. Return a valid-but-UNSIGNED bundle so the security gate still fires
+    // (proves the broker path doesn't bypass the operator-signature check).
+    const _decrypt = async (s, seed, env) => {
+      sawScope = s;
+      sawSeed = seed;
+      assert.equal(env, 'c2VhbGVk');
+      return Buffer.from(JSON.stringify({ item_id: 'v', secret: 'x' }), 'utf8');
+    };
+    let rejected = null;
+    const r = await resolveVaultShare(scope, 'v', {
+      slotSeed: null,
+      operatorJwk: { x_b64u: 'x', y_b64u: 'y' },
+      onReject: (_id, why) => (rejected = why),
+      _decrypt,
+    });
+    assert.equal(sawScope, scope);
+    assert.equal(sawSeed, null, 'no-seed posture forwarded to the decrypt layer (→ broker)');
+    assert.equal(r, null, 'unsigned share still rejected on the broker path');
+    assert.match(rejected, /unverified/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

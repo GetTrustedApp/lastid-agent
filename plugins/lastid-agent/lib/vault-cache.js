@@ -17,7 +17,38 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { decryptContent } from './agent-content-crypto.js';
+import { brokerDecryptContent } from './broker-ipc.js';
 import { verifyRecordSignature } from './agent-sig-verify.js';
+
+/**
+ * Open a slot-seed-sealed vault envelope, broker-aware. Two custody postures,
+ * same plaintext:
+ *   - legacy: node holds the 32-byte slotSeed → decrypt in-process (sync; the
+ *     `await` at call sites is a no-op on the returned bytes).
+ *   - broker-native: no seed in node (slotSeed null) → the signed broker opens it
+ *     under the slot_seed IT holds. Byte-identical: the vault KEK is
+ *     HKDF-SHA512(slot_seed, info=CONTENT_KEY_INFO), exactly what the broker's
+ *     decrypt_agent_content op derives — so a broker-native agent reads its vault
+ *     shares without the seed ever entering this process.
+ *
+ * `env` is the cached `enc_b64` (standard-base64 string) or a raw Buffer (the
+ * JIT secret's inner layer). The broker op wants base64, so a Buffer is encoded.
+ * Deps injectable so the vault tests exercise both postures without a real broker.
+ *
+ * @returns {Promise<Buffer>} the decrypted plaintext bytes
+ */
+async function decryptVaultEnvelope(
+  scope,
+  slotSeed,
+  env,
+  { _decryptContent = decryptContent, _brokerDecryptContent = brokerDecryptContent } = {},
+) {
+  if (Buffer.isBuffer(slotSeed) && slotSeed.length === 32) {
+    return _decryptContent(slotSeed, env);
+  }
+  const envelopeB64 = typeof env === 'string' ? env : Buffer.from(env).toString('base64');
+  return _brokerDecryptContent({ scope, envelopeB64 });
+}
 
 export function vaultCachePath(scope = 'main') {
   return join(homedir(), '.lastid-agent', scope ?? 'main', 'vault-shares.json');
@@ -94,10 +125,10 @@ export function cliBindingsPath(scope = 'main') {
  * aws …`. Carries NO secret: only item ids + binary names (both already in the
  * operator-signed share). Best-effort; returns the bindings it wrote.
  */
-export function refreshCliBindings(scope = 'main', slotSeed, deps = {}) {
+export async function refreshCliBindings(scope = 'main', slotSeed, deps = {}) {
   const bindings = [];
   try {
-    const { items: decoded } = decryptedVaultViews(scope, slotSeed, deps);
+    const { items: decoded } = await decryptedVaultViews(scope, slotSeed, deps);
     for (const v of decoded) {
       if (v?.injection?.type !== 'env') continue;
       const binaries = Array.isArray(v.binaries)
@@ -147,12 +178,18 @@ export function getVaultShare(scope, id) {
  *
  * @returns {object|null} the decoded share content (incl. secret)
  */
-export function resolveVaultShare(scope, id, { slotSeed, operatorJwk, onReject } = {}) {
+export async function resolveVaultShare(
+  scope,
+  id,
+  { slotSeed, operatorJwk, onReject, _decrypt = decryptVaultEnvelope } = {},
+) {
   const entry = getVaultShare(scope, id);
   if (!entry || !entry.enc_b64) return null;
   let bytes;
   try {
-    bytes = decryptContent(slotSeed, entry.enc_b64);
+    // Broker-aware: legacy decrypts under the in-node seed; broker-native opens
+    // it in the signed broker (no seed in node). Same plaintext either way.
+    bytes = await _decrypt(scope, slotSeed, entry.enc_b64);
   } catch {
     if (onReject) onReject(id, 'undecryptable (wrong slot_seed / corrupt)');
     return null;
@@ -203,7 +240,7 @@ export function resolveVaultShare(scope, id, { slotSeed, operatorJwk, onReject }
  */
 export async function resolveVaultSecret(
   id,
-  { slotSeed, handle, fetchWrappedSecret, openWithHandle, onReject } = {},
+  { scope = 'main', slotSeed, handle, fetchWrappedSecret, openWithHandle, onReject, _decrypt = decryptVaultEnvelope } = {},
 ) {
   const handlePubB64 = handle?.handlePubB64;
   const handlePrivB64 = handle?.handlePrivB64;
@@ -231,10 +268,13 @@ export async function resolveVaultSecret(
     if (onReject) onReject(id, `handle unwrap failed (wrong key/id or tamper): ${e?.message ?? e}`);
     return null;
   }
-  // Inner layer: unseal with the agent's slot_seed.
+  // Inner layer: unseal with the agent's slot_seed. Broker-aware — a
+  // broker-native agent (no seed in node) unseals via the signed broker; the
+  // handle-unwrapped `inner` bytes are passed straight through (the broker only
+  // sees the slot-sealed inner layer, never the handle key).
   let bytes;
   try {
-    bytes = decryptContent(slotSeed, inner);
+    bytes = await _decrypt(scope, slotSeed, inner);
   } catch {
     try {
       inner.fill(0);
@@ -327,17 +367,23 @@ export function vaultListView(decoded, id = null) {
  * operator had shared nothing. A non-zero undecryptable count is a signal,
  * not noise.
  */
-export function decryptedVaultViews(
+export async function decryptedVaultViews(
   scope = 'main',
   slotSeed,
-  { listCache = listVaultCache, decrypt = decryptContent } = {},
+  { listCache = listVaultCache, decrypt = decryptContent, brokerDecrypt = brokerDecryptContent } = {},
 ) {
   const items = [];
   const undecryptable = [];
   for (const sealed of listCache(scope)) {
     if (!sealed || typeof sealed.enc_b64 !== 'string' || sealed.status === 'revoked') continue;
     try {
-      const bytes = decrypt(slotSeed, sealed.enc_b64);
+      // Broker-aware (legacy seed in-node vs broker-native). `decrypt` keeps the
+      // existing injection seam for the seed path; `brokerDecrypt` is the no-seed
+      // path. await is a no-op for the sync seed decrypt.
+      const bytes = await decryptVaultEnvelope(scope, slotSeed, sealed.enc_b64, {
+        _decryptContent: decrypt,
+        _brokerDecryptContent: brokerDecrypt,
+      });
       const decoded = JSON.parse(Buffer.from(bytes).toString('utf8'));
       items.push(vaultListView(decoded, sealed.id));
     } catch (err) {

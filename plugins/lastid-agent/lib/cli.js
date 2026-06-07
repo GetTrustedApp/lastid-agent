@@ -760,7 +760,7 @@ async function cmdVaultList(flags) {
   try {
     const { decryptedVaultViews } = await import('./vault-cache.js');
     const { compactCredential } = await import('./credential-awareness.js');
-    const { items: decoded } = decryptedVaultViews(scope, loaded.slotSeed);
+    const { items: decoded } = await decryptedVaultViews(scope, loaded.slotSeed);
     const items = decoded.map(compactCredential);
     process.stdout.write(JSON.stringify({ items }));
     process.exit(0);
@@ -1892,6 +1892,7 @@ async function cmdListen(flags) {
         // is never cached: the permissioned window is the call, not "forever".
         resolveSecret: (itemId, handle) =>
           resolveVaultSecret(itemId, {
+            scope,
             slotSeed: loaded.slotSeed,
             handle,
             fetchWrappedSecret: (id, handlePubB64, handleId) =>

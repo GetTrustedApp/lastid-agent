@@ -384,7 +384,7 @@ async function handlePluginTool(name, _args, { scope, loadedAgent }) {
     // instead of silently presenting an empty list (which is how the 2026-
     // 05-28 sub-agent slot-0-sentinel bug went unnoticed).
     const { decryptedVaultViews } = await import('./vault-cache.js');
-    const { items, undecryptable } = decryptedVaultViews(scope, loadedAgent.slotSeed);
+    const { items, undecryptable } = await decryptedVaultViews(scope, loadedAgent.slotSeed);
     const body = undecryptable.length > 0 ? { items, undecryptable } : { items };
     return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
   }
