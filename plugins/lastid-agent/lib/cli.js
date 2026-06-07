@@ -1157,12 +1157,24 @@ async function runAgentStateSync(loaded, scope, opts = {}) {
     import('./vc-claims.js'),
   ]);
   const idpUrl = loaded.idpUrl ?? env.LASTID_IDP_URL ?? 'https://human.lastid.co';
-  const { signingKey } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid);
+  // MLS-custody: a broker-native agent has no seed in node — the operator-store
+  // MAC key comes from the broker (byte-identical to deriveOperatorStateMacKey),
+  // and signingKey stays null (syncAgentState's IdP auth + content decrypt route
+  // through the broker via authedIdpFetch + brokerDecryptContent). Legacy agents
+  // derive both from the seed as before.
+  const brokerNative = loaded.brokerNative === true;
+  let signingKey = null;
+  let macKey = null;
+  if (brokerNative) {
+    const { brokerDeriveOperatorStoreMacKey } = await import('./broker-ipc.js');
+    macKey = await brokerDeriveOperatorStoreMacKey({ scope });
+  } else {
+    ({ signingKey } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid));
+    macKey = deriveOperatorStateMacKey(loaded.slotSeed);
+  }
   // The listener is the SINGLE writer of operator-state — key it so every save
   // stamps the anti-tamper MAC (off the slot_seed, which isn't in the file).
-  const store = new OperatorStore(scope, undefined, {
-    macKey: deriveOperatorStateMacKey(loaded.slotSeed),
-  });
+  const store = new OperatorStore(scope, undefined, { macKey });
   // Memory store for cross-session/host reconcile: agent-authored memories
   // (and memory revokes) from the IdP land here, so a memory written on
   // another host/session shows up locally.
@@ -1317,7 +1329,33 @@ async function cmdListen(flags) {
       );
   });
 
-  const { signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid);
+  // MLS-custody: a BROKER-NATIVE agent has no slot seed in node — it lives only
+  // in the broker's protected store. The MLS at-rest wrap key + the audit-chain
+  // signatures come from the broker (the agent identity key never enters node).
+  // A LEGACY agent (seed in the keychain) is byte-unchanged.
+  const brokerNative = loaded.brokerNative === true;
+  let signingKey = null;
+  let signingSeed = null;
+  let mlsWrapKey = null;
+  if (brokerNative) {
+    const { brokerDeriveMlsStateKey } = await import('./broker-ipc.js');
+    mlsWrapKey = await brokerDeriveMlsStateKey({ scope });
+    process.stderr.write(
+      '[lastid-agent] broker-native: MLS wrap key + audit signing via the broker; the slot seed never enters node\n',
+    );
+  } else {
+    ({ signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid));
+  }
+  // The audit-chain signer: the legacy in-process key (a node KeyObject) for a
+  // legacy agent, or an async broker signer (raw-ES256 over the record core,
+  // validated broker-side as an audit record) for a broker-native agent. Either
+  // way the chain stays signed by the agent identity key.
+  const auditSigner = brokerNative
+    ? async (bytes) => {
+        const { brokerSignAuditRecord } = await import('./broker-ipc.js');
+        return brokerSignAuditRecord({ scope, coreBytes: bytes });
+      }
+    : signingKey;
 
   // Drain the audit spool into the signed chain, then ship it to the IdP
   // (operator-visible cross-device). The listener is the SINGLE chain writer:
@@ -1337,7 +1375,15 @@ async function cmdListen(flags) {
       if (Math.random() < 0.2) {
         try {
           const { auditSelfCheck, publicKeyFor } = await import('./memory-audit.js');
-          const r = auditSelfCheck({ scope, signingKey, agentDid: loaded.agentDid, publicKey: publicKeyFor(signingKey) });
+          // auditSigner signs (legacy key or broker); publicKey verifies — only
+          // available in node for a legacy agent (broker-native skips the in-node
+          // signature check; the IdP verifies it server-side).
+          const r = await auditSelfCheck({
+            scope,
+            signingKey: auditSigner,
+            agentDid: loaded.agentDid,
+            publicKey: signingKey ? publicKeyFor(signingKey) : null,
+          });
           if (r.healed) process.stderr.write(`[lastid-agent] audit chain healed (was broken at seq ${r.firstFailure?.seq})\n`);
         } catch (e) {
           process.stderr.write(`[lastid-agent] audit self-check failed: ${e?.message ?? e}\n`);
@@ -1345,7 +1391,7 @@ async function cmdListen(flags) {
       }
       try {
         const { drainAuditSpool } = await import('./audit-spool.js');
-        const chained = drainAuditSpool({ scope, signingKey, agentDid: loaded.agentDid });
+        const chained = await drainAuditSpool({ scope, signingKey: auditSigner, agentDid: loaded.agentDid });
         if (chained > 0) process.stderr.write(`[lastid-agent] chained ${chained} spooled audit event(s)\n`);
       } catch (e) {
         process.stderr.write(`[lastid-agent] audit spool drain failed: ${e?.message ?? e}\n`);
@@ -1356,7 +1402,9 @@ async function cmdListen(flags) {
         scope,
         agentDid: loaded.agentDid,
         vcCompact: loaded.vcCompact,
-        signingKey,
+        // Records are already signed; signingKey here is only the IdP-call auth,
+        // which the broker covers for a broker-native agent (authedIdpFetch).
+        signingKey: brokerNative ? null : signingKey,
       });
       if (n > 0) process.stderr.write(`[lastid-agent] shipped ${n} audit record(s) to IdP\n`);
     } catch {
@@ -1399,6 +1447,8 @@ async function cmdListen(flags) {
   // the orchestrator handle (via ctx.deviceId) and the MlsClient wrapper, so
   // the credential the shared handle stamps and the device_id KeyPackage
   // publish reports can never disagree (the multi-device two-sources class).
+  // A broker-native agent is always machine-bound → its device_id is the pinned
+  // md- (no seed needed to resolve it); a legacy agent derives from the seed.
   const resolvedDeviceId =
     Buffer.isBuffer(loaded.slotSeed) && loaded.slotSeed.length === 32
       ? resolveAgentDeviceId({
@@ -1406,7 +1456,7 @@ async function cmdListen(flags) {
           slotSeed: loaded.slotSeed,
           agentDid: loaded.agentDid,
         })
-      : null;
+      : (loaded.deviceId ?? null);
   const listenerCtx = {
     scope,
     agentDid: loaded.agentDid,
@@ -1414,7 +1464,11 @@ async function cmdListen(flags) {
     idpUrl,
     vcCompact: loaded.vcCompact,
     signingKey,
+    // Legacy: the raw seed (getOrchestrator derives the MLS wrap key in node).
+    // Broker-native: slotSeed is null and wrapKey is the broker-derived at-rest
+    // key, so node never holds the seed to seal/open the MLS keystore.
     slotSeed: loaded.slotSeed,
+    wrapKey: mlsWrapKey,
     deviceId: resolvedDeviceId,
     log: (l) => process.stderr.write(`${l}\n`),
   };

@@ -82,11 +82,16 @@ export async function publishAgentKeyPackage({
   if (!trimmed) throw new Error('publishAgentKeyPackage: idpUrl required');
   if (!agentDid) throw new Error('publishAgentKeyPackage: agentDid required');
   if (!vcCompact) throw new Error('publishAgentKeyPackage: vcCompact required');
-  if (!Buffer.isBuffer(slotSeed) || slotSeed.length !== 32) {
-    throw new Error('publishAgentKeyPackage: slotSeed must be 32 bytes');
+  // MLS-custody: a BROKER-NATIVE agent has no seed in node. The KeyPackages are
+  // minted by the shared MLS handle (openmls key, NOT the slot seed), and the
+  // IdP POST authenticates through the broker (authedIdpFetch). So the seed is
+  // only required on the LEGACY path (no shared handle → throwaway client + an
+  // in-node signing key). With a shared handle it is optional.
+  const haveSeed = Buffer.isBuffer(slotSeed) && slotSeed.length === 32;
+  if (!haveSeed && !sharedMls) {
+    throw new Error('publishAgentKeyPackage: slotSeed (32 bytes) or a shared mls handle is required');
   }
-
-  const { signingKey } = deriveAgentKeypair(slotSeed, agentDid);
+  const signingKey = haveSeed ? deriveAgentKeypair(slotSeed, agentDid).signingKey : null;
 
   // Reuse the listener's shared handle when given (B1 convergence — see the
   // `mls` param doc). Only fall back to a throwaway client at provision time,
@@ -177,10 +182,13 @@ export async function maintainAgentKeyPackages({
 }) {
   const trimmed = String(idpUrl ?? '').replace(/\/$/, '');
   if (!trimmed) throw new Error('maintainAgentKeyPackages: idpUrl required');
-  if (!Buffer.isBuffer(slotSeed) || slotSeed.length !== 32) {
-    throw new Error('maintainAgentKeyPackages: slotSeed must be 32 bytes');
+  // MLS-custody (see publishAgentKeyPackage): broker-native agents pass a shared
+  // MLS handle + no seed; the IdP GET/publish authenticate through the broker.
+  const haveSeed = Buffer.isBuffer(slotSeed) && slotSeed.length === 32;
+  if (!haveSeed && !sharedMls) {
+    throw new Error('maintainAgentKeyPackages: slotSeed (32 bytes) or a shared mls handle is required');
   }
-  const { signingKey } = deriveAgentKeypair(slotSeed, agentDid);
+  const signingKey = haveSeed ? deriveAgentKeypair(slotSeed, agentDid).signingKey : null;
 
   let available = 0;
   try {
