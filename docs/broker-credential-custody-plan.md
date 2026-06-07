@@ -67,14 +67,17 @@ POST   /v1/groups/:id/member-devices/{reconcile,evict}   GET /v1/groups/:id/memb
 DELETE /v1/identity/devices/:device_id   GET /v1/trust/:did/devices
 POST   /v1/agent-use-approvals           GET /v1/agent-use-approvals/:approval_id
 ```
-Plugin files (each currently `deriveAgentKeypair`+`mintDpopJwt`+`fetch`):
+Plugin files (each currently mints DPoP + fetches; `mls-publish.js` and
+`agent-memory-publish.js` also call `deriveAgentKeypair` directly — the others
+receive `signingKey` as an injected param, so don't expect a derive call in each):
 `mls-groups-api.js` (shared `authedIdpFetch` — biggest win, many callers),
 `mls-publish.js`, `agent-state-sync.js`, `agent-memory-publish.js`,
 `memory-audit-ship.js`, `rule-metrics-ship.js`, `vault-secret-fetch.js`,
 `vault-use-metrics.js`, `use-approval-loop.js`, `desktop-mcp-client.js`.
 
 ### B. Non-IdpCall pieces — genuinely need NEW broker capability (Phase 3)
-- **WebSocket** `/v1/ws` (`ws-client.js:216`): long-lived upgrade w/ Bearer+DPoP —
+- **WebSocket** `/v1/ws` (`ws-client.js` `#openSocket` ~:214, URL :216, headers
+  :230-237): long-lived upgrade w/ Bearer+DPoP —
   cannot be an IdpCall (request/response only). Broker must mint the upgrade auth.
 - **Content decryption** (`agent-state-sync.js` → `agent-content-crypto.js`,
   `project-crypto.js`): pulled rules/memories are AES-256-GCM under slot-seed- and
@@ -85,9 +88,10 @@ Plugin files (each currently `deriveAgentKeypair`+`mintDpopJwt`+`fetch`):
   from the PARENT slot seed + `signParentAuthorization` + `mintProofJwt`.
 
 ### C. Provisioning — slot-seed BIRTH (Phase 4)
-`agent-provisioning.js`: `/initiate` (ephemeral + machine key) → poll →
-`unsealSlotSeed` (the 32-byte seed arrives from the wallet, ECDH-P256+AES-GCM) →
-`/token` + `/credential` (`mintProofJwt` with the NEW slot key) → persist to
+`agent-provisioning.js`: `POST /v1/oid4vci/agent-provision/initiate` (ephemeral +
+machine key) → `POST /v1/oid4vci/agent-provision/poll` → `unsealSlotSeed` (the
+32-byte seed arrives from the wallet, ECDH-P256+AES-GCM) → `POST /v1/oid4vci/token`
+→ `POST /v1/oid4vci/credential` (`mintProofJwt` with the NEW slot key) → persist to
 keychain. Today node unseals + holds the slot seed at birth. To hit the end goal,
 this must move into the broker (broker generates the ephemeral, unseals, claims
 the VC, persists). Node drives only the `user_code` UX.
@@ -133,10 +137,15 @@ endpoint. This single phase de-risks Phases 1–2.
 
 **Phase 1 — Plugin broker-IPC bridge.** New `lib/broker-ipc.js` (port
 `broker-ipc-call.mjs`): connect `broker.sock` w/ `broker.token`, send
-`{op,method,path,body,auth_token}`, return `{status,body}`. Add `brokerIdpFetch(...)`
-mirroring `authedIdpFetch`'s shape (drop-in). Listener (`cli.js listen`) starts the
-signed broker `serve` daemon (spawn `native/lastid-agent-broker.app/.../lastid-agent-broker serve --scope <s>`),
-waits for socket+token, health-checks, restarts on death. Feature-flag
+`{kind:"idp_call", method, path, body, auth_token}` — the IPC discriminator field
+is **`kind`** (serde tag), value `"idp_call"`, NOT `op`; return `{status,body}`.
+Add `brokerIdpFetch(...)` mirroring `authedIdpFetch`'s shape (drop-in). The
+listener (`bin/lastid-agent.js listen`; lifecycle in `listener-daemon.js`) starts
+the signed broker daemon — **the serve/listen loop is the
+DEFAULT action; there is NO `serve` subcommand** (passing one hits the
+`unknown argument` fail-closed exit in `main.rs:120-123`). Spawn:
+`native/lastid-agent-broker.app/Contents/MacOS/lastid-agent-broker --scope <s> [--idp <url>]`,
+wait for socket+token, health-check, restart on death. Feature-flag
 `LASTID_BROKER_IDP` (default off → legacy node path; on → broker path) for
 no-flag-day rollout/rollback. Tests: IPC client unit (mock socket); listener
 starts broker + Health.

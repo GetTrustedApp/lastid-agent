@@ -43,13 +43,13 @@ import {
   mintProofJwt,
   claimCredential,
 } from './agent-provisioning.js';
-import { mintDpopJwt } from './dpop.js';
 import {
   brokerAvailable,
   brokerDeriveSubAgentSeed,
   brokerSignParentAuthorization,
 } from './broker-ipc.js';
 import { brokerIdpEnabled } from './broker-supervisor.js';
+import { authedIdpFetch } from './mls-groups-api.js';
 import { loadAgentVc, persistAgentVc } from './keychain.js';
 
 // Sub-agent VC validity ceiling. The IdP clamps to ≤ parent.exp too;
@@ -88,9 +88,6 @@ export async function provisionSubagent({
   subagent,
   fetchImpl = globalThis.fetch,
 }) {
-  if (!Buffer.isBuffer(parentSlotSeed) || parentSlotSeed.length !== 32) {
-    throw new Error('provisionSubagent: parentSlotSeed must be a 32-byte Buffer');
-  }
   if (!subagent || typeof subagent.slug !== 'string' || !subagent.slug) {
     throw new Error('provisionSubagent: subagent.slug required');
   }
@@ -98,15 +95,26 @@ export async function provisionSubagent({
   const subScope = `${parentScope}-${subagent.slug}`;
 
   // FORK1 Phase 3 op 4: when the signed broker is up for a P-256 parent, do the
-  // PARENT-KEY crypto (sub-seed derivation + parent-authorization signing) in the
-  // broker so the parent slot seed never reaches node. Ed25519 parents + no
-  // broker stay local — the broker is P-256-only and an Ed25519 parent-auth must
-  // be EdDSA, which it can't produce. (The sub-agent's OWN proof/keypair stay
-  // node-side: the sub-seed IS the new credential node persists.)
+  // PARENT-KEY crypto (sub-seed derivation + parent-authorization signing) AND
+  // the parent-authenticated IdP calls (next-index, /sub) in the broker so the
+  // parent slot seed never reaches node. Ed25519 parents + no broker stay local
+  // — the broker is P-256-only and an Ed25519 parent-auth must be EdDSA, which it
+  // can't produce. (The sub-agent's OWN proof/keypair stay node-side: the
+  // sub-seed IS the new credential node persists.)
   const parentIsP256 =
     typeof parentDid === 'string' && parentDid.startsWith('did:lastid:agent:zDn');
   const subBrokerOn =
     parentIsP256 && brokerIdpEnabled() && (await brokerAvailable(parentScope));
+
+  // The parent slot seed is only needed for the LOCAL (non-broker) parent-key
+  // crypto. A broker-native parent has no seed in node — the broker owns it — so
+  // a missing seed is valid exactly when subBrokerOn. Otherwise a 32-byte seed
+  // is mandatory (the legacy path derives sub-seed + parent-auth from it).
+  if (!subBrokerOn && (!Buffer.isBuffer(parentSlotSeed) || parentSlotSeed.length !== 32)) {
+    throw new Error(
+      'provisionSubagent: parentSlotSeed must be a 32-byte Buffer (or a running broker for a P-256 parent)',
+    );
+  }
 
   // The OPERATOR-PICKED capabilities are the contract — log them at
   // provision time so a wrong-caps issue is observable in the log instead
@@ -201,6 +209,7 @@ export async function provisionSubagent({
     parentDid,
     parentSigningKey,
     parentVcCompact,
+    parentScope,
     subAgentClass: subagent.slug,
     fetchImpl,
   });
@@ -279,42 +288,38 @@ export async function provisionSubagent({
     ? await brokerSignParentAuthorization({ scope: parentScope, claimsJson })
     : signParentAuthorization(parentAuthKey, claimsJson);
 
-  // 4) POST /sub authenticated as parent.
-  const subUrl = `${idpUrl}/v1/oid4vci/agent-provision/sub`;
-  const dpop = mintDpopJwt({
-    agentDid: parentDid,
-    httpMethod: 'POST',
-    httpUri: subUrl,
-    signingKey: parentSigningKey,
-  });
-  const provisionRes = await fetchImpl(subUrl, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${parentVcCompact}`,
-      DPoP: dpop,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      sub_agent_class: subagent.slug,
-      sub_agent_index: subAgentIndex,
-      sub_agent_pubkey_jwk: subPublicJwk,
-      capabilities_subset: claims.capabilities,
-      may_delegate: claims.may_delegate,
-      exp: claims.exp,
-      parent_authorization: parentAuthorization,
-      // Same-host: no relay needed. Placeholder satisfies the route's
-      // body-shape check; the seed is persisted to keychain locally.
-      sealed_slot_seed: '',
-    }),
-  });
-  if (!provisionRes.ok) {
-    const text =
-      typeof provisionRes.text === 'function' ? await provisionRes.text() : '';
-    throw new Error(
-      `subagent /sub failed: ${provisionRes.status} ${text}`,
-    );
+  // 4) POST /sub authenticated as parent. Same broker-aware routing as the
+  //    next-index GET above: the broker mints the parent DPoP when it's up
+  //    (parent slot seed stays in the broker), else node mints from
+  //    parentSigningKey. The parent_authorization JWS in the body is already
+  //    broker- or node-signed above (subBrokerOn), independent of the transport.
+  let provisioned;
+  try {
+    provisioned = await authedIdpFetch({
+      idpUrl,
+      method: 'POST',
+      path: '/v1/oid4vci/agent-provision/sub',
+      body: {
+        sub_agent_class: subagent.slug,
+        sub_agent_index: subAgentIndex,
+        sub_agent_pubkey_jwk: subPublicJwk,
+        capabilities_subset: claims.capabilities,
+        may_delegate: claims.may_delegate,
+        exp: claims.exp,
+        parent_authorization: parentAuthorization,
+        // Same-host: no relay needed. Placeholder satisfies the route's
+        // body-shape check; the seed is persisted to keychain locally.
+        sealed_slot_seed: '',
+      },
+      agentDid: parentDid,
+      vcCompact: parentVcCompact,
+      signingKey: parentSigningKey,
+      scope: parentScope,
+      fetchImpl,
+    });
+  } catch (err) {
+    throw new Error(`subagent /sub failed: ${err?.message ?? err}`);
   }
-  const provisioned = await provisionRes.json();
   if (
     !provisioned ||
     provisioned.ok !== true ||
@@ -421,29 +426,32 @@ async function fetchNextSubagentIndex({
   parentDid,
   parentSigningKey,
   parentVcCompact,
+  parentScope,
   subAgentClass,
   fetchImpl,
 }) {
-  const { htu, url } = subagentNextIndexUrls(idpUrl, subAgentClass);
-  const dpop = mintDpopJwt({
-    agentDid: parentDid,
-    httpMethod: 'GET',
-    httpUri: htu,
-    signingKey: parentSigningKey,
-  });
-  const res = await fetchImpl(url, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${parentVcCompact}`,
-      DPoP: dpop,
-      accept: 'application/json',
-    },
-  });
-  if (!res.ok) {
-    const text = typeof res.text === 'function' ? await res.text() : '';
-    throw new Error(`/sub/next-index failed: ${res.status} ${text}`);
+  // Authenticated as the PARENT (Bearer parent VC + parent DPoP). Routed through
+  // the broker-aware authedIdpFetch: when the broker is up for this scope it mints
+  // the parent DPoP (the parent slot seed never reaches node); otherwise node mints
+  // it from parentSigningKey exactly as before. authedIdpFetch strips the query for
+  // the DPoP htu (matching the IdP verifier), so the `?sub_agent_class=` param is
+  // safe in the path — the same htu-mismatch fix `subagentNextIndexUrls` encodes.
+  const path = `/v1/oid4vci/agent-provision/sub/next-index?sub_agent_class=${encodeURIComponent(subAgentClass)}`;
+  let body;
+  try {
+    body = await authedIdpFetch({
+      idpUrl,
+      method: 'GET',
+      path,
+      agentDid: parentDid,
+      vcCompact: parentVcCompact,
+      signingKey: parentSigningKey,
+      scope: parentScope,
+      fetchImpl,
+    });
+  } catch (err) {
+    throw new Error(`/sub/next-index failed: ${err?.message ?? err}`);
   }
-  const body = await res.json();
   if (!body || !Number.isInteger(body.next_index) || body.next_index < 0) {
     throw new Error(`/sub/next-index returned unexpected shape: ${JSON.stringify(body)}`);
   }

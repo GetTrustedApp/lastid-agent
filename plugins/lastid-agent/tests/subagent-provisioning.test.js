@@ -37,6 +37,37 @@ test('provisionSubagent: NEGATIVE — parentSlotSeed must be a 32-byte Buffer', 
   );
 });
 
+// REGRESSION (broker-credential-custody Phase 3 op 4 — 2026-06-07):
+// The seed guard is relaxed ONLY when the broker is actually doing the
+// parent-key crypto (subBrokerOn = P-256 parent AND LASTID_BROKER_IDP on AND a
+// broker socket+token present for the scope). A P-256 parent DID (zDn…) must NOT
+// be a free pass: with no broker running for the scope, subBrokerOn is false and
+// the 32-byte seed is still mandatory. Locks the relaxation so it can't silently
+// bypass the seed requirement when the broker isn't up.
+test('provisionSubagent: NEGATIVE — P-256 parent with no seed STILL requires it when no broker is up', async () => {
+  // Force the flag on; brokerAvailable() still returns false (no socket/token in
+  // this test env), so subBrokerOn must resolve false → seed guard fires.
+  const prev = process.env.LASTID_BROKER_IDP;
+  process.env.LASTID_BROKER_IDP = '1';
+  try {
+    await assert.rejects(
+      provisionSubagent({
+        idpUrl: 'https://idp.example',
+        parentSlotSeed: null, // broker-native shape, but no broker is running
+        parentSigningKey: null,
+        parentDid: 'did:lastid:agent:zDnPARENT', // P-256 (zDn) parent
+        parentVcCompact: 'vc.compact',
+        parentScope: 'main',
+        subagent: { slug: 'echo' },
+      }),
+      /parentSlotSeed must be a 32-byte Buffer \(or a running broker for a P-256 parent\)/,
+    );
+  } finally {
+    if (prev === undefined) delete process.env.LASTID_BROKER_IDP;
+    else process.env.LASTID_BROKER_IDP = prev;
+  }
+});
+
 test('provisionSubagent: NEGATIVE — subagent.slug required', async () => {
   await assert.rejects(
     provisionSubagent({
