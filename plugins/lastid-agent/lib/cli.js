@@ -53,7 +53,11 @@ function detectRuntimeName() {
   if (env.OPENAI_ASSISTANT_ID) return `OpenAI Assistant${here}`;
   return `lastid-agent${here}`;
 }
-import { provisionAgent, resolveAgentDeviceId } from '../lib/agent-provisioning.js';
+import {
+  provisionAgent,
+  provisionAgentViaBroker,
+  resolveAgentDeviceId,
+} from '../lib/agent-provisioning.js';
 import { recordGroup } from '../lib/agent-groups.js';
 import { resolveScope } from '../lib/scope.js';
 import { setActiveScope } from '../lib/active-scope.js';
@@ -301,12 +305,11 @@ async function cmdProvision(flags) {
   }
 
   console.log('Starting agent provisioning…');
-  const provisioned = await provisionAgent({
-    idpUrl,
-    parentHumanDid,
-    runtimeName: flags.runtime ?? detectRuntimeName(),
-    projectHint: flags['project-hint'] ?? env.LASTID_PROJECT_HINT,
-    onUserCode: async ({ userCode, expiresIn }) => {
+  const runtimeName = flags.runtime ?? detectRuntimeName();
+  const projectHint = flags['project-hint'] ?? env.LASTID_PROJECT_HINT;
+  // Shared operator-facing UX — surfaced identically whether provisioning runs
+  // in node (legacy) or inside the signed broker (Phase 4 broker-credential-custody).
+  const onUserCode = async ({ userCode, expiresIn }) => {
       console.log('');
       console.log(`User code:  ${userCode}`);
       console.log(`Expires in: ${expiresIn}s`);
@@ -391,20 +394,82 @@ async function cmdProvision(flags) {
       }
       console.log('');
       console.log('Waiting for you to approve…');
-    },
-  });
+  };
+
+  // Route provisioning through the signed broker when enabled (Phase 4): the
+  // broker generates the ephemeral, unseals the slot seed, claims the VC, and
+  // persists everything itself — the slot seed never enters this process. The
+  // broker must run UNPROVISIONED for this; on success it has persisted, so we
+  // stop it and the listener restarts it agent-mode (supervisor-restart model).
+  // Falls back to the legacy in-node provisionAgent when the broker path is off
+  // / not on macOS / the broker doesn't come up — no-flag-day.
+  let provisioned = null;
+  if (process.env.LASTID_BROKER_IDP === '1' && process.platform === 'darwin') {
+    const { startBrokerSupervisor } = await import('./broker-supervisor.js');
+    const provBroker = await startBrokerSupervisor({
+      scope,
+      idpUrl,
+      log: (l) => process.stderr.write(`${l}\n`),
+    });
+    if (provBroker?.ready) {
+      try {
+        console.log('Provisioning via the signed broker (the slot seed stays in the broker)…');
+        provisioned = await provisionAgentViaBroker({
+          scope,
+          runtimeName,
+          projectHint,
+          parentHumanDid,
+          onUserCode,
+        });
+      } finally {
+        provBroker.stop?.();
+      }
+    } else {
+      provBroker?.stop?.();
+    }
+  }
+  if (!provisioned) {
+    provisioned = await provisionAgent({
+      idpUrl,
+      parentHumanDid,
+      runtimeName,
+      projectHint,
+      onUserCode,
+    });
+  }
 
   // Stamp the chosen IdP onto the provisioned bundle so the
   // keychain records which env this agent is bound to.
   provisioned.idpUrl = idpUrl;
-  await persistAgentVc(provisioned, scope);
+  // The broker path already persisted (and node holds no slot seed to write);
+  // only the legacy node path writes the keychain here.
+  if (!provisioned.persistedByBroker) {
+    await persistAgentVc(provisioned, scope);
+  } else {
+    // The broker BORN the seed + persisted it; load the bundle back so the
+    // post-provision MLS KeyPackage publish (still in node for now) has the
+    // material. NOTE: this transiently reads the slot seed in node — acceptable
+    // under P4's dual-read keychain. P5's ACL lock-down closes this (the publish
+    // would then route through the broker too). Birth custody is already won:
+    // node never saw the seed during provisioning itself.
+    const fromKeychain = await loadAgentVc(scope);
+    if (fromKeychain) {
+      provisioned.slotSeed = fromKeychain.slotSeed;
+      provisioned.vcCompact = fromKeychain.vcCompact;
+      provisioned.projectRootSeed = fromKeychain.projectRootSeed;
+    }
+  }
   console.log('');
   console.log('✅ Agent provisioned and persisted to keychain.');
   console.log(`   scope:      ${scope}`);
   console.log(`   slot:       ${provisioned.slotIndex}`);
   console.log(`   agent_did:  ${provisioned.agentDid}`);
   console.log(`   idp_url:    ${idpUrl}`);
-  console.log(`   vc length:  ${provisioned.vcCompact.length} chars`);
+  console.log(
+    `   vc length:  ${
+      provisioned.vcCompact ? `${provisioned.vcCompact.length} chars` : '(persisted in broker)'
+    }`,
+  );
 
   // Reissue reset — MUST run BEFORE publishing the KeyPackage. We just minted a
   // NEW identity (the keychain now holds it). The running listener still has a

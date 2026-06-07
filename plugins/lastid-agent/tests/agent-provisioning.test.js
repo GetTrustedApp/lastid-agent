@@ -20,6 +20,7 @@ import {
   mintProofJwt,
   signParentAuthorization,
   parseCredentialOffer,
+  provisionAgentViaBroker,
   _internal,
 } from '../lib/agent-provisioning.js';
 import {
@@ -476,4 +477,72 @@ test('signParentAuthorization: optional kid lands in the header (both algos)', (
     fromB64url(signParentAuthorization(p.signingKey, '{}', 'parent-p256').split('.')[0]).toString('utf-8'),
   );
   assert.equal(pHeader.kid, 'parent-p256');
+});
+
+// ── provisionAgentViaBroker (Phase 4: node drives only the user_code UX) ──────
+
+test('provisionAgentViaBroker: surfaces user_code, polls to complete, returns persistedByBroker', async () => {
+  const codes = [];
+  const calls = { initiate: 0, poll: 0 };
+  let pending = 2; // two pendings before complete
+  const result = await provisionAgentViaBroker({
+    scope: 'unit',
+    runtimeName: 'r',
+    projectHint: 'repo',
+    parentHumanDid: 'did:lastid:zHuman',
+    intervalSeconds: 0,
+    onUserCode: ({ userCode, expiresIn }) => codes.push([userCode, expiresIn]),
+    initiate: async (a) => {
+      calls.initiate += 1;
+      assert.equal(a.scope, 'unit');
+      assert.equal(a.runtimeName, 'r');
+      assert.equal(a.projectHint, 'repo');
+      assert.equal(a.parentHumanDid, 'did:lastid:zHuman');
+      return { provisionId: 'pv-9', userCode: 'CODE-9', expiresIn: 600 };
+    },
+    poll: async (a) => {
+      calls.poll += 1;
+      assert.equal(a.provisionId, 'pv-9');
+      if (pending-- > 0) return { status: 'pending' };
+      return { status: 'complete', agentDid: 'did:lastid:agent:zDnX', slotIndex: 5, deviceId: 'md-x' };
+    },
+  });
+  assert.deepEqual(result, {
+    agentDid: 'did:lastid:agent:zDnX',
+    slotIndex: 5,
+    deviceId: 'md-x',
+    persistedByBroker: true,
+  });
+  assert.deepEqual(codes, [['CODE-9', 600]]);
+  assert.equal(calls.initiate, 1);
+  assert.equal(calls.poll, 3);
+});
+
+test('provisionAgentViaBroker: a wallet rejection (poll throws) propagates', async () => {
+  await assert.rejects(
+    provisionAgentViaBroker({
+      scope: 'unit',
+      intervalSeconds: 0,
+      onUserCode: () => {},
+      initiate: async () => ({ provisionId: 'pv', userCode: 'C', expiresIn: 1 }),
+      poll: async () => {
+        throw new Error('provision_poll failed: broker bad_request: provisioning rejected by wallet');
+      },
+    }),
+    /rejected by wallet/,
+  );
+});
+
+test('provisionAgentViaBroker: times out if never approved', async () => {
+  await assert.rejects(
+    provisionAgentViaBroker({
+      scope: 'unit',
+      intervalSeconds: 0,
+      timeoutSeconds: 0, // deadline already passed → no poll, immediate timeout
+      onUserCode: () => {},
+      initiate: async () => ({ provisionId: 'pv', userCode: 'C', expiresIn: 1 }),
+      poll: async () => ({ status: 'pending' }),
+    }),
+    /timed out before wallet approval/,
+  );
 });

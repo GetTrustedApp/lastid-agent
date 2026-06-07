@@ -57,6 +57,10 @@ import {
   machineDeviceIdFromP256Jwk,
 } from './agent-device-id.js';
 import { getMachineSePubkeyJwk as defaultGetMachineSePubkeyJwk } from './broker-client.js';
+import {
+  brokerProvisionInitiate as defaultBrokerProvisionInitiate,
+  brokerProvisionPoll as defaultBrokerProvisionPoll,
+} from './broker-ipc.js';
 
 // The agent's stable identity crypto is owned by the Rust SDK, surfaced
 // through the bundled P-256 WASM. We load it directly here (rather than
@@ -1011,6 +1015,64 @@ export async function provisionAgent({
     cNonce: issued.c_nonce ?? null,
     cNonceExpiresIn: issued.c_nonce_expires_in ?? null,
   };
+}
+
+/**
+ * Provision a new agent THROUGH the signed broker (FORK1 Phase 4). The broker
+ * (already running unprovisioned for `scope`) generates the ephemeral, unseals
+ * the slot seed, claims the VC, and PERSISTS everything to the keychain itself —
+ * so unlike {@link provisionAgent}, the slot seed never enters this process and
+ * the result carries NO `slotSeed`/`vcCompact`. Node drives only the `user_code`
+ * UX + the poll loop.
+ *
+ * The caller routes here (instead of `provisionAgent`) when the broker path is
+ * active (flag on + macOS + a broker up); on `persistedByBroker` the caller must
+ * NOT call `persistAgentVc` (the broker already did, and node has no seed).
+ *
+ * @param {object} a
+ * @param {string} [a.scope]
+ * @param {string} [a.runtimeName]
+ * @param {string} [a.projectHint]
+ * @param {string} [a.parentHumanDid]
+ * @param {(info:{userCode:string, expiresIn:number|null}) => Promise<void>|void} [a.onUserCode]
+ * @param {number} [a.intervalSeconds]
+ * @param {number} [a.timeoutSeconds]
+ * @param {typeof defaultBrokerProvisionInitiate} [a.initiate] - test override
+ * @param {typeof defaultBrokerProvisionPoll} [a.poll] - test override
+ * @returns {Promise<{agentDid:string, slotIndex:number|null, deviceId:string|null, persistedByBroker:true}>}
+ */
+export async function provisionAgentViaBroker({
+  scope = 'main',
+  runtimeName,
+  projectHint,
+  parentHumanDid,
+  onUserCode,
+  intervalSeconds = 5,
+  timeoutSeconds = 600,
+  initiate = defaultBrokerProvisionInitiate,
+  poll = defaultBrokerProvisionPoll,
+} = {}) {
+  const init = await initiate({ scope, runtimeName, projectHint, parentHumanDid });
+  if (typeof onUserCode === 'function') {
+    await onUserCode({ userCode: init.userCode, expiresIn: init.expiresIn });
+  }
+  const intervalMs = intervalSeconds * 1000;
+  const deadlineMs = Date.now() + timeoutSeconds * 1000;
+  while (Date.now() < deadlineMs) {
+    // brokerProvisionPoll throws on a wallet rejection / broker error — let it
+    // propagate (same posture as pollUntilApproved's 410 throw).
+    const r = await poll({ scope, provisionId: init.provisionId });
+    if (r.status === 'complete') {
+      return {
+        agentDid: r.agentDid,
+        slotIndex: r.slotIndex,
+        deviceId: r.deviceId,
+        persistedByBroker: true,
+      };
+    }
+    await delay(intervalMs);
+  }
+  throw new Error('broker provisioning timed out before wallet approval');
 }
 
 // Internal re-exports for tests.
