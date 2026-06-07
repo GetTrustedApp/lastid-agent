@@ -1481,11 +1481,22 @@ async function cmdListen(flags) {
   // so we don't burn MLS message generations into the void. Set true
   // on every (re)connect, cleared when a send finds the socket gone.
   let wsOpen = false;
+  // Broker-owns-WS (Phase 3 op 3): route the /v1/ws channel through the signed
+  // broker when the flag is on AND this is a P-256 agent (zDn… DID — the broker
+  // is P-256-only; Ed25519 z6Mk… agents keep the direct node WS). Default OFF;
+  // ws-client also re-checks per connect that a broker is actually up, so this
+  // can only ever ADD the broker path, never remove the legacy fallback.
+  const brokerWs =
+    process.env.LASTID_BROKER_IDP === '1' &&
+    typeof loaded.agentDid === 'string' &&
+    loaded.agentDid.startsWith('did:lastid:agent:zDn');
   const ws = new LastIdWsClient({
     idpUrl,
     agentDid: loaded.agentDid,
     vcCompact: loaded.vcCompact,
     signingKey,
+    brokerWs,
+    scope,
     onOpen: ({ ws_url }) => {
       wsOpen = true;
       process.stderr.write(`[lastid-agent] ws connected: ${ws_url}\n`);

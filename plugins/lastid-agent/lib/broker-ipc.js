@@ -12,6 +12,8 @@
  * JSON, throws on non-2xx) so Phase 2 can swap call sites with no caller change.
  */
 import net from 'node:net';
+import { EventEmitter } from 'node:events';
+import { existsSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -417,4 +419,234 @@ export async function brokerSignParentAuthorization({
     throw new Error(`sign_parent_authorization: unexpected broker response ${JSON.stringify(resp.body)}`);
   }
   return jws;
+}
+
+/**
+ * Synchronous "is a broker up for this scope?" — both the socket AND the
+ * per-launch token must exist. The async {@link brokerAvailable} is the
+ * authority, but the WS client's `#openSocket` is synchronous (it mirrors
+ * `new WebSocket()`), so it uses this cheap stat to decide PER CONNECT whether
+ * to take the broker transport or fall back to the legacy direct WS. That
+ * per-attempt check means a broker that dies mid-session degrades to the legacy
+ * path on the next reconnect instead of looping on a dead socket.
+ */
+export function brokerSocketExistsSync(scope = 'main') {
+  try {
+    return existsSync(brokerSocketPath(scope)) && existsSync(brokerTokenPath(scope));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A WebSocket-shaped transport whose channel is actually the signed broker's
+ * `/v1/ws` connection (broker-credential-custody Phase 3 op 3). The broker owns
+ * the wss upgrade (Bearer agent-VC + DPoP) and proxies frames over the local
+ * IPC socket as NDJSON `ws_frame`/`ws_close` lines; this class presents the
+ * SUBSET of the `ws` package's `WebSocket` interface that {@link LastIdWsClient}
+ * uses, so it's a drop-in there with no change to that client's event logic:
+ *
+ *   - events: `open`, `message`(Buffer), `close`(code, reason), `error`(Error),
+ *     and — crucially — `unexpected-response`(req, res) synthesized from a
+ *     broker `ws_error` carrying the upgrade HTTP status + body, so the client's
+ *     revocation classifier (401 + "credential has been revoked") still fires
+ *     through the broker.
+ *   - `readyState` using the same numeric constants as `ws`
+ *     (0 CONNECTING, 1 OPEN, 2 CLOSING, 3 CLOSED).
+ *   - `send(data)` (text frames; the client only ever sends JSON strings),
+ *     `close(code, reason)`, and a no-op `ping()` (node↔broker is a local unix
+ *     socket; the broker↔IdP TCP is kept warm server-side).
+ *
+ * The agent VC + P-256 key never transit node for the channel. Broker is
+ * P-256-only, so the caller gates this to P-256 (`zDn…`) agents.
+ */
+export class BrokerWsTransport extends EventEmitter {
+  // ws-compatible readyState constants.
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+
+  /** @type {0|1|2|3} */
+  readyState = 0;
+  #sock;
+  #buf = '';
+  #scope;
+  #socketPath;
+  #token;
+  #connect;
+  #closeEmitted = false;
+
+  /**
+   * @param {object} a
+   * @param {string} [a.scope]
+   * @param {string} [a.socketPath]   - test override
+   * @param {string} [a.token]        - test override (skips token file read)
+   * @param {typeof net.createConnection} [a.connect] - test override
+   */
+  constructor({ scope = 'main', socketPath, token, connect = net.createConnection } = {}) {
+    super();
+    this.#scope = scope;
+    this.#socketPath = socketPath ?? brokerSocketPath(scope);
+    this.#token = token;
+    this.#connect = connect;
+    // Async setup, but return immediately — mirrors `new WebSocket()` emitting
+    // `open` on a later tick. Any setup failure routes to the same error→close
+    // path the legacy socket uses, so the client's reconnect logic is unchanged.
+    this.#begin().catch((err) => this.#fatal(err));
+  }
+
+  async #begin() {
+    const token = this.#token ?? (await readBrokerToken(this.#scope));
+    let sock;
+    try {
+      sock = this.#connect(this.#socketPath);
+    } catch (err) {
+      this.#fatal(new Error(`broker ws connect threw: ${err?.message ?? err}`));
+      return;
+    }
+    this.#sock = sock;
+    sock.on('error', (e) => this.#fatal(new Error(`broker ws socket error: ${e.message}`)));
+    sock.on('connect', () => {
+      const req = { id: nextRequestId(), auth_token: token, kind: 'ws_open' };
+      try {
+        sock.write(`${JSON.stringify(req)}\n`);
+      } catch (err) {
+        this.#fatal(new Error(`broker ws open write failed: ${err?.message ?? err}`));
+      }
+    });
+    sock.on('data', (chunk) => this.#onData(chunk));
+    sock.on('close', () => this.#finishClose(1006, 'broker ipc closed'));
+  }
+
+  #onData(chunk) {
+    this.#buf += chunk.toString('utf8');
+    let nl;
+    // NDJSON: drain every complete line; a frame can arrive split or batched.
+    while ((nl = this.#buf.indexOf('\n')) !== -1) {
+      const line = this.#buf.slice(0, nl).trim();
+      this.#buf = this.#buf.slice(nl + 1);
+      if (line) this.#onLine(line);
+    }
+  }
+
+  #onLine(line) {
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      return; // ignore a garbled line rather than tear down the channel
+    }
+    switch (msg?.kind) {
+      case 'ws_open_ok':
+        this.readyState = 1;
+        this.emit('open');
+        return;
+      case 'ws_frame': {
+        // Broker relays both text + binary as base64; the client treats the
+        // payload as bytes (it JSON.parses the utf-8), so binary-ness is moot.
+        const data = Buffer.from(typeof msg.data === 'string' ? msg.data : '', 'base64');
+        this.emit('message', data);
+        return;
+      }
+      case 'ws_error': {
+        // If the broker relayed an upgrade HTTP status + body, replay it as an
+        // `unexpected-response` so LastIdWsClient's revocation classifier runs
+        // exactly as on a direct connection. Then error→close drives reconnect
+        // (the classifier flips the client to 'stopped' first if it's a revoke).
+        if (typeof msg.http_status === 'number') {
+          const res = makeFakeUpgradeResponse(
+            msg.http_status,
+            typeof msg.body === 'string' ? msg.body : '',
+          );
+          this.emit('unexpected-response', {}, res);
+        }
+        this.emit('error', new Error(typeof msg.message === 'string' ? msg.message : 'broker ws error'));
+        this.#finishClose(1006, typeof msg.message === 'string' ? msg.message : '');
+        return;
+      }
+      case 'ws_close':
+        this.#finishClose(
+          typeof msg.code === 'number' ? msg.code : 1000,
+          typeof msg.reason === 'string' ? msg.reason : '',
+        );
+        return;
+      default:
+        return; // forward-compatible: ignore unknown control lines
+    }
+  }
+
+  /** Send a text frame (the client only sends JSON strings). No-op unless open. */
+  send(data) {
+    if (this.readyState !== 1 || !this.#sock) return;
+    const str = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+    const frame = {
+      kind: 'ws_frame',
+      data: Buffer.from(str, 'utf8').toString('base64'),
+      binary: false,
+    };
+    try {
+      this.#sock.write(`${JSON.stringify(frame)}\n`);
+    } catch (err) {
+      this.#fatal(new Error(`broker ws send failed: ${err?.message ?? err}`));
+    }
+  }
+
+  /** Begin a clean close: tell the broker to close its WS, then end the IPC. */
+  close(code = 1000, reason = '') {
+    if (this.readyState === 3 || this.#closeEmitted) return;
+    this.readyState = 2;
+    try {
+      this.#sock?.write(`${JSON.stringify({ kind: 'ws_close', code, reason })}\n`);
+    } catch {
+      /* ignore — we're tearing down anyway */
+    }
+    try {
+      this.#sock?.end();
+    } catch {
+      /* ignore */
+    }
+    // The socket 'close' (or a broker ws_close line) drives #finishClose.
+  }
+
+  /** No-op: the keep-warm ping belongs on the broker↔IdP TCP, not the local IPC. */
+  ping() {}
+
+  #fatal(err) {
+    try {
+      this.emit('error', err);
+    } catch {
+      /* a thrown error handler must not mask the close */
+    }
+    this.#finishClose(1006, err?.message ?? 'broker ws fatal');
+  }
+
+  #finishClose(code, reason) {
+    if (this.#closeEmitted) return;
+    this.#closeEmitted = true;
+    this.readyState = 3;
+    try {
+      this.#sock?.destroy();
+    } catch {
+      /* ignore */
+    }
+    this.#sock = undefined;
+    this.emit('close', code, reason);
+  }
+}
+
+/**
+ * Build the minimal `http.IncomingMessage`-shaped object LastIdWsClient's
+ * `unexpected-response` handler reads: a `statusCode` plus a readable that
+ * emits the body once via `data` then `end`. We schedule the emits on a
+ * microtask so listeners attached synchronously in the handler are wired first.
+ */
+function makeFakeUpgradeResponse(statusCode, body) {
+  const res = new EventEmitter();
+  res.statusCode = statusCode;
+  queueMicrotask(() => {
+    if (body) res.emit('data', Buffer.from(body, 'utf8'));
+    res.emit('end');
+  });
+  return res;
 }

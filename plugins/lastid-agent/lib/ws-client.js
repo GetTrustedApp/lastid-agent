@@ -57,6 +57,7 @@
 
 import { createRequire } from 'node:module';
 import { mintDpopJwt } from './dpop.js';
+import { BrokerWsTransport, brokerSocketExistsSync } from './broker-ipc.js';
 
 const localRequire = createRequire(import.meta.url);
 const { WebSocket } = localRequire('ws');
@@ -119,6 +120,15 @@ const KNOWN_EVENT_TYPES = new Set([
  * @property {string} agentDid - `did:lastid:agent:z…`.
  * @property {string} vcCompact - Agent VC SD-JWT compact string.
  * @property {import('node:crypto').KeyObject} signingKey - Ed25519 KeyObject.
+ * @property {boolean} [brokerWs]
+ *   When true AND a signed broker is up for `scope`, open the `/v1/ws` channel
+ *   THROUGH the broker (broker-credential-custody Phase 3 op 3) — the broker
+ *   owns the wss upgrade auth (Bearer VC + DPoP) and proxies frames over IPC, so
+ *   the agent VC + key never transit node for the channel. Flag-gated by the
+ *   caller and P-256-only (the broker is P-256-only). Falls back to the legacy
+ *   direct WS, per connect, whenever no broker socket exists — a down broker can
+ *   never strand the listener.
+ * @property {string} [scope] - agent scope (locates the broker socket/token).
  * @property {(evt: any) => void} [onOpen]
  * @property {(evt: any) => Promise<void> | void} onEvent
  *   Called for every inbound `group_chat.*` event in arrival order.
@@ -211,9 +221,23 @@ export class LastIdWsClient {
    * would 401 anyway.
    */
   #openSocket() {
-    const { idpUrl, agentDid, vcCompact, signingKey } = this.#opts;
+    const { idpUrl, agentDid, vcCompact, signingKey, brokerWs, scope } = this.#opts;
     const trimmed = idpUrl.replace(/\/$/, '');
     const wsUrl = trimmed.replace(/^https/i, 'wss').replace(/^http/i, 'ws') + '/v1/ws';
+
+    // Broker-owns-WS path (Phase 3 op 3): only when the caller opted in AND a
+    // broker is actually up for this scope RIGHT NOW. The per-connect stat means
+    // a broker that dies mid-session degrades to the legacy direct WS on the
+    // next reconnect instead of looping on a dead socket — no-flag-day safety.
+    // The broker mints the upgrade auth itself, so node skips the DPoP here.
+    if (brokerWs && brokerSocketExistsSync(scope)) {
+      process.stderr.write('[lastid-agent] ws: opening via signed-broker transport\n');
+      const socket = new BrokerWsTransport({ scope });
+      this.#socket = socket;
+      this.#wireSocket(socket, wsUrl);
+      return;
+    }
+
     const proofHtu = `${trimmed.replace(/^ws/i, 'http')}/v1/ws`;
     const dpopProof = mintDpopJwt({
       agentDid,
@@ -233,7 +257,20 @@ export class LastIdWsClient {
       },
     });
     this.#socket = ws;
+    this.#wireSocket(ws, wsUrl);
+  }
 
+  /**
+   * Wire the lifecycle handlers onto a freshly-opened socket. Shared by the
+   * legacy direct `ws` WebSocket and the {@link BrokerWsTransport} — both expose
+   * the same event surface (`unexpected-response`/`open`/`message`/`close`/
+   * `error`), so the revocation classifier, reconnect, and heartbeat logic are
+   * identical regardless of which transport carries the channel.
+   *
+   * @param {import('ws').WebSocket | BrokerWsTransport} ws
+   * @param {string} wsUrl - informational, surfaced to `onOpen`.
+   */
+  #wireSocket(ws, wsUrl) {
     // Detect the SPECIFIC revocation signal on the WS upgrade response
     // and short-circuit the reconnect loop. The `ws` package emits
     // 'unexpected-response' BEFORE 'error' + 'close' when the upgrade

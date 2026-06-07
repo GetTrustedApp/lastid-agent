@@ -9,6 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rmSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -25,6 +26,8 @@ import {
   brokerSocketPath,
   brokerTokenPath,
   brokerRuntimeDir,
+  brokerSocketExistsSync,
+  BrokerWsTransport,
 } from '../lib/broker-ipc.js';
 
 let _n = 0;
@@ -375,5 +378,212 @@ test('brokerSignParentAuthorization: broker error → throws', async () => {
     );
   } finally {
     await srv.close();
+  }
+});
+
+// ── op 3: BrokerWsTransport (broker-owns-WS streaming proxy) ─────────────────
+//
+// These drive the STREAMING wire (multiple NDJSON lines both ways on one
+// connection), distinct from the single request/response `startServer` above.
+// The server speaks the ws_open/ws_open_ok/ws_frame/ws_close/ws_error contract
+// the Rust ws_proxy.rs implements, so the transport's framing + event surface
+// is pinned exactly as the live broker would exercise it.
+
+/**
+ * A streaming unix-socket server: parses every NDJSON line the client sends into
+ * `received`, invokes `onLine(msg, sock)` per line (so the test can script the
+ * broker's replies), and exposes `push(obj)` to inject broker→node lines.
+ */
+async function startWsServer(onLine) {
+  const socketPath = tmpSock();
+  try {
+    rmSync(socketPath, { force: true });
+  } catch {
+    /* ignore */
+  }
+  const received = [];
+  let clientSock;
+  const server = net.createServer((sock) => {
+    clientSock = sock;
+    let buf = '';
+    sock.on('data', (chunk) => {
+      buf += chunk.toString('utf8');
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const msg = JSON.parse(line);
+        received.push(msg);
+        onLine?.(msg, sock);
+      }
+    });
+    sock.on('error', () => {});
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  return {
+    socketPath,
+    received,
+    push: (obj) => clientSock?.write(`${JSON.stringify(obj)}\n`),
+    close: () =>
+      new Promise((resolve) => {
+        server.close(() => {
+          try {
+            rmSync(socketPath, { force: true });
+          } catch {
+            /* ignore */
+          }
+          resolve();
+        });
+      }),
+  };
+}
+
+const ackOpen = (msg, sock) => {
+  if (msg.kind === 'ws_open') sock.write(`${JSON.stringify({ kind: 'ws_open_ok' })}\n`);
+};
+
+test('BrokerWsTransport: sends a ws_open (with auth_token) and emits open on ws_open_ok', async () => {
+  const srv = await startWsServer(ackOpen);
+  try {
+    const t = new BrokerWsTransport({ socketPath: srv.socketPath, token: 'tok-x' });
+    await once(t, 'open');
+    assert.equal(t.readyState, BrokerWsTransport.OPEN);
+    assert.equal(srv.received[0].kind, 'ws_open');
+    assert.equal(srv.received[0].auth_token, 'tok-x');
+    t.close();
+  } finally {
+    await srv.close();
+  }
+});
+
+test('BrokerWsTransport: inbound ws_frame → message event with base64-decoded bytes', async () => {
+  const srv = await startWsServer(ackOpen);
+  try {
+    const t = new BrokerWsTransport({ socketPath: srv.socketPath, token: 't' });
+    await once(t, 'open');
+    const msgP = once(t, 'message');
+    srv.push({ kind: 'ws_frame', data: Buffer.from('{"type":"hi"}', 'utf8').toString('base64'), binary: false });
+    const [data] = await msgP;
+    assert.ok(Buffer.isBuffer(data));
+    assert.equal(data.toString('utf8'), '{"type":"hi"}');
+    t.close();
+  } finally {
+    await srv.close();
+  }
+});
+
+test('BrokerWsTransport: send() writes a base64 ws_frame (binary:false) to the broker', async () => {
+  const srv = await startWsServer(ackOpen);
+  try {
+    const t = new BrokerWsTransport({ socketPath: srv.socketPath, token: 't' });
+    await once(t, 'open');
+    const payload = JSON.stringify({ type: 'group_chat.fetch_queue' });
+    t.send(payload);
+    // Poll for the server to receive the frame line.
+    for (let i = 0; i < 100 && !srv.received.some((m) => m.kind === 'ws_frame'); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const frame = srv.received.find((m) => m.kind === 'ws_frame');
+    assert.ok(frame, 'broker received a ws_frame');
+    assert.equal(frame.binary, false);
+    assert.equal(Buffer.from(frame.data, 'base64').toString('utf8'), payload);
+    t.close();
+  } finally {
+    await srv.close();
+  }
+});
+
+test('BrokerWsTransport: ws_error with http_status replays unexpected-response (revocation classifier survives the broker) then closes', async () => {
+  const body = JSON.stringify({ error: 'invalid_token', error_description: 'Credential has been revoked' });
+  const srv = await startWsServer((msg, sock) => {
+    if (msg.kind === 'ws_open') {
+      sock.write(
+        `${JSON.stringify({ kind: 'ws_error', message: 'ws upgrade failed: HTTP 401', http_status: 401, body })}\n`,
+      );
+    }
+  });
+  try {
+    const t = new BrokerWsTransport({ socketPath: srv.socketPath, token: 't' });
+    t.on('error', () => {}); // swallow — the close path is what matters
+    // Attach the consumer SYNCHRONOUSLY (as ws-client does) so the fake body
+    // stream's listeners are wired before its queued data/end fire. Use a manual
+    // close listener — `events.once` would reject on the (expected) error emit.
+    const chunks = [];
+    let status;
+    const drained = new Promise((resolve) => {
+      t.on('unexpected-response', (_req, res) => {
+        status = res.statusCode;
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', resolve);
+      });
+    });
+    const closeP = new Promise((resolve) => t.on('close', () => resolve()));
+    await drained;
+    assert.equal(status, 401);
+    assert.equal(Buffer.concat(chunks).toString('utf8'), body);
+    await closeP;
+    assert.equal(t.readyState, BrokerWsTransport.CLOSED);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('BrokerWsTransport: ws_close → close event with code + reason', async () => {
+  const srv = await startWsServer((msg, sock) => {
+    if (msg.kind === 'ws_open') {
+      sock.write(`${JSON.stringify({ kind: 'ws_open_ok' })}\n`);
+      sock.write(`${JSON.stringify({ kind: 'ws_close', code: 1011, reason: 'bye' })}\n`);
+    }
+  });
+  try {
+    const t = new BrokerWsTransport({ socketPath: srv.socketPath, token: 't' });
+    const [code, reason] = await once(t, 'close');
+    assert.equal(code, 1011);
+    assert.equal(reason.toString(), 'bye');
+    assert.equal(t.readyState, BrokerWsTransport.CLOSED);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('BrokerWsTransport: close() sends ws_close to the broker', async () => {
+  const srv = await startWsServer(ackOpen);
+  try {
+    const t = new BrokerWsTransport({ socketPath: srv.socketPath, token: 't' });
+    await once(t, 'open');
+    t.close(1000, 'agent shutting down');
+    for (let i = 0; i < 100 && !srv.received.some((m) => m.kind === 'ws_close'); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.ok(srv.received.some((m) => m.kind === 'ws_close'), 'broker received ws_close');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('BrokerWsTransport: unconnectable socket → emits close (degrades, never throws)', async () => {
+  const t = new BrokerWsTransport({
+    socketPath: join(tmpdir(), `lidbrk-none-${process.pid}.sock`),
+    token: 't',
+  });
+  t.on('error', () => {}); // swallow — connect ENOENT is the expected trigger
+  // Manual close listener: `events.once` would reject on the error emit.
+  await new Promise((resolve) => t.on('close', () => resolve()));
+  assert.equal(t.readyState, BrokerWsTransport.CLOSED);
+});
+
+test('brokerSocketExistsSync: true only when BOTH socket + token exist', () => {
+  const scope = `__brk_sync_${process.pid}`;
+  const dir = brokerRuntimeDir(scope);
+  try {
+    assert.equal(brokerSocketExistsSync(scope), false, 'absent → false');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(brokerSocketPath(scope), '');
+    assert.equal(brokerSocketExistsSync(scope), false, 'socket only → false');
+    writeFileSync(brokerTokenPath(scope), 'tok');
+    assert.equal(brokerSocketExistsSync(scope), true, 'socket + token → true');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
