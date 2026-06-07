@@ -404,8 +404,12 @@ async function cmdProvision(flags) {
   // Falls back to the legacy in-node provisionAgent when the broker path is off
   // / not on macOS / the broker doesn't come up — no-flag-day.
   let provisioned = null;
-  if (process.env.LASTID_BROKER_IDP === '1' && process.platform === 'darwin') {
-    const { startBrokerSupervisor } = await import('./broker-supervisor.js');
+  // Broker-native by DEFAULT on macOS (brokerIdpEnabled() is true unless the
+  // LASTID_BROKER_IDP kill-switch is set / non-macOS). A fresh agent is born in
+  // the broker's protected store with the seed never entering node; if the signed
+  // broker can't start we fall through to the legacy in-node provisionAgent below.
+  const { startBrokerSupervisor, brokerIdpEnabled } = await import('./broker-supervisor.js');
+  if (brokerIdpEnabled()) {
     const provBroker = await startBrokerSupervisor({
       scope,
       idpUrl,
@@ -1291,16 +1295,20 @@ async function cmdListen(flags) {
     );
   }
 
-  // Phase 1 (broker-credential-custody): the listener owns the signed broker's
-  // lifecycle. Bring it up for this scope so it can serve FORK1 IdP calls
-  // (brokerIdpFetch). No-flag-day + macOS-gated INSIDE the supervisor → returns
-  // null (legacy node IdP path) when LASTID_BROKER_IDP is off or not on macOS.
-  // Tied to this listener's lifetime; torn down in shutdown().
-  const broker = await startBrokerSupervisor({
-    scope,
-    idpUrl,
-    log: (l) => process.stderr.write(`${l}\n`),
-  });
+  // The listener owns the signed broker's lifecycle. A BROKER-NATIVE agent (seed
+  // in the protected store, absent from node) REQUIRES the broker to serve every
+  // op, so we start it (enabled:true — a broker-native agent must run its broker
+  // even if the kill-switch is set; the switch only governs fresh provisioning).
+  // A LEGACY agent (seed in the keychain) keeps the node path and never starts a
+  // broker — existing agents are byte-unchanged. Torn down in shutdown().
+  const broker = loaded.brokerNative === true
+    ? await startBrokerSupervisor({
+        scope,
+        idpUrl,
+        enabled: true,
+        log: (l) => process.stderr.write(`${l}\n`),
+      })
+    : null;
   if (broker) {
     process.stderr.write(
       `[lastid-agent] signed broker supervised (scope=${scope} ready=${broker.ready} pid=${broker.pid ?? '?'})\n`,

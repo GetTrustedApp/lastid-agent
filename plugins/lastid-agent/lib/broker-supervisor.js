@@ -5,11 +5,13 @@
  * and restarts it on death — so a long-lived broker is available to serve
  * `brokerIdpFetch` (FORK1) for as long as the listener runs.
  *
- * No-flag-day: gated behind `LASTID_BROKER_IDP` (default OFF) AND macOS-only
- * (the broker owns the macOS Secure Enclave). On any other platform, or with the
- * flag off, this is a no-op (returns null) and the agent keeps the legacy node
- * IdP path. The broker's serve loop is its DEFAULT action — there is NO `serve`
- * subcommand (an unknown arg fails closed in the broker's main.rs).
+ * Broker-native is the DEFAULT on macOS (no flag to opt in); `LASTID_BROKER_IDP`
+ * set to a falsey value is only a rollback kill-switch. On any non-macOS platform,
+ * with the kill-switch set, or when the binary can't be resolved, this is a no-op
+ * (returns null) and the agent keeps the legacy node IdP path. The listener only
+ * calls this for a broker-native agent (seed in the protected store); a legacy
+ * seed-in-keychain agent never starts a broker. The broker's serve loop is its
+ * DEFAULT action — there is NO `serve` subcommand (unknown arg fails closed).
  */
 import { spawn } from 'node:child_process';
 import { rm, stat } from 'node:fs/promises';
@@ -18,13 +20,22 @@ import { resolveBrokerPath } from './broker-client.js';
 import { brokerSocketPath, brokerTokenPath, brokerHealth } from './broker-ipc.js';
 
 /**
- * The no-flag-day feature flag. OFF by default → legacy node IdP path. Set
- * `LASTID_BROKER_IDP=1` (or true/on/yes) to route authed IdP calls through the
- * signed broker. Pure + injectable for tests.
+ * Whether the signed-broker credential path is active. Broker-native is now the
+ * DEFAULT on macOS (the broker owns the Secure Enclave + data-protection
+ * keychain) — you do NOT set a flag to opt in; a freshly provisioned agent is
+ * broker-native automatically. `LASTID_BROKER_IDP` is only a rollback
+ * KILL-SWITCH: an explicit falsey value (`0`/`false`/`off`/`no`) forces the
+ * legacy in-node path. Non-macOS is always legacy (no Secure Enclave).
+ *
+ * NOTE: this gates whether the broker path is *permitted/preferred*; the actual
+ * runtime discriminator for an EXISTING agent is where its seed lives
+ * (`loaded.brokerNative` / `brokerAvailable(scope)`), so a legacy seed-in-keychain
+ * agent keeps the node path regardless. Pure + injectable for tests.
  */
-export function brokerIdpEnabled(env = process.env) {
+export function brokerIdpEnabled(env = process.env, platform = process.platform) {
+  if (platform !== 'darwin') return false;
   const v = String(env.LASTID_BROKER_IDP ?? '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'on' || v === 'yes';
+  return !(v === '0' || v === 'false' || v === 'off' || v === 'no');
 }
 
 async function fileExists(p) {
@@ -80,7 +91,7 @@ export async function startBrokerSupervisor({
 } = {}) {
   const on = enabled ?? brokerIdpEnabled();
   if (!on) {
-    log('[broker] LASTID_BROKER_IDP off — legacy node IdP path');
+    log('[broker] broker path disabled (LASTID_BROKER_IDP kill-switch) — legacy node IdP path');
     return null;
   }
   if (platform !== 'darwin') {

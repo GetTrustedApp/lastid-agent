@@ -37,14 +37,19 @@ const baseOpts = {
 
 const tick = () => new Promise((r) => setImmediate(r));
 
-test('brokerIdpEnabled: off by default, on for 1/true/on/yes', () => {
-  assert.equal(brokerIdpEnabled({}), false);
-  assert.equal(brokerIdpEnabled({ LASTID_BROKER_IDP: '' }), false);
-  assert.equal(brokerIdpEnabled({ LASTID_BROKER_IDP: '0' }), false);
-  assert.equal(brokerIdpEnabled({ LASTID_BROKER_IDP: 'off' }), false);
-  for (const v of ['1', 'true', 'TRUE', 'on', 'yes']) {
-    assert.equal(brokerIdpEnabled({ LASTID_BROKER_IDP: v }), true, v);
+test('brokerIdpEnabled: broker-native by DEFAULT on macOS; kill-switch forces legacy; non-macOS off', () => {
+  // Default ON on macOS — no flag needed to get broker-native custody.
+  assert.equal(brokerIdpEnabled({}, 'darwin'), true);
+  assert.equal(brokerIdpEnabled({ LASTID_BROKER_IDP: '' }, 'darwin'), true);
+  assert.equal(brokerIdpEnabled({ LASTID_BROKER_IDP: '1' }, 'darwin'), true);
+  assert.equal(brokerIdpEnabled({ LASTID_BROKER_IDP: 'on' }, 'darwin'), true);
+  // An explicit falsey value is the rollback KILL-SWITCH → legacy in-node path.
+  for (const v of ['0', 'false', 'FALSE', 'off', 'no']) {
+    assert.equal(brokerIdpEnabled({ LASTID_BROKER_IDP: v }, 'darwin'), false, v);
   }
+  // Non-macOS is ALWAYS legacy (the broker owns the Secure Enclave), env aside.
+  assert.equal(brokerIdpEnabled({}, 'linux'), false);
+  assert.equal(brokerIdpEnabled({ LASTID_BROKER_IDP: '1' }, 'linux'), false);
 });
 
 test('returns null (legacy path) when the flag is off', async () => {

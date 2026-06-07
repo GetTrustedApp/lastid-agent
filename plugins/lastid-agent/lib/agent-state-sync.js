@@ -108,7 +108,7 @@ export function decodeRecord(record, slotSeed, projectRootSeed = null, opts = {}
 async function fetchKind({ idpUrl, path, since, agentDid, vcCompact, signingKey, fetchImpl }) {
   // FORK1 (Phase 2): route through the shared, broker-aware authedIdpFetch. The
   // legacy path is byte-identical (Bearer + DPoP; htu strips the ?since query the
-  // same way) and, when LASTID_BROKER_IDP is on + a broker is up, the signed
+  // same way) and, for a broker-native agent (broker up for the scope), the signed
   // broker makes the call. Scope is ambient (getActiveScope). authedIdpFetch
   // returns the parsed body; we shape the per-kind result from it as before.
   const body = await authedIdpFetch({

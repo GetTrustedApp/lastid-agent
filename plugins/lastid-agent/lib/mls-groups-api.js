@@ -48,12 +48,13 @@ export async function authedIdpFetch({
   _brokerAvailable = brokerAvailable,
   _brokerEnabled = brokerIdpEnabled,
 }) {
-  // FORK1 (broker-credential-custody Phase 2): when broker routing is enabled
-  // AND a broker is actually up for this scope, the SIGNED BROKER makes the call
-  // — it holds the slot seed + mints the canonical DPoP resource-token, so node
-  // derives no key and mints no DPoP here. No-flag-day: LASTID_BROKER_IDP is off
-  // by default, and even when on we fall back to the legacy node path below
-  // whenever no broker is running (brokerAvailable=false).
+  // FORK1 (broker-credential-custody): when the broker path is active (macOS
+  // default; LASTID_BROKER_IDP kill-switch off) AND a broker is actually up for
+  // this scope, the SIGNED BROKER makes the call — it holds the slot seed + mints
+  // the canonical DPoP resource-token, so node derives no key and mints no DPoP
+  // here. The brokerAvailable() guard is what discriminates at runtime: only a
+  // broker-native agent (which started a broker) routes here; a legacy
+  // seed-in-keychain agent has no broker up and falls through to the node path.
   const routeScope = scope ?? getActiveScope();
   if (_brokerEnabled() && (await _brokerAvailable(routeScope))) {
     return _brokerIdpFetch({ method, path, body, scope: routeScope });

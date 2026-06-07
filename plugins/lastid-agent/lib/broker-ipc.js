@@ -40,9 +40,11 @@ export async function readBrokerToken(scope = 'main') {
 
 /**
  * Whether a broker is actually running for `scope` — both the socket AND the
- * per-launch token exist. The dispatch in authedIdpFetch checks this so that,
- * even with LASTID_BROKER_IDP on, a call falls back to the legacy node path
- * whenever no broker is up (no-flag-day safety).
+ * per-launch token exist. This is the RUNTIME discriminator: a broker-native
+ * agent's listener starts a broker (so this is true), while a legacy
+ * seed-in-keychain agent never does (false → the call falls back to the node
+ * path). The dispatch in authedIdpFetch checks it so the broker path is taken
+ * only when a broker is genuinely up.
  */
 export async function brokerAvailable(scope = 'main') {
   try {

@@ -90,10 +90,11 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
     ...(contentBytes ? { content_sha256: sha256Hex(contentBytes) } : {}),
   };
   // FORK1 Phase 3: a P-256 agent mints the record provenance JWS in the SIGNED
-  // BROKER (it holds the slot-seed key) when LASTID_BROKER_IDP is on AND a broker
-  // is up — byte-identical to signAgentRecordJws (node owns the JSON
-  // canonicalization). The broker is P-256-only, so Ed25519 agents and the
-  // no-broker path keep the local dual-algo signer.
+  // BROKER (it holds the slot-seed key) when the broker path is active (macOS
+  // default) AND a broker is up — byte-identical to signAgentRecordJws (node owns
+  // the JSON canonicalization). The brokerAvailable() guard means a broker-native
+  // agent signs in the broker; the broker is P-256-only, so Ed25519 agents and
+  // any no-broker (legacy) path keep the local dual-algo signer.
   const isEd25519 = signingKey?.asymmetricKeyType === 'ed25519';
   const recordScope = getActiveScope();
   let sig;
