@@ -28,6 +28,8 @@ import {
   brokerRuntimeDir,
   brokerSocketExistsSync,
   BrokerWsTransport,
+  brokerProvisionInitiate,
+  brokerProvisionPoll,
 } from '../lib/broker-ipc.js';
 
 let _n = 0;
@@ -375,6 +377,81 @@ test('brokerSignParentAuthorization: broker error → throws', async () => {
     await assert.rejects(
       brokerSignParentAuthorization({ socketPath: srv.socketPath, token: 't', claimsJson: '{}' }),
       /sign_parent_authorization failed: broker not_implemented/,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+// ── Phase 4: provisioning through the broker ────────────────────────────────
+
+test('brokerProvisionInitiate: sends kind=provision_initiate + optional fields, returns the handle', async () => {
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: true,
+    status: 200,
+    body: { provision_id: 'pv-1', user_code: 'WXYZ-1234', expires_in: 600, verification_uri: null },
+  }));
+  try {
+    const out = await brokerProvisionInitiate({
+      socketPath: srv.socketPath,
+      token: 't',
+      runtimeName: 'test-runtime',
+      projectHint: 'repo-x',
+    });
+    assert.equal(out.provisionId, 'pv-1');
+    assert.equal(out.userCode, 'WXYZ-1234');
+    assert.equal(out.expiresIn, 600);
+    const req = srv.received[0];
+    assert.equal(req.kind, 'provision_initiate');
+    assert.equal(req.runtime_name, 'test-runtime');
+    assert.equal(req.project_hint, 'repo-x');
+    assert.ok(!('parent_human_did' in req), 'absent optional omitted');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerProvisionPoll: pending → {status:pending}', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: true, status: 200, body: { status: 'pending' } }));
+  try {
+    const out = await brokerProvisionPoll({ socketPath: srv.socketPath, token: 't', provisionId: 'pv-1' });
+    assert.deepEqual(out, { status: 'pending' });
+    assert.equal(srv.received[0].kind, 'provision_poll');
+    assert.equal(srv.received[0].provision_id, 'pv-1');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerProvisionPoll: complete → carries agentDid/slotIndex/deviceId', async () => {
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: true,
+    status: 200,
+    body: { status: 'complete', agent_did: 'did:lastid:agent:zDnX', slot_index: 3, device_id: 'md-abc' },
+  }));
+  try {
+    const out = await brokerProvisionPoll({ socketPath: srv.socketPath, token: 't', provisionId: 'pv-1' });
+    assert.equal(out.status, 'complete');
+    assert.equal(out.agentDid, 'did:lastid:agent:zDnX');
+    assert.equal(out.slotIndex, 3);
+    assert.equal(out.deviceId, 'md-abc');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerProvisionPoll: wallet rejection (broker error) → throws', async () => {
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: false,
+    error: { code: 'bad_request', message: 'provisioning rejected by wallet: rejected_by_operator' },
+  }));
+  try {
+    await assert.rejects(
+      brokerProvisionPoll({ socketPath: srv.socketPath, token: 't', provisionId: 'pv-1' }),
+      /provision_poll failed: broker bad_request.*rejected by wallet/,
     );
   } finally {
     await srv.close();

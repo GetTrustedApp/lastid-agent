@@ -422,6 +422,107 @@ export async function brokerSignParentAuthorization({
 }
 
 /**
+ * Begin provisioning a NEW agent THROUGH the signed broker (FORK1 Phase 4). The
+ * broker generates the ephemeral ECDH envelope keypair + presents its machine SE
+ * pubkey to `/agent-provision/initiate`; node only relays the operator-facing
+ * `user_code` and the `provision_id` handle. The slot seed is BORN in the broker
+ * — it never enters this process even at provisioning time.
+ *
+ * @param {object} a
+ * @param {string} [a.scope]
+ * @param {string} [a.runtimeName]
+ * @param {string} [a.projectHint]
+ * @param {string} [a.parentHumanDid]
+ * @returns {Promise<{provisionId:string, userCode:string, expiresIn:number|null, verificationUri:string|null}>}
+ */
+export async function brokerProvisionInitiate({
+  scope = 'main',
+  runtimeName,
+  projectHint,
+  parentHumanDid,
+  socketPath,
+  token,
+  connect,
+  timeoutMs,
+} = {}) {
+  const sp = socketPath ?? brokerSocketPath(scope);
+  const tok = token ?? (await readBrokerToken(scope));
+  const fields = {};
+  if (runtimeName != null) fields.runtime_name = runtimeName;
+  if (projectHint != null) fields.project_hint = projectHint;
+  if (parentHumanDid != null) fields.parent_human_did = parentHumanDid;
+  const resp = await brokerIpcCall({
+    socketPath: sp,
+    token: tok,
+    kind: 'provision_initiate',
+    fields,
+    connect,
+    timeoutMs,
+  });
+  if (resp.error) {
+    const code = resp.error.code ?? 'broker_error';
+    throw new Error(`provision_initiate failed: broker ${code}: ${resp.error.message ?? ''}`);
+  }
+  const b = resp.body ?? {};
+  if (typeof b.provision_id !== 'string' || typeof b.user_code !== 'string') {
+    throw new Error(`provision_initiate: unexpected broker response ${JSON.stringify(b)}`);
+  }
+  return {
+    provisionId: b.provision_id,
+    userCode: b.user_code,
+    expiresIn: typeof b.expires_in === 'number' ? b.expires_in : null,
+    verificationUri: typeof b.verification_uri === 'string' ? b.verification_uri : null,
+  };
+}
+
+/**
+ * Poll a provisioning handle (FORK1 Phase 4). While the wallet hasn't decided,
+ * returns `{status:'pending'}`. On approval the broker has already unsealed the
+ * slot seed, claimed the VC, and PERSISTED everything to the keychain; it returns
+ * `{status:'complete', agentDid, slotIndex, deviceId}` — after which the broker
+ * exits so the supervisor relaunches it in agent mode. A wallet rejection throws.
+ *
+ * @param {object} a
+ * @param {string} [a.scope]
+ * @param {string} a.provisionId
+ * @returns {Promise<{status:'pending'}|{status:'complete', agentDid:string, slotIndex:number|null, deviceId:string|null}>}
+ */
+export async function brokerProvisionPoll({
+  scope = 'main',
+  provisionId,
+  socketPath,
+  token,
+  connect,
+  timeoutMs,
+} = {}) {
+  const sp = socketPath ?? brokerSocketPath(scope);
+  const tok = token ?? (await readBrokerToken(scope));
+  const resp = await brokerIpcCall({
+    socketPath: sp,
+    token: tok,
+    kind: 'provision_poll',
+    fields: { provision_id: provisionId },
+    connect,
+    timeoutMs,
+  });
+  if (resp.error) {
+    const code = resp.error.code ?? 'broker_error';
+    throw new Error(`provision_poll failed: broker ${code}: ${resp.error.message ?? ''}`);
+  }
+  const b = resp.body ?? {};
+  if (b.status === 'pending') return { status: 'pending' };
+  if (b.status === 'complete' && typeof b.agent_did === 'string') {
+    return {
+      status: 'complete',
+      agentDid: b.agent_did,
+      slotIndex: typeof b.slot_index === 'number' ? b.slot_index : null,
+      deviceId: typeof b.device_id === 'string' ? b.device_id : null,
+    };
+  }
+  throw new Error(`provision_poll: unexpected broker response ${JSON.stringify(b)}`);
+}
+
+/**
  * Synchronous "is a broker up for this scope?" — both the socket AND the
  * per-launch token must exist. The async {@link brokerAvailable} is the
  * authority, but the WS client's `#openSocket` is synchronous (it mirrors
