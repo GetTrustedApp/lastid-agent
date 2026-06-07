@@ -55,8 +55,21 @@ export function deriveWrapKey(slotSeed) {
   );
 }
 
-export function sealStateBlob(slotSeed, stateB64) {
-  const key = deriveWrapKey(slotSeed);
+/** Validate a 32-byte AES key (the broker-derived wrap key or deriveWrapKey). */
+function requireWrapKey(key) {
+  if (!(key instanceof Uint8Array) || key.length !== 32) {
+    throw new Error('mls-state-store: wrap key must be a 32-byte buffer');
+  }
+  return key;
+}
+
+/**
+ * Seal with a PRE-DERIVED 32-byte wrap key. MLS-custody: a broker-native agent
+ * gets this key from the broker (brokerDeriveMlsStateKey) — byte-identical to
+ * deriveWrapKey — so it never holds the raw seed. Same wire shape either way.
+ */
+export function sealStateBlobWithKey(key, stateB64) {
+  requireWrapKey(key);
   const nonce = randomBytes(STATE_NONCE_LEN);
   const cipher = createCipheriv('aes-256-gcm', key, nonce);
   const plaintext = Buffer.from(stateB64, 'utf-8');
@@ -66,7 +79,13 @@ export function sealStateBlob(slotSeed, stateB64) {
   return Buffer.concat([Buffer.from([1]), nonce, tag, ct]).toString('base64');
 }
 
-export function openStateBlob(slotSeed, blobB64) {
+export function sealStateBlob(slotSeed, stateB64) {
+  return sealStateBlobWithKey(deriveWrapKey(slotSeed), stateB64);
+}
+
+/** Open with a PRE-DERIVED 32-byte wrap key (MLS-custody; see sealStateBlobWithKey). */
+export function openStateBlobWithKey(key, blobB64) {
+  requireWrapKey(key);
   const blob = Buffer.from(blobB64, 'base64');
   if (blob.length < 1 + STATE_NONCE_LEN + 16 || blob[0] !== 1) {
     throw new Error('mls-state-store: state blob has unexpected version/length');
@@ -74,11 +93,14 @@ export function openStateBlob(slotSeed, blobB64) {
   const nonce = blob.subarray(1, 1 + STATE_NONCE_LEN);
   const tag = blob.subarray(1 + STATE_NONCE_LEN, 1 + STATE_NONCE_LEN + 16);
   const ct = blob.subarray(1 + STATE_NONCE_LEN + 16);
-  const key = deriveWrapKey(slotSeed);
   const decipher = createDecipheriv('aes-256-gcm', key, nonce);
   decipher.setAuthTag(tag);
   const pt = Buffer.concat([decipher.update(ct), decipher.final()]);
   return pt.toString('utf-8');
+}
+
+export function openStateBlob(slotSeed, blobB64) {
+  return openStateBlobWithKey(deriveWrapKey(slotSeed), blobB64);
 }
 
 /**
@@ -96,13 +118,18 @@ export function openStateBlob(slotSeed, blobB64) {
  *   atomically (tmp + rename) so a crash mid-write never truncates the live
  *   file. Awaited by the wasm so the JS Promise only resolves once durable.
  *
- * @param {{ slotSeed: Uint8Array, scope?: string, log?: (line:string)=>void }} a
+ * Supply EITHER `slotSeed` (legacy: derives the wrap key in node) OR `wrapKey`
+ * (MLS-custody: the broker-derived 32-byte key, so node never holds the raw
+ * seed). They produce the identical wire key, so a file sealed under one opens
+ * under the other.
+ *
+ * @param {{ slotSeed?: Uint8Array, wrapKey?: Uint8Array, scope?: string, log?: (line:string)=>void }} a
  * @returns {{ loadBlob: () => Promise<string|null>, flushBlob: (b64:string) => Promise<void> }}
  */
-export function diskKvCallbacks({ slotSeed, scope, log }) {
-  if (!(slotSeed instanceof Uint8Array) || slotSeed.length !== 32) {
-    throw new Error('diskKvCallbacks: slotSeed must be a 32-byte Uint8Array');
-  }
+export function diskKvCallbacks({ slotSeed, wrapKey, scope, log }) {
+  // Resolve the 32-byte wrap key from whichever source was given. wrapKey wins
+  // (broker-native); else derive from the raw seed (legacy).
+  const key = wrapKey != null ? requireWrapKey(wrapKey) : deriveWrapKey(slotSeed);
   const resolvedScope = scope ?? 'main';
   const path = stateFilePath(resolvedScope);
   const warn =
@@ -111,7 +138,7 @@ export function diskKvCallbacks({ slotSeed, scope, log }) {
   const loadBlob = async () => {
     try {
       const blob = await readFile(path, 'utf-8');
-      return openStateBlob(slotSeed, blob.trim());
+      return openStateBlobWithKey(key, blob.trim());
     } catch (err) {
       if (err && err.code === 'ENOENT') return null;
       warn(
@@ -122,7 +149,7 @@ export function diskKvCallbacks({ slotSeed, scope, log }) {
   };
 
   const flushBlob = async (stateB64) => {
-    const sealed = sealStateBlob(slotSeed, stateB64);
+    const sealed = sealStateBlobWithKey(key, stateB64);
     await mkdir(dirname(path), { recursive: true });
     // Atomic write: tmp + rename so a crash mid-write can't truncate the
     // live sealed state and brick the agent's MLS identity.
