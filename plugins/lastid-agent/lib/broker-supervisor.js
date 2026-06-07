@@ -62,6 +62,8 @@ async function fileExists(p) {
  * @param {string} [a.idpUrl]
  * @param {string} [a.platform]
  * @param {boolean} [a.enabled]            - default brokerIdpEnabled()
+ * @param {boolean} [a.reprovision]        - pass --reprovision (reissue: force
+ *   provisioning-only even if a seed already exists for the scope)
  * @param {string} [a.brokerPath]          - default resolveBrokerPath()
  * @param {typeof import('node:child_process').spawn} [a.spawnImpl]
  * @param {typeof brokerHealth} [a.healthImpl]
@@ -78,6 +80,7 @@ export async function startBrokerSupervisor({
   idpUrl,
   platform = process.platform,
   enabled,
+  reprovision = false,
   brokerPath,
   spawnImpl = spawn,
   healthImpl = brokerHealth,
@@ -119,6 +122,11 @@ export async function startBrokerSupervisor({
     // fails closed on an unknown argument). Just --scope (+ --idp for dev/mock).
     const args = ['--scope', scope];
     if (idpUrl) args.push('--idp', idpUrl);
+    // Reissue: force the broker into provisioning-only mode even though a seed
+    // exists for this scope (it would otherwise boot agent-mode and reject
+    // ProvisionInitiate). The fresh provision overwrites the old protected-store
+    // seed. Node can't clear that seed itself (it's in the broker's access group).
+    if (reprovision) args.push('--reprovision');
     const c = spawnImpl(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
     if (c?.stdout?.on) c.stdout.on('data', (d) => log(`[broker] ${String(d).trimEnd()}`));
     if (c?.stderr?.on) c.stderr.on('data', (d) => log(`[broker] ${String(d).trimEnd()}`));

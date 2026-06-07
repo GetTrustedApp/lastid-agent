@@ -93,8 +93,23 @@ test('spawns the broker with --scope (+--idp), NO serve subcommand, and reports 
   assert.equal(calls[0].bin, '/fake/broker');
   assert.deepEqual(calls[0].args, ['--scope', 'tscope', '--idp', 'http://127.0.0.1:3000']);
   assert.ok(!calls[0].args.includes('serve'), 'must NOT pass a serve subcommand');
+  assert.ok(!calls[0].args.includes('--reprovision'), 'no --reprovision unless reissue');
   assert.equal(h.ready, true);
   assert.equal(h.pid, 777);
+});
+
+test('reissue: reprovision=true appends --reprovision (force provisioning-only over an existing seed)', async () => {
+  const calls = [];
+  const h = await startBrokerSupervisor({
+    ...baseOpts,
+    reprovision: true,
+    spawnImpl: (bin, args, opts) => {
+      calls.push({ bin, args, opts });
+      return fakeChild(778);
+    },
+  });
+  assert.deepEqual(calls[0].args, ['--scope', 'tscope', '--idp', 'http://127.0.0.1:3000', '--reprovision']);
+  assert.equal(h.ready, true);
 });
 
 test('not-ready within timeout → handle returned with ready:false (still supervising)', async () => {

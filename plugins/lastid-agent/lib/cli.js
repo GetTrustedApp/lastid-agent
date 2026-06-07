@@ -413,6 +413,11 @@ async function cmdProvision(flags) {
     const provBroker = await startBrokerSupervisor({
       scope,
       idpUrl,
+      // Reissue: force the broker provisioning-only so it mints a NEW identity
+      // that overwrites the old protected-store seed. Without this the broker
+      // boots agent-mode off the existing seed and ProvisionInitiate fails
+      // (not_implemented — already provisioned).
+      reprovision: reissue && !!existing,
       log: (l) => process.stderr.write(`${l}\n`),
     });
     if (provBroker?.ready) {
