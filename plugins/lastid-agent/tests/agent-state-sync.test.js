@@ -481,3 +481,92 @@ test('REGRESSION: a legacy single-cursor store re-pulls every kind from 0 (self-
   assert.equal(store.cursorFor('memory'), 0);
   assert.equal(store.cursorFor('rule'), 0);
 });
+
+// ── FORK1 broker content-decrypt (Phase 3) ───────────────────────────────────
+// When the broker is up, syncAgentState decrypts each active record THROUGH the
+// broker (it holds the seeds) instead of locally. Injected so no real broker.
+
+test('broker decrypt: the broker bytes are what get applied (not the local decrypt)', async () => {
+  const store = freshStore();
+  // The wire ciphertext is valid (would decode locally), but the broker resolves
+  // NON-JSON. If the broker bytes are the ones used, decode fails → applied 0.
+  // (If the code ignored the broker and decoded locally, it would apply 1.) This
+  // proves the broker plaintext — not the local decrypt — is what flows through.
+  const idp = makeFakeIdp({
+    rules: [rule('r1', { tool: 'Bash', pattern: 'x', severity: 'deny' }, 1)],
+  });
+  let calls = 0;
+  const res = await syncAgentState({
+    ...auth,
+    store,
+    fetchImpl: idp.fetchImpl,
+    _brokerEnabled: () => true,
+    _brokerAvailable: async () => true,
+    _brokerDecryptContent: async () => {
+      calls += 1;
+      return Buffer.from('not-json-from-broker', 'utf8'); // resolves (no throw) → these bytes are used
+    },
+  });
+  assert.equal(calls, 1, 'the active record was decrypted via the broker');
+  assert.equal(res.applied, 0, 'broker bytes (non-JSON) were applied → record rejected');
+});
+
+test('broker decrypt: passes the record enc_b64 + (only for project) routing_id', async () => {
+  const store = freshStore();
+  const enc = encryptJson(SEED, { tool: 'Bash', severity: 'deny' }).toString('base64');
+  const idp = makeFakeIdp({
+    rules: [{ id: 'r1', kind: 'rule', target: 'global', status: 'active', version: 1, cursor: 1, enc_b64: enc }],
+  });
+  const calls = [];
+  await syncAgentState({
+    ...auth,
+    store,
+    fetchImpl: idp.fetchImpl,
+    _brokerEnabled: () => true,
+    _brokerAvailable: async () => true,
+    _brokerDecryptContent: async (a) => {
+      calls.push(a);
+      return Buffer.from(JSON.stringify({ tool: 'Bash', severity: 'deny' }), 'utf8');
+    },
+  });
+  assert.equal(calls[0].envelopeB64, enc, 'the record enc_b64 is handed to the broker');
+  assert.equal(calls[0].routingId, undefined, 'global/slot-tier record → no routing_id');
+});
+
+test('broker decrypt: a broker failure falls back to the LOCAL decode (record not stranded)', async () => {
+  const store = freshStore();
+  const idp = makeFakeIdp({
+    rules: [rule('r1', { tool: 'Bash', pattern: 'x', severity: 'deny' }, 1)],
+  });
+  const res = await syncAgentState({
+    ...auth,
+    store,
+    fetchImpl: idp.fetchImpl,
+    _brokerEnabled: () => true,
+    _brokerAvailable: async () => true,
+    _brokerDecryptContent: async () => {
+      throw new Error('broker down mid-sync');
+    },
+  });
+  // Falls back to local decrypt of enc_b64 → the record still applies.
+  assert.equal(res.applied, 1, 'broker failure must not strand the record');
+});
+
+test('broker decrypt: OFF (default) → no broker call, local decode path', async () => {
+  const store = freshStore();
+  const idp = makeFakeIdp({ rules: [rule('r1', { tool: 'Bash', severity: 'deny' }, 1)] });
+  let called = false;
+  const res = await syncAgentState({
+    ...auth,
+    store,
+    fetchImpl: idp.fetchImpl,
+    _brokerEnabled: () => false,
+    _brokerAvailable: async () => true,
+    _brokerDecryptContent: async () => {
+      called = true;
+      return Buffer.alloc(0);
+    },
+  });
+  assert.equal(called, false, 'flag off → broker decrypt never invoked');
+  assert.equal(res.applied, 1);
+});

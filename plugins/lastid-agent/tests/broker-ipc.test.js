@@ -299,11 +299,12 @@ test('brokerDecryptContent: slot-tier sends kind=decrypt_agent_content + envelop
   }
 });
 
-test('brokerDecryptContent: project tier includes project_key', async () => {
+test('brokerDecryptContent: project tier includes routing_id (the wire id, not the repo name)', async () => {
   const srv = await startServer((req) => ({ id: req.id, ok: true, status: 200, body: { plaintext_b64: '' } }));
   try {
-    await brokerDecryptContent({ socketPath: srv.socketPath, token: 't', envelopeB64: 'X', projectKey: 'my-repo' });
-    assert.equal(srv.received[0].project_key, 'my-repo');
+    await brokerDecryptContent({ socketPath: srv.socketPath, token: 't', envelopeB64: 'X', routingId: 'a1b2c3' });
+    assert.equal(srv.received[0].routing_id, 'a1b2c3');
+    assert.ok(!('project_key' in srv.received[0]), 'repo name never crosses the wire');
   } finally {
     await srv.close();
   }

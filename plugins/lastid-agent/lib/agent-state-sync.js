@@ -16,6 +16,8 @@
  * approval rows). RULES are fail-closed — an unverified rule is dropped.
  */
 import { authedIdpFetch } from './mls-groups-api.js';
+import { brokerAvailable, brokerDecryptContent } from './broker-ipc.js';
+import { brokerIdpEnabled } from './broker-supervisor.js';
 import { decryptContent } from './agent-content-crypto.js';
 import { applyVaultRecords, refreshCliBindings } from './vault-cache.js';
 import {
@@ -44,7 +46,7 @@ export const SUBAGENTS_PATH = '/v1/agent-state/subagents';
  * removes them. Active records decrypt their JSON content. Returns the
  * store record plus the raw decrypted bytes (for signature/hash checks).
  */
-export function decodeRecord(record, slotSeed, projectRootSeed = null) {
+export function decodeRecord(record, slotSeed, projectRootSeed = null, opts = {}) {
   // A shared record (wire target 'project') whose routing_id matches the
   // operator's GLOBAL routing is a global memory OR rule riding the project
   // Option-B rails — retarget it to 'global' so it injects/enforces ALWAYS
@@ -86,7 +88,12 @@ export function decodeRecord(record, slotSeed, projectRootSeed = null) {
   // NOT the agent's slot_seed. Without the project seed (older agent) we can't
   // read them — surface as undecryptable so the caller skips, not crashes.
   let contentBytes;
-  if (record.target === 'project') {
+  if (Buffer.isBuffer(opts.decryptedContent)) {
+    // FORK1 Phase 3: the SIGNED BROKER already decrypted this record (it holds
+    // the slot/project seeds). We use those plaintext bytes directly — the seeds
+    // never reach node. Verification downstream runs on these same bytes.
+    contentBytes = opts.decryptedContent;
+  } else if (record.target === 'project') {
     if (!Buffer.isBuffer(projectRootSeed) || typeof record.routing_id !== 'string') {
       throw new Error('project record but no project_root_seed/routing_id');
     }
@@ -152,6 +159,11 @@ export async function syncAgentState({
   operatorJwk = null,
   verifyRecord = null,
   onReject = null,
+  // Injectable so the FORK1 broker-decrypt path is unit-testable without a real
+  // broker. Default to the module-level broker helpers.
+  _brokerEnabled = brokerIdpEnabled,
+  _brokerAvailable = brokerAvailable,
+  _brokerDecryptContent = brokerDecryptContent,
 }) {
   if (typeof fetchImpl !== 'function') {
     throw new Error('syncAgentState: no fetch implementation available');
@@ -262,15 +274,42 @@ export async function syncAgentState({
     selfProtection.cursor ?? 0,
     subagents.cursor ?? 0,
   );
+  // FORK1 Phase 3: when the signed broker is up, decrypt record content THERE
+  // (it holds the slot/project seeds) rather than in node. Checked ONCE per
+  // sync, not per record. Content decryption keys off the slot/project seed
+  // (not the identity key), so it works for any agent algo.
+  const brokerDecryptOn = _brokerEnabled() && (await _brokerAvailable(scope));
+
   const decoded = [];
   let reconciled = 0;
   for (const rec of all) {
     if (typeof rec.cursor === 'number' && rec.cursor > maxCursor) maxCursor = rec.cursor;
 
+    // Pre-decrypt active records via the broker when it's up. On any broker
+    // failure, fall back to the local decode below (node still holds the seeds
+    // pre-lockdown), so a transient broker hiccup never strands a record.
+    let decryptedContent;
+    if (brokerDecryptOn && rec.status === 'active' && typeof rec.enc_b64 === 'string') {
+      try {
+        decryptedContent = await _brokerDecryptContent({
+          scope,
+          envelopeB64: rec.enc_b64,
+          routingId: rec.target === 'project' ? rec.routing_id : undefined,
+        });
+      } catch {
+        decryptedContent = undefined;
+      }
+    }
+
     let storeRecord;
     let contentBytes = null;
     try {
-      const d = decodeRecord(rec, slotSeed, projectRootSeed);
+      const d = decodeRecord(
+        rec,
+        slotSeed,
+        projectRootSeed,
+        Buffer.isBuffer(decryptedContent) ? { decryptedContent } : {},
+      );
       storeRecord = d.storeRecord;
       contentBytes = d.contentBytes;
     } catch (err) {

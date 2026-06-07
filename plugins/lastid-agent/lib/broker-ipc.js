@@ -300,13 +300,15 @@ export async function brokerSignAgentRecord({
  * @param {object} a
  * @param {string} [a.scope]
  * @param {string} a.envelopeB64    - standard base64 of the packed LIDE envelope
- * @param {string|null} [a.projectKey] - set for project-tier content; absent → slot-seed
+ * @param {string|null} [a.routingId] - the record's wire routing_id for project-tier
+ *   content; absent → slot-seed (agent/global). The consumer holds routing_id, not
+ *   the repo name (which is inside the ciphertext).
  * @returns {Promise<Buffer>} the decrypted plaintext bytes
  */
 export async function brokerDecryptContent({
   scope = 'main',
   envelopeB64,
-  projectKey,
+  routingId,
   socketPath,
   token,
   connect,
@@ -315,7 +317,7 @@ export async function brokerDecryptContent({
   const sp = socketPath ?? brokerSocketPath(scope);
   const tok = token ?? (await readBrokerToken(scope));
   const fields = { envelope_b64: envelopeB64 };
-  if (projectKey != null) fields.project_key = projectKey;
+  if (routingId != null) fields.routing_id = routingId;
   const resp = await brokerIpcCall({
     socketPath: sp,
     token: tok,
