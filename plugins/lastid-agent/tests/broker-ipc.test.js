@@ -30,6 +30,7 @@ import {
   BrokerWsTransport,
   brokerProvisionInitiate,
   brokerProvisionPoll,
+  brokerDeriveMlsStateKey,
 } from '../lib/broker-ipc.js';
 
 let _n = 0;
@@ -377,6 +378,60 @@ test('brokerSignParentAuthorization: broker error → throws', async () => {
     await assert.rejects(
       brokerSignParentAuthorization({ socketPath: srv.socketPath, token: 't', claimsJson: '{}' }),
       /sign_parent_authorization failed: broker not_implemented/,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+// ── MLS-custody: MLS state wrap-key through the broker ──────────────────────
+
+test('brokerDeriveMlsStateKey: sends kind=derive_mls_state_key, returns a 32-byte key Buffer', async () => {
+  const key = Buffer.alloc(32, 0x9c);
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: true,
+    status: 200,
+    body: { key_b64: key.toString('base64') },
+  }));
+  try {
+    const out = await brokerDeriveMlsStateKey({ socketPath: srv.socketPath, token: 't' });
+    assert.ok(Buffer.isBuffer(out) && out.length === 32);
+    assert.ok(out.equals(key));
+    assert.equal(srv.received[0].kind, 'derive_mls_state_key');
+    assert.ok(!('method' in srv.received[0]), 'no idp_call fields leak in');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerDeriveMlsStateKey: a non-32-byte key → throws', async () => {
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: true,
+    status: 200,
+    body: { key_b64: Buffer.alloc(16).toString('base64') },
+  }));
+  try {
+    await assert.rejects(
+      brokerDeriveMlsStateKey({ socketPath: srv.socketPath, token: 't' }),
+      /unexpected broker response/,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerDeriveMlsStateKey: broker error → throws', async () => {
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: false,
+    error: { code: 'not_implemented', message: 'no slot seed' },
+  }));
+  try {
+    await assert.rejects(
+      brokerDeriveMlsStateKey({ socketPath: srv.socketPath, token: 't' }),
+      /derive_mls_state_key failed: broker not_implemented/,
     );
   } finally {
     await srv.close();
