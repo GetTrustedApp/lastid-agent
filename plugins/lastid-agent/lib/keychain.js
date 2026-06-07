@@ -50,22 +50,34 @@ const SERVICE_SUB_SLOT_SEED = 'lastid.co/sub-agent-slot-seed';
 const SERVICE_SUB_VC = 'lastid.co/sub-agent-vc';
 
 /**
- * Load the top-level agent's identity bundle from keychain. Returns
- * null if any required piece is missing.
+ * Load the top-level agent's identity bundle from keychain. Returns null when
+ * UNPROVISIONED (no VC).
+ *
+ * `slotSeed` is a Buffer for a LEGACY agent (seed in the login keychain) but
+ * `null` for a BROKER-NATIVE agent — one the signed broker provisioned, whose
+ * seed lives ONLY in the broker's protected store and is unreadable here. Such a
+ * bundle carries `brokerNative: true`; the listener then sources all seed-derived
+ * material (MLS wrap key, content crypto, signing) from the broker, never the raw
+ * seed. (The headline custody win: node holds the VC + metadata, never the seed.)
  */
 export async function loadAgentVc(scope = 'main') {
   const seedB64 = await readSecret(`${SERVICE_SLOT_SEED}:${scope}`);
   const vcCompact = await readSecret(`${SERVICE_VC}:${scope}`);
-  if (!seedB64 || !vcCompact) return null;
+  // No VC → genuinely unprovisioned. (A missing seed with a present VC is the
+  // broker-native case, NOT unprovisioned — handled below.)
+  if (!vcCompact) return null;
   const slotIndexStr = await readSecret(`${SERVICE_SLOT_INDEX}:${scope}`);
   const agentDid = await readSecret(`${SERVICE_AGENT_DID}:${scope}`);
   const deviceId = await readSecret(`${SERVICE_DEVICE_ID}:${scope}`);
   const idpUrl = await readSecret(`${SERVICE_IDP_URL}:${scope}`);
   const projectRootSeedB64 = await readSecret(`${SERVICE_PROJECT_ROOT_SEED}:${scope}`);
+  const slotSeed = seedB64 ? Buffer.from(seedB64, 'base64url') : null;
   return {
-    slotSeed: Buffer.from(seedB64, 'base64url'),
-    // Optional — null for agents provisioned before project memories existed
-    // (they get global+agent memories only until re-provisioned).
+    // Buffer for a legacy agent; null for broker-native (seed in the broker).
+    slotSeed,
+    brokerNative: slotSeed === null,
+    // Optional — null for agents provisioned before project memories existed,
+    // AND for broker-native agents (their project seed is in the broker).
     projectRootSeed: projectRootSeedB64
       ? Buffer.from(projectRootSeedB64, 'base64url')
       : null,
