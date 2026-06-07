@@ -550,6 +550,45 @@ export async function brokerDeriveMlsStateKey({
 }
 
 /**
+ * Derive the agent's operator-store MAC key via the signed broker (MLS-custody).
+ * The broker holds the slot seed and returns the 32-byte HKDF key node uses to
+ * integrity-MAC its at-rest operator-store (rules/memories) — byte-identical to
+ * `operator-store.js deriveOperatorStateMacKey`. A broker-native agent fetches it
+ * once per session so the raw seed never reaches node yet the MAC still verifies.
+ *
+ * @param {object} a
+ * @param {string} [a.scope]
+ * @returns {Promise<Buffer>} the 32-byte MAC key
+ */
+export async function brokerDeriveOperatorStoreMacKey({
+  scope = 'main',
+  socketPath,
+  token,
+  connect,
+  timeoutMs,
+} = {}) {
+  const sp = socketPath ?? brokerSocketPath(scope);
+  const tok = token ?? (await readBrokerToken(scope));
+  const resp = await brokerIpcCall({
+    socketPath: sp,
+    token: tok,
+    kind: 'derive_operator_store_mac_key',
+    connect,
+    timeoutMs,
+  });
+  if (resp.error) {
+    const code = resp.error.code ?? 'broker_error';
+    throw new Error(`derive_operator_store_mac_key failed: broker ${code}: ${resp.error.message ?? ''}`);
+  }
+  const b64 = resp.body?.key_b64;
+  const key = typeof b64 === 'string' ? Buffer.from(b64, 'base64') : null;
+  if (!key || key.length !== 32) {
+    throw new Error(`derive_operator_store_mac_key: unexpected broker response ${JSON.stringify(resp.body)}`);
+  }
+  return key;
+}
+
+/**
  * Begin provisioning a NEW agent THROUGH the signed broker (FORK1 Phase 4). The
  * broker generates the ephemeral ECDH envelope keypair + presents its machine SE
  * pubkey to `/agent-provision/initiate`; node only relays the operator-facing
