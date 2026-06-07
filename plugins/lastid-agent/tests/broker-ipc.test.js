@@ -31,6 +31,7 @@ import {
   brokerProvisionInitiate,
   brokerProvisionPoll,
   brokerDeriveMlsStateKey,
+  brokerEncryptContent,
 } from '../lib/broker-ipc.js';
 
 let _n = 0;
@@ -378,6 +379,54 @@ test('brokerSignParentAuthorization: broker error → throws', async () => {
     await assert.rejects(
       brokerSignParentAuthorization({ socketPath: srv.socketPath, token: 't', claimsJson: '{}' }),
       /sign_parent_authorization failed: broker not_implemented/,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+// ── MLS-custody: content encrypt through the broker ─────────────────────────
+
+test('brokerEncryptContent: sends kind=encrypt_agent_content + plaintext_b64, returns the envelope Buffer', async () => {
+  const env = Buffer.from('LIDE-packed-envelope-bytes');
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: true,
+    status: 200,
+    body: { envelope_b64: env.toString('base64') },
+  }));
+  try {
+    const out = await brokerEncryptContent({
+      socketPath: srv.socketPath,
+      token: 't',
+      plaintext: Buffer.from('authored memory'),
+    });
+    assert.ok(Buffer.isBuffer(out) && out.equals(env));
+    const req = srv.received[0];
+    assert.equal(req.kind, 'encrypt_agent_content');
+    assert.equal(Buffer.from(req.plaintext_b64, 'base64').toString('utf8'), 'authored memory');
+    assert.ok(!('routing_id' in req), 'slot tier omits routing_id');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerEncryptContent: project tier passes routing_id', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: true, status: 200, body: { envelope_b64: '' } }));
+  try {
+    await brokerEncryptContent({ socketPath: srv.socketPath, token: 't', plaintext: Buffer.from('x'), routingId: 'rid-1' });
+    assert.equal(srv.received[0].routing_id, 'rid-1');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerEncryptContent: broker error → throws', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: false, error: { code: 'bad_request', message: 'no project seed' } }));
+  try {
+    await assert.rejects(
+      brokerEncryptContent({ socketPath: srv.socketPath, token: 't', plaintext: Buffer.from('x'), routingId: 'r' }),
+      /encrypt_agent_content failed: broker bad_request/,
     );
   } finally {
     await srv.close();

@@ -340,6 +340,51 @@ export async function brokerDecryptContent({
 }
 
 /**
+ * Encrypt authored content via the signed broker (MLS-custody) — the inverse of
+ * {@link brokerDecryptContent} and the last node authoring path that derived a
+ * content key from the slot seed (`agent-content-crypto.js encryptContent`). The
+ * broker holds the seed(s) and returns the packed LIDE envelope; a recipient (JS
+ * decryptContent or the broker's own decrypt op) opens it under the same seed.
+ *
+ * @param {object} a
+ * @param {string} [a.scope]
+ * @param {Buffer|Uint8Array} a.plaintext  - the content bytes to seal
+ * @param {string|null} [a.routingId]      - project tier routing id; absent → slot/global
+ * @returns {Promise<Buffer>} the packed LIDE envelope bytes
+ */
+export async function brokerEncryptContent({
+  scope = 'main',
+  plaintext,
+  routingId,
+  socketPath,
+  token,
+  connect,
+  timeoutMs,
+} = {}) {
+  const sp = socketPath ?? brokerSocketPath(scope);
+  const tok = token ?? (await readBrokerToken(scope));
+  const fields = { plaintext_b64: Buffer.from(plaintext).toString('base64') };
+  if (routingId != null) fields.routing_id = routingId;
+  const resp = await brokerIpcCall({
+    socketPath: sp,
+    token: tok,
+    kind: 'encrypt_agent_content',
+    fields,
+    connect,
+    timeoutMs,
+  });
+  if (resp.error) {
+    const code = resp.error.code ?? 'broker_error';
+    throw new Error(`encrypt_agent_content failed: broker ${code}: ${resp.error.message ?? ''}`);
+  }
+  const b64 = resp.body?.envelope_b64;
+  if (typeof b64 !== 'string') {
+    throw new Error(`encrypt_agent_content: unexpected broker response ${JSON.stringify(resp.body)}`);
+  }
+  return Buffer.from(b64, 'base64');
+}
+
+/**
  * Derive a sub-agent's 32-byte seed via the signed broker (FORK1 Phase 3 op 4).
  * The PARENT slot seed stays in the broker; only the derived sub-seed (the new
  * sub-agent's own credential) comes back. Byte-identical to the SDK
