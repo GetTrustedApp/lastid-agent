@@ -84,15 +84,18 @@ export class MlsClient {
    * are flushed back via flushBlob after every state-mutating op. If the
    * file is missing or unparseable we start fresh.
    */
-  static async open({ agentDid, slotSeed, scope, deviceId: persistedDeviceId }) {
+  static async open({ agentDid, slotSeed, wrapKey, scope, deviceId: persistedDeviceId }) {
     const resolvedScope = scope ?? 'main';
     // Stamp this agent's device_id into every credential this client builds so
     // peers can map our leaf→device (matches the orchestrator handle + the
     // device_id the IdP key-package store is keyed by). `resolveAgentDeviceId`
     // returns the value PINNED at provisioning (`md-…` for a machine-bound
     // agent) or the legacy `ad-…` derivation when none was persisted — the
-    // no-flag-day seam, byte-identical to today for existing agents. Falls back
-    // to a bare-DID credential if the seed isn't a valid 32-byte buffer.
+    // no-flag-day seam, byte-identical to today for existing agents.
+    //
+    // MLS-custody: a broker-native agent passes `wrapKey` (no raw seed); it is
+    // always machine-bound, so its device_id is the pinned `md-…` — no seed
+    // needed to resolve it. Legacy agents pass `slotSeed` and derive as before.
     const deviceId =
       slotSeed instanceof Uint8Array && slotSeed.length === 32
         ? resolveAgentDeviceId({
@@ -100,10 +103,10 @@ export class MlsClient {
             slotSeed: Buffer.from(slotSeed),
             agentDid,
           })
-        : undefined;
+        : (persistedDeviceId ?? undefined);
     const handle = await wasm.createPersistentBotClientWithCallbacks(
       agentDid,
-      diskKvCallbacks({ slotSeed, scope: resolvedScope }),
+      diskKvCallbacks({ slotSeed, wrapKey, scope: resolvedScope }),
       deviceId,
     );
     return new MlsClient({ handle, agentDid, deviceId: deviceId ?? null });

@@ -417,15 +417,19 @@ export async function getOrchestrator(ctx, { deps = {}, wasmImpl = wasm } = {}) 
     );
   }
   const makeKvCallbacks = deps.makeKvCallbacks ?? diskKvCallbacks;
-  if (!deps.makeKvCallbacks) {
-    // The disk backend needs the 32-byte slot seed; a test injecting its own
-    // backend via deps.makeKvCallbacks is exempt.
-    if (!(ctx.slotSeed instanceof Uint8Array) || ctx.slotSeed.length !== 32) {
-      throw new Error('getOrchestrator: ctx.slotSeed (32-byte Uint8Array) required for the disk backend');
-    }
+  // MLS-custody: a broker-native agent supplies `ctx.wrapKey` (the broker-derived
+  // at-rest key) and NO raw seed; a legacy agent supplies `ctx.slotSeed`. The disk
+  // backend needs one of them; a test injecting its own backend is exempt.
+  const haveWrapKey = ctx.wrapKey instanceof Uint8Array && ctx.wrapKey.length === 32;
+  const haveSeed = ctx.slotSeed instanceof Uint8Array && ctx.slotSeed.length === 32;
+  if (!deps.makeKvCallbacks && !haveWrapKey && !haveSeed) {
+    throw new Error(
+      'getOrchestrator: ctx.wrapKey or ctx.slotSeed (32-byte Uint8Array) required for the disk backend',
+    );
   }
   const kvCallbacks = makeKvCallbacks({
     slotSeed: ctx.slotSeed,
+    wrapKey: ctx.wrapKey,
     scope: ctx.scope,
     log: ctx.log,
   });
@@ -439,6 +443,8 @@ export async function getOrchestrator(ctx, { deps = {}, wasmImpl = wasm } = {}) 
   // no-flag-day seam (existing agents unchanged). Only derivable with the real
   // slot seed; a test backend (deps.makeKvCallbacks, no seed) leaves it
   // undefined → bare-DID credential.
+  // A broker-native agent (wrapKey, no seed) is always machine-bound → its
+  // device_id is the pinned `md-…` (ctx.deviceId), no seed needed to resolve it.
   const deviceId =
     ctx.slotSeed instanceof Uint8Array && ctx.slotSeed.length === 32
       ? resolveAgentDeviceId({
@@ -446,7 +452,7 @@ export async function getOrchestrator(ctx, { deps = {}, wasmImpl = wasm } = {}) 
           slotSeed: Buffer.from(ctx.slotSeed),
           agentDid: ctx.agentDid,
         })
-      : undefined;
+      : (ctx.deviceId ?? undefined);
 
   ctx.__mlsOrchestratorPending = (async () => {
     const orch = await factory(
