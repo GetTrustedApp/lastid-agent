@@ -20,6 +20,8 @@ import {
   brokerAvailable,
   brokerSignAgentRecord,
   brokerDecryptContent,
+  brokerDeriveSubAgentSeed,
+  brokerSignParentAuthorization,
   brokerSocketPath,
   brokerTokenPath,
   brokerRuntimeDir,
@@ -316,6 +318,60 @@ test('brokerDecryptContent: broker error (wrong key / tamper) → throws', async
     await assert.rejects(
       brokerDecryptContent({ socketPath: srv.socketPath, token: 't', envelopeB64: 'X' }),
       /decrypt_agent_content failed: broker bad_request/,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerDeriveSubAgentSeed: sends kind+class_slug+index, returns a 32-byte seed Buffer', async () => {
+  const seed = Buffer.alloc(32, 7);
+  const srv = await startServer((req) => ({ id: req.id, ok: true, status: 200, body: { sub_seed_b64: seed.toString('base64') } }));
+  try {
+    const out = await brokerDeriveSubAgentSeed({ socketPath: srv.socketPath, token: 't', classSlug: 'refund-bot', index: 3 });
+    assert.ok(Buffer.isBuffer(out) && out.length === 32);
+    assert.ok(out.equals(seed));
+    const req = srv.received[0];
+    assert.equal(req.kind, 'derive_sub_agent_seed');
+    assert.equal(req.class_slug, 'refund-bot');
+    assert.equal(req.index, 3);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerDeriveSubAgentSeed: a non-32-byte seed → throws', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: true, status: 200, body: { sub_seed_b64: Buffer.alloc(8).toString('base64') } }));
+  try {
+    await assert.rejects(
+      brokerDeriveSubAgentSeed({ socketPath: srv.socketPath, token: 't', classSlug: 'x', index: 0 }),
+      /unexpected broker response/,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerSignParentAuthorization: sends base64url(claimsJson), returns the jws', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: true, status: 200, body: { jws: 'h.p.s' } }));
+  try {
+    const claimsJson = JSON.stringify({ iss: 'did:lastid:agent:zP', sub: 'did:lastid:agent:zS' });
+    const jws = await brokerSignParentAuthorization({ socketPath: srv.socketPath, token: 't', claimsJson });
+    assert.equal(jws, 'h.p.s');
+    const req = srv.received[0];
+    assert.equal(req.kind, 'sign_parent_authorization');
+    assert.equal(req.payload_b64, Buffer.from(claimsJson, 'utf8').toString('base64url'));
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerSignParentAuthorization: broker error → throws', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: false, error: { code: 'not_implemented', message: 'no parent key' } }));
+  try {
+    await assert.rejects(
+      brokerSignParentAuthorization({ socketPath: srv.socketPath, token: 't', claimsJson: '{}' }),
+      /sign_parent_authorization failed: broker not_implemented/,
     );
   } finally {
     await srv.close();

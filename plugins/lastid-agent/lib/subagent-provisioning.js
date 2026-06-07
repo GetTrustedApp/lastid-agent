@@ -44,6 +44,12 @@ import {
   claimCredential,
 } from './agent-provisioning.js';
 import { mintDpopJwt } from './dpop.js';
+import {
+  brokerAvailable,
+  brokerDeriveSubAgentSeed,
+  brokerSignParentAuthorization,
+} from './broker-ipc.js';
+import { brokerIdpEnabled } from './broker-supervisor.js';
 import { loadAgentVc, persistAgentVc } from './keychain.js';
 
 // Sub-agent VC validity ceiling. The IdP clamps to ≤ parent.exp too;
@@ -90,6 +96,17 @@ export async function provisionSubagent({
   }
 
   const subScope = `${parentScope}-${subagent.slug}`;
+
+  // FORK1 Phase 3 op 4: when the signed broker is up for a P-256 parent, do the
+  // PARENT-KEY crypto (sub-seed derivation + parent-authorization signing) in the
+  // broker so the parent slot seed never reaches node. Ed25519 parents + no
+  // broker stay local — the broker is P-256-only and an Ed25519 parent-auth must
+  // be EdDSA, which it can't produce. (The sub-agent's OWN proof/keypair stay
+  // node-side: the sub-seed IS the new credential node persists.)
+  const parentIsP256 =
+    typeof parentDid === 'string' && parentDid.startsWith('did:lastid:agent:zDn');
+  const subBrokerOn =
+    parentIsP256 && brokerIdpEnabled() && (await brokerAvailable(parentScope));
 
   // The OPERATOR-PICKED capabilities are the contract — log them at
   // provision time so a wrong-caps issue is observable in the log instead
@@ -191,11 +208,13 @@ export async function provisionSubagent({
   // 2) Derive sub-agent seed deterministically from the parent's slot_seed
   //    + (slug, index). The index participates in the HKDF info so a fresh
   //    index yields a fresh seed → fresh DID.
-  const subSeedBytes = sdk.deriveSubAgentSeed(
-    parentSlotSeed,
-    subagent.slug,
-    subAgentIndex,
-  );
+  const subSeedBytes = subBrokerOn
+    ? await brokerDeriveSubAgentSeed({
+        scope: parentScope,
+        classSlug: subagent.slug,
+        index: subAgentIndex,
+      })
+    : sdk.deriveSubAgentSeed(parentSlotSeed, subagent.slug, subAgentIndex);
   const subagentSeed = Buffer.from(subSeedBytes);
 
   // 3) Sub-agent keypair from seed (same HKDF path as top-level agents).
@@ -232,11 +251,11 @@ export async function provisionSubagent({
   //    let signParentAuthorization branch on the key type. Sub-agent identity
   //    itself stays P-256 (above) — only the PARENT's signature alg varies.
   //
-  //    PURE JS (node:crypto) for both algos — no wasm rebuild.
-  const { signingKey: parentAuthKey } = deriveAgentKeypair(
-    parentSlotSeed,
-    parentDid,
-  );
+  //    PURE JS (node:crypto) for both algos — no wasm rebuild. When subBrokerOn,
+  //    the parent key is NOT derived in node at all — the broker signs (below).
+  const { signingKey: parentAuthKey } = subBrokerOn
+    ? { signingKey: null }
+    : deriveAgentKeypair(parentSlotSeed, parentDid);
 
   const now = Math.floor(Date.now() / 1000);
   const claims = {
@@ -256,7 +275,9 @@ export async function provisionSubagent({
   // claims_json is the EXACT byte sequence the JWS will encode in its payload.
   // Stringify once; the signer treats the input as the serialized claims verbatim.
   const claimsJson = JSON.stringify(claims);
-  const parentAuthorization = signParentAuthorization(parentAuthKey, claimsJson);
+  const parentAuthorization = subBrokerOn
+    ? await brokerSignParentAuthorization({ scope: parentScope, claimsJson })
+    : signParentAuthorization(parentAuthKey, claimsJson);
 
   // 4) POST /sub authenticated as parent.
   const subUrl = `${idpUrl}/v1/oid4vci/agent-provision/sub`;

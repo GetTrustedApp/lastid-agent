@@ -336,3 +336,85 @@ export async function brokerDecryptContent({
   }
   return Buffer.from(b64, 'base64');
 }
+
+/**
+ * Derive a sub-agent's 32-byte seed via the signed broker (FORK1 Phase 3 op 4).
+ * The PARENT slot seed stays in the broker; only the derived sub-seed (the new
+ * sub-agent's own credential) comes back. Byte-identical to the SDK
+ * `deriveSubAgentSeed` (same HKDF, KAT-pinned).
+ *
+ * @returns {Promise<Buffer>} the 32-byte sub-agent seed
+ */
+export async function brokerDeriveSubAgentSeed({
+  scope = 'main',
+  classSlug,
+  index,
+  socketPath,
+  token,
+  connect,
+  timeoutMs,
+} = {}) {
+  const sp = socketPath ?? brokerSocketPath(scope);
+  const tok = token ?? (await readBrokerToken(scope));
+  const resp = await brokerIpcCall({
+    socketPath: sp,
+    token: tok,
+    kind: 'derive_sub_agent_seed',
+    fields: { class_slug: classSlug, index },
+    connect,
+    timeoutMs,
+  });
+  if (resp.error) {
+    const code = resp.error.code ?? 'broker_error';
+    throw new Error(`derive_sub_agent_seed failed: broker ${code}: ${resp.error.message ?? ''}`);
+  }
+  const b64 = resp.body?.sub_seed_b64;
+  const seed = typeof b64 === 'string' ? Buffer.from(b64, 'base64') : null;
+  if (!seed || seed.length !== 32) {
+    throw new Error(`derive_sub_agent_seed: unexpected broker response ${JSON.stringify(resp.body)}`);
+  }
+  return seed;
+}
+
+/**
+ * Sign a sub-agent parent-authorization JWS via the broker (FORK1 Phase 3 op 4)
+ * with the PARENT's identity key. Byte-identical to JS `signParentAuthorization`
+ * for a P-256 parent (node owns the claims canonicalization). Broker is
+ * P-256-only, so this path is for P-256 (`zDn…`) parents.
+ *
+ * @param {object} a
+ * @param {string} [a.scope]
+ * @param {string} [a.claimsJson]   - the pre-stringified parent-auth claims
+ * @param {string} [a.payloadB64]   - or a precomputed base64url(claimsJson)
+ * @returns {Promise<string>} the compact JWS
+ */
+export async function brokerSignParentAuthorization({
+  scope = 'main',
+  claimsJson,
+  payloadB64,
+  socketPath,
+  token,
+  connect,
+  timeoutMs,
+} = {}) {
+  const sp = socketPath ?? brokerSocketPath(scope);
+  const tok = token ?? (await readBrokerToken(scope));
+  const payload = payloadB64 ?? Buffer.from(claimsJson, 'utf8').toString('base64url');
+  const resp = await brokerIpcCall({
+    socketPath: sp,
+    token: tok,
+    kind: 'sign_parent_authorization',
+    fields: { payload_b64: payload },
+    connect,
+    timeoutMs,
+  });
+  if (resp.error) {
+    const code = resp.error.code ?? 'broker_error';
+    throw new Error(`sign_parent_authorization failed: broker ${code}: ${resp.error.message ?? ''}`);
+  }
+  const jws = resp.body?.jws;
+  if (typeof jws !== 'string' || jws.split('.').length !== 3) {
+    throw new Error(`sign_parent_authorization: unexpected broker response ${JSON.stringify(resp.body)}`);
+  }
+  return jws;
+}
