@@ -188,3 +188,33 @@ export async function startBrokerSupervisor({
     socketPath: sockPath,
   };
 }
+
+/**
+ * Wait until NO broker is reachable for `scope` — i.e. a Health probe fails.
+ * `stopListener` (and the supervisor's `stop()`) send SIGTERM and return before
+ * the broker has actually exited; starting a NEW broker into that window races
+ * the dying one's socket teardown (ECONNREFUSED on the next IPC call). The reissue
+ * flow calls this AFTER stopping the old listener and BEFORE starting the
+ * provisioning broker, so the socket is genuinely free. Resolves true once the
+ * broker is gone, false if it's still answering after `timeoutMs` (the caller
+ * proceeds anyway — startBrokerSupervisor's own socket-removal is the backstop).
+ */
+export async function waitForBrokerDown({
+  scope = 'main',
+  timeoutMs = 5_000,
+  pollMs = 150,
+  healthImpl = brokerHealth,
+  now = () => Date.now(),
+  sleepImpl = (ms) => new Promise((r) => setTimeout(r, ms)),
+} = {}) {
+  const deadline = now() + timeoutMs;
+  while (now() < deadline) {
+    try {
+      await healthImpl({ scope });
+    } catch {
+      return true; // unreachable → the old broker is gone
+    }
+    await sleepImpl(pollMs);
+  }
+  return false;
+}

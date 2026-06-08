@@ -12,6 +12,7 @@
 import { deriveAgentKeypair, resolveAgentDeviceId } from './agent-provisioning.js';
 import { revokeAgentDevice } from './mls-groups-api.js';
 import { startBrokerSupervisor } from './broker-supervisor.js';
+import { brokerAvailable } from './broker-ipc.js';
 
 /**
  * Revoke the OLD agent's device at the IdP during a reissue. The IdP evicts its
@@ -45,6 +46,7 @@ export async function revokeOldAgentDeviceForReissue({ existing, scope, idpUrl, 
   const _revokeAgentDevice = deps.revokeAgentDevice ?? revokeAgentDevice;
   const _startBrokerSupervisor = deps.startBrokerSupervisor ?? startBrokerSupervisor;
   const _resolveAgentDeviceId = deps.resolveAgentDeviceId ?? resolveAgentDeviceId;
+  const _brokerAvailable = deps.brokerAvailable ?? brokerAvailable;
 
   const oldDeviceId = _resolveAgentDeviceId({
     persistedDeviceId: existing.deviceId,
@@ -71,11 +73,33 @@ export async function revokeOldAgentDeviceForReissue({ existing, scope, idpUrl, 
     return oldDeviceId;
   }
 
-  // BROKER-NATIVE: start the OLD broker agent-mode (NO --reprovision → it reads
-  // the old seed) and revoke through it. signingKey is null — authedIdpFetch sees
-  // a broker up for this scope and routes the DELETE through it (the broker mints
-  // the old-key DPoP). Stop the broker afterwards, no matter what.
-  log('[reissue] starting the old broker (agent-mode) to revoke the old device before reprovisioning…');
+  // BROKER-NATIVE: the old key is in the OLD broker's protected store. signingKey
+  // is null — authedIdpFetch sees a broker up for this scope and routes the DELETE
+  // through it (the broker mints the old-key DPoP).
+  //
+  // PREFER a broker that is ALREADY up for this scope — the running listener's,
+  // agent-mode with the old seed. Revoke through it with NO broker juggling: the
+  // caller revokes BEFORE stopping the listener, so its broker is still live.
+  // Starting a fresh broker here instead would race the listener-broker's socket
+  // teardown — startBrokerSupervisor rm's the socket while the dying broker still
+  // holds it, so the new broker reports ready but the path is unlinked →
+  // ECONNREFUSED on the revoke (the live-reissue failure we hit).
+  if (await _brokerAvailable(scope)) {
+    log('[reissue] revoking the old device through the running broker (race-free)…');
+    await _revokeAgentDevice({
+      idpUrl: effIdp,
+      deviceId: oldDeviceId,
+      agentDid: existing.agentDid,
+      vcCompact: existing.vcCompact,
+      signingKey: null, // the broker mints the DPoP from the old seed
+      scope,
+    });
+    return oldDeviceId;
+  }
+
+  // No broker up for this scope (cold reissue, no running listener) — start a temp
+  // one. There is no competing broker here, so no socket race. Stopped afterwards.
+  log('[reissue] no running broker — starting a temp old broker (agent-mode) to revoke…');
   const oldBroker = await _startBrokerSupervisor({
     scope,
     idpUrl: effIdp,

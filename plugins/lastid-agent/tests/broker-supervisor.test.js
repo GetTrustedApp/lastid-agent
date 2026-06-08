@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 
-import { brokerIdpEnabled, startBrokerSupervisor } from '../lib/broker-supervisor.js';
+import { brokerIdpEnabled, startBrokerSupervisor, waitForBrokerDown } from '../lib/broker-supervisor.js';
 
 function fakeChild(pid = 4242) {
   const ee = new EventEmitter();
@@ -166,4 +166,32 @@ test('omits --idp when no idpUrl is given', async () => {
     },
   });
   assert.deepEqual(calls[0], ['--scope', 'tscope']);
+});
+
+test('waitForBrokerDown: resolves true once a Health probe is unreachable (broker gone)', async () => {
+  let calls = 0;
+  const down = await waitForBrokerDown({
+    scope: 'tscope',
+    pollMs: 1,
+    healthImpl: async () => {
+      calls += 1;
+      if (calls >= 2) throw new Error('connect ECONNREFUSED'); // 2nd poll: broker gone
+      return { ok: true };
+    },
+    sleepImpl: async () => {},
+  });
+  assert.equal(down, true);
+  assert.ok(calls >= 2, 'polled until Health threw (the old broker fully exited)');
+});
+
+test('waitForBrokerDown: resolves false if the broker keeps answering past the timeout', async () => {
+  const down = await waitForBrokerDown({
+    scope: 'tscope',
+    timeoutMs: 5,
+    pollMs: 1,
+    healthImpl: async () => ({ ok: true }), // never goes down
+    sleepImpl: async () => {},
+    now: (() => { let t = 0; return () => (t += 3); })(), // advances past the 5ms deadline
+  });
+  assert.equal(down, false);
 });

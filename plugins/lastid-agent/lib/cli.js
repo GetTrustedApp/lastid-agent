@@ -399,24 +399,21 @@ async function cmdProvision(flags) {
   // Reissue — retire the OLD identity BEFORE we provision. ORDER IS LOAD-BEARING
   // for a broker-native agent: the old-device revoke needs the old agent key,
   // which lives ONLY in the old broker's protected store, and the provisioning
-  // broker (--reprovision) is about to OVERWRITE that seed. So stop the old
-  // listener (frees the scope's broker socket + closes the stale WebSocket), then
-  // revoke the old device through the old broker booted agent-mode — both now,
-  // before provisioning. (clearScopeState runs AFTER provisioning, before the new
-  // KeyPackage publish — see below.) A revoke failure is logged loudly but does
-  // not block the reissue; the stale device otherwise lapses at VC expiry.
+  // broker (--reprovision) is about to OVERWRITE that seed. The sequence:
+  //   1. revoke the old device THROUGH the still-running listener broker (race-
+  //      free — reuse the live agent-mode broker, do NOT start a fresh one; a
+  //      fresh broker races the listener-broker's socket teardown → ECONNREFUSED);
+  //   2. stop the old listener (its shutdown SIGTERMs the broker);
+  //   3. wait for that broker to fully EXIT before the provisioning broker starts
+  //      — stopListener returns before the broker dies, and starting the
+  //      --reprovision broker into that window races the socket.
+  // (clearScopeState runs AFTER provisioning, before the new KeyPackage publish —
+  // see below.) A revoke failure is logged loudly but never blocks the reissue;
+  // the stale device otherwise lapses at the old VC's expiry.
   if (reissue && existing) {
     console.log('');
     console.log('Reissue — retiring the old identity…');
-    const { stopListener } = await import('./listener-daemon.js');
-    try {
-      const stopped = await stopListener({ scope });
-      console.log(`   listener:   ${stopped.status} (old WebSocket closed)`);
-    } catch (err) {
-      console.error(
-        `   listener:   stop failed — ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+    // 1. Revoke FIRST, through the live broker (must precede stopListener).
     try {
       const { revokeOldAgentDeviceForReissue } = await import('./agent-reissue.js');
       const oldDeviceId = await revokeOldAgentDeviceForReissue({
@@ -431,6 +428,27 @@ async function cmdProvision(flags) {
         `   old device: revoke FAILED — ${err instanceof Error ? err.message : String(err)}`,
       );
       console.error('   (continuing the reissue; the stale device lapses at the old VC expiry)');
+    }
+    // 2. Stop the old listener.
+    const { stopListener } = await import('./listener-daemon.js');
+    try {
+      const stopped = await stopListener({ scope });
+      console.log(`   listener:   ${stopped.status} (old WebSocket closed)`);
+    } catch (err) {
+      console.error(
+        `   listener:   stop failed — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    // 3. Wait for the old broker to fully exit before the provisioning broker
+    //    starts (so it binds a clean socket — no race with the dying broker).
+    try {
+      const { waitForBrokerDown } = await import('./broker-supervisor.js');
+      const down = await waitForBrokerDown({ scope });
+      if (!down) {
+        console.error('   broker:     still answering after wait — provisioning may retry');
+      }
+    } catch {
+      /* best-effort — startBrokerSupervisor's own socket-removal is the backstop */
     }
   }
 

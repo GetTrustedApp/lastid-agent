@@ -32,6 +32,7 @@ test('LEGACY: derives the old key in node + revokes with that signingKey (no bro
     idpUrl: 'https://fallback.example',
     deps: {
       resolveAgentDeviceId: ({ persistedDeviceId }) => persistedDeviceId,
+      brokerAvailable: async () => false,
       deriveAgentKeypair: () => {
         calls.derive += 1;
         return { signingKey: { fake: 'old-key' } };
@@ -63,6 +64,7 @@ test('BROKER-NATIVE: starts the OLD broker agent-mode + revokes through it (sign
     idpUrl: 'https://fallback.example',
     deps: {
       resolveAgentDeviceId: ({ persistedDeviceId }) => persistedDeviceId,
+      brokerAvailable: async () => false,
       deriveAgentKeypair: () => {
         calls.derive += 1;
         return { signingKey: {} };
@@ -87,6 +89,35 @@ test('BROKER-NATIVE: starts the OLD broker agent-mode + revokes through it (sign
   assert.equal(calls.stopped, 1, 'the old broker is stopped after the revoke');
 });
 
+test('BROKER-NATIVE: REUSES a running broker (no temp start, no socket race) when one is up', async () => {
+  const calls = { revoke: null, started: 0, stopped: 0 };
+  const id = await revokeOldAgentDeviceForReissue({
+    existing: BROKER_NATIVE,
+    scope: 'test',
+    idpUrl: 'https://fallback.example',
+    deps: {
+      resolveAgentDeviceId: ({ persistedDeviceId }) => persistedDeviceId,
+      // A broker is ALREADY up for this scope (the running listener's, agent-mode,
+      // old seed) — the caller revokes BEFORE stopping the listener.
+      brokerAvailable: async () => true,
+      revokeAgentDevice: (args) => {
+        calls.revoke = args;
+        return Promise.resolve({ ok: true });
+      },
+      startBrokerSupervisor: () => {
+        calls.started += 1;
+        return Promise.resolve({ ready: true, stop: () => { calls.stopped += 1; } });
+      },
+    },
+  });
+  assert.equal(id, 'md-machinedevice');
+  assert.equal(calls.started, 0, 'must NOT start a temp broker when one is up — that is the socket race');
+  assert.equal(calls.stopped, 0, 'does not stop the running listener broker (the caller stops it after)');
+  assert.equal(calls.revoke.signingKey, null, 'the broker mints the DPoP');
+  assert.equal(calls.revoke.scope, 'test', 'routes the DELETE to THIS scope’s running broker');
+  assert.equal(calls.revoke.deviceId, 'md-machinedevice');
+});
+
 test('BROKER-NATIVE NEGATIVE: old broker fails to come up → throws, never revokes', async () => {
   const calls = { revoke: 0, stopped: 0 };
   await assert.rejects(
@@ -96,6 +127,7 @@ test('BROKER-NATIVE NEGATIVE: old broker fails to come up → throws, never revo
       idpUrl: 'https://fallback.example',
       deps: {
         resolveAgentDeviceId: ({ persistedDeviceId }) => persistedDeviceId,
+      brokerAvailable: async () => false,
         revokeAgentDevice: () => {
           calls.revoke += 1;
           return Promise.resolve({});
@@ -118,6 +150,7 @@ test('BROKER-NATIVE: a revoke failure still stops the old broker (no leak)', asy
       idpUrl: 'https://fallback.example',
       deps: {
         resolveAgentDeviceId: ({ persistedDeviceId }) => persistedDeviceId,
+      brokerAvailable: async () => false,
         revokeAgentDevice: () => Promise.reject(new Error('IdP 500')),
         startBrokerSupervisor: () => Promise.resolve({ ready: true, stop: () => { calls.stopped += 1; } }),
       },
