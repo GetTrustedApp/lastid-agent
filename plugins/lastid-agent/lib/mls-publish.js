@@ -26,7 +26,7 @@
  */
 import { MlsClient } from './mls-client.js';
 import { authedIdpFetch } from './mls-groups-api.js';
-import { deriveAgentKeypair, resolveAgentDeviceId } from './agent-provisioning.js';
+import { agentIdpAuthSigningKey, resolveAgentDeviceId } from './agent-provisioning.js';
 
 /** How many regular (consumable) KeyPackages to keep on file. */
 const REGULAR_COUNT = 5;
@@ -91,7 +91,9 @@ export async function publishAgentKeyPackage({
   if (!haveSeed && !sharedMls) {
     throw new Error('publishAgentKeyPackage: slotSeed (32 bytes) or a shared mls handle is required');
   }
-  const signingKey = haveSeed ? deriveAgentKeypair(slotSeed, agentDid).signingKey : null;
+  // Broker-bound (`md-…`) agents authenticate the IdP POST through the broker
+  // (signingKey null); only legacy agents node-sign. See agentIdpAuthSigningKey.
+  const signingKey = agentIdpAuthSigningKey({ slotSeed, agentDid, deviceId: persistedDeviceId });
 
   // Reuse the listener's shared handle when given (B1 convergence — see the
   // `mls` param doc). Only fall back to a throwaway client at provision time,
@@ -188,7 +190,8 @@ export async function maintainAgentKeyPackages({
   if (!haveSeed && !sharedMls) {
     throw new Error('maintainAgentKeyPackages: slotSeed (32 bytes) or a shared mls handle is required');
   }
-  const signingKey = haveSeed ? deriveAgentKeypair(slotSeed, agentDid).signingKey : null;
+  // Broker-bound agents authenticate through the broker (signingKey null).
+  const signingKey = agentIdpAuthSigningKey({ slotSeed, agentDid, deviceId: persistedDeviceId });
 
   let available = 0;
   try {

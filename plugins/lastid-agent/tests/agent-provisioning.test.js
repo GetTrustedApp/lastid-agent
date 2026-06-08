@@ -15,6 +15,7 @@ import {
   deriveAgentEd25519Keypair,
   deriveAgentKeypair,
   agentKeyTypeFromDid,
+  agentIdpAuthSigningKey,
   deriveAgentDeviceId,
   agentDidFromPublicJwk,
   mintProofJwt,
@@ -545,4 +546,59 @@ test('provisionAgentViaBroker: times out if never approved', async () => {
     }),
     /timed out before wallet approval/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// agentIdpAuthSigningKey — broker-bound agents must NOT node-sign IdP auth.
+// Regression for the reissue 401 (agent_pop: signature verification failed):
+// a stale node slot seed derives a key ≠ the broker-provisioned VC cnf.
+// ---------------------------------------------------------------------------
+
+test('agentIdpAuthSigningKey: BROKER-BOUND (md- device) → null (route through the broker), even with a seed present', () => {
+  const seed = Buffer.alloc(32, 9);
+  const key = agentIdpAuthSigningKey({
+    slotSeed: seed,
+    agentDid: 'did:lastid:agent:zDnSomeP256Agent',
+    deviceId: 'md-4ad7fadabc767c3ae323992fb919e3ce',
+  });
+  assert.equal(key, null, 'md- agents delegate IdP auth to the broker; node must not sign with its (possibly stale) seed');
+});
+
+test('agentIdpAuthSigningKey: LEGACY (ad- device + seed) → derives the node signing key', () => {
+  // z6Mk ⇒ Ed25519 derivation, which is PURE JS (no wasm) → hermetic.
+  const seed = Buffer.alloc(32, 3);
+  const key = agentIdpAuthSigningKey({
+    slotSeed: seed,
+    agentDid: 'did:lastid:agent:z6MkLegacyEd25519Agent',
+    deviceId: 'ad-legacydevice',
+  });
+  assert.ok(key, 'legacy agents keep node-signing');
+  assert.equal(key.asymmetricKeyType, 'ed25519', 'dual-algo: a z6Mk agent signs EdDSA');
+  // Determinism: same seed+did → same key bytes as the direct derivation.
+  const direct = deriveAgentEd25519Keypair(seed);
+  assert.equal(
+    key.export({ format: 'jwk' }).x,
+    direct.signingKey.export({ format: 'jwk' }).x,
+    'the helper returns exactly the deriveAgentKeypair signing key',
+  );
+});
+
+test('agentIdpAuthSigningKey: NO seed (broker-native) → null regardless of device', () => {
+  assert.equal(
+    agentIdpAuthSigningKey({ slotSeed: null, agentDid: 'did:lastid:agent:zDnX', deviceId: 'ad-x' }),
+    null,
+  );
+  assert.equal(
+    agentIdpAuthSigningKey({ slotSeed: undefined, agentDid: 'did:lastid:agent:zDnX', deviceId: undefined }),
+    null,
+  );
+});
+
+test('agentIdpAuthSigningKey: no device id + legacy seed → still node-signs (md- is the ONLY broker-bound signal)', () => {
+  const key = agentIdpAuthSigningKey({
+    slotSeed: Buffer.alloc(32, 5),
+    agentDid: 'did:lastid:agent:z6MkLegacyEd25519Agent',
+    deviceId: undefined,
+  });
+  assert.ok(key, 'absent device id is treated as legacy (node-signs), not broker-bound');
 });

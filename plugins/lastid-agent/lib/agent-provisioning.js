@@ -513,6 +513,35 @@ export function agentKeyTypeFromDid(agentDid) {
 }
 
 /**
+ * Decide the node-side signing key for an agent's per-request IdP auth
+ * (DPoP / agent_pop). The custody rule:
+ *
+ *   - BROKER-BOUND agents (machine device `md-…`): the signed broker is the
+ *     sole holder of the slot seed and the sole maker of IdP auth. Return
+ *     `null` so `authedIdpFetch` routes the call through the broker, which
+ *     mints the proof from the seed it ACTUALLY provisioned the VC with.
+ *     Node must NOT sign these: a reissue can leave a STALE node slot seed in
+ *     the keychain whose derived key no longer matches the broker-provisioned
+ *     VC `cnf` — node-signing with it yields a 401 `agent_pop: signature
+ *     verification failed` (the VC and the proof key disagree).
+ *   - LEGACY agents (`ad-…` device or no machine device, seed in node): keep
+ *     node-signing with the dual-algo-correct derived key.
+ *
+ * @param {object} a
+ * @param {Buffer|null} a.slotSeed   32-byte slot seed, or null (broker-native).
+ * @param {string} a.agentDid        selects the derivation algo for legacy agents.
+ * @param {string|null} [a.deviceId] the PINNED device id (`md-…` ⇒ broker-bound).
+ * @returns {import('node:crypto').KeyObject|null} the node signing key, or
+ *   `null` to force the broker path.
+ */
+export function agentIdpAuthSigningKey({ slotSeed, agentDid, deviceId }) {
+  const brokerBound = typeof deviceId === 'string' && deviceId.startsWith('md-');
+  const haveSeed = Buffer.isBuffer(slotSeed) && slotSeed.length === 32;
+  if (brokerBound || !haveSeed) return null;
+  return deriveAgentKeypair(slotSeed, agentDid).signingKey;
+}
+
+/**
  * Dispatcher: derive the right keypair for an EXISTING agent given its
  * stored DID. Ed25519 agents (`z6Mk…`) get the pure-JS EdDSA path; everyone
  * else (new agents) gets the wasm-owned P-256 path. The returned shape is

@@ -400,3 +400,48 @@ test('authedIdpFetch: falls back to legacy when enabled but NO broker is up (no-
   assert.equal(brokerCalled, false, 'must NOT route to a broker that is not up');
   assert.equal(fetchImpl.calls.length, 1, 'falls back to the legacy node path');
 });
+
+test('authedIdpFetch: signingKey null + NO broker up → REFUSES to node-sign (broker-bound agent)', async () => {
+  // A broker-bound agent (md- device) passes signingKey:null to delegate IdP
+  // auth to the broker. If the broker isn't up we must NOT node-sign with a
+  // (possibly stale) key — that is the reissue 401. Fail loud + retryable.
+  const fetchImpl = recordingFetch(res({ ok: 1 }));
+  await assert.rejects(
+    () =>
+      authedIdpFetch({
+        ...AUTH,
+        signingKey: null,
+        method: 'POST',
+        path: '/v1/mls/keypackages/batch',
+        body: { key_packages: [] },
+        fetchImpl,
+        _brokerEnabled: () => true,
+        _brokerAvailable: async () => false,
+      }),
+    /broker-bound agent requires the signed broker/,
+  );
+  assert.equal(fetchImpl.calls.length, 0, 'must not hit the network with an unsigned/stale proof');
+});
+
+test('authedIdpFetch: signingKey null + broker UP → routes through the broker (never node-signs)', async () => {
+  const fetchImpl = recordingFetch(res({ ok: 1 }));
+  let brokerCall = null;
+  const out = await authedIdpFetch({
+    ...AUTH,
+    signingKey: null,
+    method: 'POST',
+    path: '/v1/mls/keypackages/batch',
+    body: { key_packages: [] },
+    scope: 'tscope',
+    fetchImpl,
+    _brokerEnabled: () => true,
+    _brokerAvailable: async () => true,
+    _brokerIdpFetch: async (a) => {
+      brokerCall = a;
+      return { ok: true };
+    },
+  });
+  assert.deepEqual(out, { ok: true });
+  assert.equal(brokerCall.path, '/v1/mls/keypackages/batch');
+  assert.equal(fetchImpl.calls.length, 0, 'broker-bound publish must not node-sign');
+});

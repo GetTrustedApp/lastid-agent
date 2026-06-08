@@ -60,6 +60,19 @@ export async function authedIdpFetch({
     return _brokerIdpFetch({ method, path, body, scope: routeScope });
   }
 
+  // A null signingKey means the caller delegated IdP auth to the broker (a
+  // broker-bound agent — e.g. an `md-…` machine device). We only reach here
+  // when no broker is up for this scope, so node cannot sign. Fail with a
+  // clear, retryable error instead of minting a proof with the wrong/stale
+  // node key (a reissue can leave a stale slot seed whose key ≠ the VC cnf →
+  // 401 agent_pop) or crashing on a null key. The listener's maintenance loop
+  // retries once the broker is up.
+  if (signingKey == null) {
+    throw new Error(
+      `authedIdpFetch: broker-bound agent requires the signed broker for scope '${routeScope}', but no broker is available — refusing to node-sign IdP auth`,
+    );
+  }
+
   const trimmed = String(idpUrl ?? '').replace(/\/$/, '');
   if (!trimmed) throw new Error('authedIdpFetch: idpUrl required');
   const url = `${trimmed}${path}`;
