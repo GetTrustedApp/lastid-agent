@@ -96,6 +96,30 @@ export function isRevocationResponse(statusCode, rawBody) {
 }
 
 /**
+ * Whether the agent's `/v1/ws` channel should be opened through the SIGNED
+ * BROKER (the broker mints the upgrade auth) rather than node minting the DPoP.
+ *
+ * True ONLY for a BROKER-NATIVE P-256 (`zDn…`) agent: such an agent has NO node
+ * signing key (the slot seed lives only in the broker), so node CANNOT mint the
+ * WS upgrade DPoP — `mintDpopJwt` would throw on a null key. A legacy
+ * seed-in-node agent (or an Ed25519 `z6Mk…` agent the P-256-only broker can't
+ * serve) keeps the direct node WS. Discriminated by where the seed lives, NOT
+ * the legacy `LASTID_BROKER_IDP` opt-in (now only a kill-switch). The caller's
+ * per-connect `brokerSocketExistsSync` re-check means this only ever ADDS the
+ * broker path; a dead broker still degrades to the legacy WS next reconnect.
+ *
+ * @param {{brokerNative?: boolean, agentDid?: string}} a
+ * @returns {boolean}
+ */
+export function brokerWsEligible({ brokerNative, agentDid } = {}) {
+  return (
+    brokerNative === true &&
+    typeof agentDid === 'string' &&
+    agentDid.startsWith('did:lastid:agent:zDn')
+  );
+}
+
+/**
  * Event types the dispatcher cares about. Unknown event types are
  * still forwarded to `onEvent` so the dispatcher's defensive
  * routing can probe for embedded mls_* fields — but the *known*

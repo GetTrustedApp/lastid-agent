@@ -25,7 +25,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { isRevocationResponse } from '../lib/ws-client.js';
+import { isRevocationResponse, brokerWsEligible } from '../lib/ws-client.js';
 
 test('isRevocationResponse: HAPPY — exact IdP-emitted shape returns true', () => {
   const body = JSON.stringify({
@@ -120,4 +120,40 @@ test('isRevocationResponse: missing error code does NOT trip even with revoke wo
     error_description: 'Credential has been revoked',
   });
   assert.equal(isRevocationResponse(401, body), false);
+});
+
+// ---------------------------------------------------------------------------
+// brokerWsEligible — a broker-native P-256 agent must open /v1/ws THROUGH the
+// broker (it has no node signing key). Regression for the WS upgrade crash
+// (mintDpopJwt: "key.key … Received null") after the broker-native switch:
+// the gate used to key off the demoted LASTID_BROKER_IDP opt-in.
+// ---------------------------------------------------------------------------
+
+test('brokerWsEligible: broker-native P-256 (zDn) agent → true (broker mints WS upgrade auth)', () => {
+  assert.equal(
+    brokerWsEligible({ brokerNative: true, agentDid: 'did:lastid:agent:zDnaeQXTXGQcb6ZSisDjt2bF1cn39mnugLhTHjhMwxRM1HQcv' }),
+    true,
+  );
+});
+
+test('brokerWsEligible: legacy seed-in-node agent (brokerNative false) → false (node WS)', () => {
+  assert.equal(
+    brokerWsEligible({ brokerNative: false, agentDid: 'did:lastid:agent:zDnSomeP256Agent' }),
+    false,
+    'a seed-in-node agent has a signing key and keeps the direct node WS',
+  );
+});
+
+test('brokerWsEligible: broker-native Ed25519 (z6Mk) agent → false (P-256-only broker cannot serve it)', () => {
+  assert.equal(
+    brokerWsEligible({ brokerNative: true, agentDid: 'did:lastid:agent:z6MkLegacyEd25519Agent' }),
+    false,
+  );
+});
+
+test('brokerWsEligible: missing/garbage inputs → false (never crash the gate)', () => {
+  assert.equal(brokerWsEligible(), false);
+  assert.equal(brokerWsEligible({}), false);
+  assert.equal(brokerWsEligible({ brokerNative: true }), false);
+  assert.equal(brokerWsEligible({ brokerNative: true, agentDid: null }), false);
 });

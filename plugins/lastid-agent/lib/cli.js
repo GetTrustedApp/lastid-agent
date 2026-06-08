@@ -1286,7 +1286,7 @@ async function cmdListen(flags) {
   const [
     { deriveAgentKeypair },
     { MlsClient },
-    { LastIdWsClient },
+    { LastIdWsClient, brokerWsEligible },
     { MlsDispatcher },
     { drainOutbox },
     { makeDoorbellHandler },
@@ -1640,14 +1640,18 @@ async function cmdListen(flags) {
   // on every (re)connect, cleared when a send finds the socket gone.
   let wsOpen = false;
   // Broker-owns-WS (Phase 3 op 3): route the /v1/ws channel through the signed
-  // broker when the flag is on AND this is a P-256 agent (zDn… DID — the broker
-  // is P-256-only; Ed25519 z6Mk… agents keep the direct node WS). Default OFF;
-  // ws-client also re-checks per connect that a broker is actually up, so this
-  // can only ever ADD the broker path, never remove the legacy fallback.
-  const brokerWs =
-    process.env.LASTID_BROKER_IDP === '1' &&
-    typeof loaded.agentDid === 'string' &&
-    loaded.agentDid.startsWith('did:lastid:agent:zDn');
+  // broker for a BROKER-NATIVE agent (P-256 zDn… DID — the broker is P-256-only;
+  // Ed25519 z6Mk… agents keep the direct node WS). A broker-native agent has NO
+  // node signing key (the seed lives only in the broker), so it MUST get its WS
+  // upgrade auth from the broker — node cannot mint the DPoP (signingKey null →
+  // a null-key crypto throw). Discriminated by where the seed lives, NOT the
+  // legacy LASTID_BROKER_IDP opt-in (now only a kill-switch). ws-client also
+  // re-checks per connect that a broker is actually up, so this only ever ADDS
+  // the broker path, never removes the legacy fallback for seed-in-node agents.
+  const brokerWs = brokerWsEligible({
+    brokerNative: loaded.brokerNative === true,
+    agentDid: loaded.agentDid,
+  });
   const ws = new LastIdWsClient({
     idpUrl,
     agentDid: loaded.agentDid,
