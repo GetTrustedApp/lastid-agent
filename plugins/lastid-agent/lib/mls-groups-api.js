@@ -114,6 +114,7 @@ export async function revokeAgentDevice({
   agentDid,
   vcCompact,
   signingKey,
+  scope,
   fetchImpl = fetch,
 }) {
   if (!deviceId) throw new Error('revokeAgentDevice: deviceId required');
@@ -124,6 +125,9 @@ export async function revokeAgentDevice({
     agentDid,
     vcCompact,
     signingKey,
+    // Pin the scope so a broker-native revoke routes to THIS scope's broker
+    // (cmdProvision never calls setActiveScope, so the ambient default is null).
+    scope,
     fetchImpl,
   });
 }

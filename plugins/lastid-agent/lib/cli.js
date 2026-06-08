@@ -396,6 +396,44 @@ async function cmdProvision(flags) {
       console.log('Waiting for you to approve…');
   };
 
+  // Reissue — retire the OLD identity BEFORE we provision. ORDER IS LOAD-BEARING
+  // for a broker-native agent: the old-device revoke needs the old agent key,
+  // which lives ONLY in the old broker's protected store, and the provisioning
+  // broker (--reprovision) is about to OVERWRITE that seed. So stop the old
+  // listener (frees the scope's broker socket + closes the stale WebSocket), then
+  // revoke the old device through the old broker booted agent-mode — both now,
+  // before provisioning. (clearScopeState runs AFTER provisioning, before the new
+  // KeyPackage publish — see below.) A revoke failure is logged loudly but does
+  // not block the reissue; the stale device otherwise lapses at VC expiry.
+  if (reissue && existing) {
+    console.log('');
+    console.log('Reissue — retiring the old identity…');
+    const { stopListener } = await import('./listener-daemon.js');
+    try {
+      const stopped = await stopListener({ scope });
+      console.log(`   listener:   ${stopped.status} (old WebSocket closed)`);
+    } catch (err) {
+      console.error(
+        `   listener:   stop failed — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    try {
+      const { revokeOldAgentDeviceForReissue } = await import('./agent-reissue.js');
+      const oldDeviceId = await revokeOldAgentDeviceForReissue({
+        existing,
+        scope,
+        idpUrl,
+        log: (l) => process.stderr.write(`${l}\n`),
+      });
+      console.log(`   old device: revoked ${oldDeviceId} (evicted from groups, KeyPackages purged)`);
+    } catch (err) {
+      console.error(
+        `   old device: revoke FAILED — ${err instanceof Error ? err.message : String(err)}`,
+      );
+      console.error('   (continuing the reissue; the stale device lapses at the old VC expiry)');
+    }
+  }
+
   // Route provisioning through the signed broker when enabled (Phase 4): the
   // broker generates the ephemeral, unseals the slot seed, claims the VC, and
   // persists everything itself — the slot seed never enters this process. The
@@ -480,51 +518,21 @@ async function cmdProvision(flags) {
     }`,
   );
 
-  // Reissue reset — MUST run BEFORE publishing the KeyPackage. We just minted a
-  // NEW identity (the keychain now holds it). The running listener still has a
-  // WebSocket bound to the OLD agent DID, and the local store is full of records
-  // sealed to the old slot_seed / signed by the old key (a stale sync cursor +
-  // undecryptable MLS state). Stop the old listener and wipe that state FIRST.
+  // Reissue local-state wipe — MUST run BEFORE publishing the new KeyPackage. We
+  // just minted a NEW identity; the local store still holds records sealed to the
+  // OLD slot_seed / signed by the OLD key (a stale sync cursor + undecryptable MLS
+  // state). The old listener + its WebSocket and the old-device IdP revoke were
+  // already handled BEFORE provisioning (see above — the revoke needs the old seed
+  // the provisioning broker just overwrote). Here we only clear local state.
   //
   // ORDER IS LOAD-BEARING: clearScopeState deletes mls-state.b64. If the publish
-  // ran first, the clear would throw away the private keys for the KeyPackages
-  // we just registered on the IdP, and every inbound welcome would fail
+  // ran first, the clear would throw away the private keys for the KeyPackages we
+  // just registered on the IdP, and every inbound welcome would fail
   // `NoMatchingKeyPackage` (the operator's messages reach the agent but it can't
-  // open them). So: stop → clear → publish → start.
+  // open them). So: clear → publish → start.
   if (reissue && existing) {
-    const { stopListener, clearScopeState } = await import('./listener-daemon.js');
-    console.log('');
-    console.log('Reissue — resetting local state for the new identity…');
-    // Retire the OLD device at the IdP first, using the OLD identity's creds:
-    // the IdP evicts its leaf from every group AND purges its KeyPackages, so
-    // no peer can re-add the now-dead device via a stale KP (NoMatchingKeyPackage
-    // on the welcome). Best-effort — a failure here (e.g. the old VC already
-    // expired) must not block the reissue.
+    const { clearScopeState } = await import('./listener-daemon.js');
     try {
-      const { deriveAgentKeypair } = await import('./agent-provisioning.js');
-      const { revokeAgentDevice } = await import('./mls-groups-api.js');
-      const oldDeviceId = resolveAgentDeviceId({
-        persistedDeviceId: existing.deviceId,
-        slotSeed: existing.slotSeed,
-        agentDid: existing.agentDid,
-      });
-      const { signingKey } = deriveAgentKeypair(existing.slotSeed, existing.agentDid);
-      await revokeAgentDevice({
-        idpUrl: existing.idpUrl ?? idpUrl,
-        deviceId: oldDeviceId,
-        agentDid: existing.agentDid,
-        vcCompact: existing.vcCompact,
-        signingKey,
-      });
-      console.log(`   old device: revoked ${oldDeviceId} (evicted from groups, KeyPackages purged)`);
-    } catch (err) {
-      console.error(
-        `   old device: revoke skipped — ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-    try {
-      const stopped = await stopListener({ scope });
-      console.log(`   listener:   ${stopped.status} (old WebSocket closed)`);
       await clearScopeState(scope);
       console.log('   state:      cleared (old rules, memories, MLS, inbox, cursor)');
     } catch (err) {
