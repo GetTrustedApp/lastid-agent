@@ -1522,8 +1522,36 @@ async function cmdListen(flags) {
     deviceId: resolvedDeviceId,
     log: (l) => process.stderr.write(`${l}\n`),
   };
-  const orchestrator = await getOrchestrator(listenerCtx);
-  const mls = MlsClient.fromOrchestrator(orchestrator, loaded.agentDid, resolvedDeviceId);
+  // MLS-into-broker (unit B3): a BROKER-NATIVE P-256 (`zDn…`) agent drives MLS
+  // THROUGH the broker — which now serves the openmls primitives — so node holds
+  // ZERO MLS key material. We MUST NOT build the node wasm orchestrator for that
+  // case: getOrchestrator opens a node openmls instance, and a second instance
+  // over the same identity would split MLS state with the broker's (the
+  // multi-instance class). The Ed25519/legacy path is byte-identical (still the
+  // node orchestrator + fromOrchestrator). brokerWsEligible is the EXACT same
+  // discriminator the WS path uses (brokerNative && did starts with
+  // `did:lastid:agent:zDn`), so the chat channel and the MLS engine agree on
+  // which agents the broker serves.
+  const useBrokerMls = brokerWsEligible({
+    brokerNative: loaded.brokerNative === true,
+    agentDid: loaded.agentDid,
+  });
+  let orchestrator = null;
+  let mls;
+  if (useBrokerMls) {
+    const { makeMlsBrokerClient } = await import('./mls-broker-client.js');
+    mls = makeMlsBrokerClient({
+      scope,
+      agentDid: loaded.agentDid,
+      deviceId: resolvedDeviceId,
+    });
+    process.stderr.write(
+      '[lastid-agent] broker-native: MLS served by the signed broker; no node openmls instance\n',
+    );
+  } else {
+    orchestrator = await getOrchestrator(listenerCtx);
+    mls = MlsClient.fromOrchestrator(orchestrator, loaded.agentDid, resolvedDeviceId);
+  }
 
   // One-time repair of the persisted group map: re-seed the idp→openmls
   // mapping for every valid group into the live MLS client (the agent only
@@ -2070,6 +2098,12 @@ async function cmdListen(flags) {
   const RECONCILE_INTERVAL_MS = 5 * 60_000;
   let reconciling = false;
   const reconcileTimer = setInterval(() => {
+    // MLS-into-broker (B3): node-side reconcile drives the NODE wasm orchestrator
+    // (reconcileConversationDevices → getOrchestrator), which the broker branch
+    // never builds. Those orchestration duties move to the broker in a later
+    // unit; for now the broker branch simply doesn't run node-side reconcile, so
+    // skip the tick rather than fault into a node openmls instance.
+    if (useBrokerMls) return;
     if (!wsOpen || reconciling || !operatorDid) return;
     reconciling = true;
     void reconcileConversationDevices({
@@ -2105,8 +2139,13 @@ async function cmdListen(flags) {
     // fromOrchestrator wrapper (ownsHandle:false) so mls.free() is a no-op;
     // disposeOrchestrator is what releases the wasm handle. Explicit free here
     // also avoids the GC-finalize-flush rust panic at exit
-    // (mem_01KSRJR43ZARPS9CPCYPB0DND3).
-    try { disposeOrchestrator(listenerCtx); } catch { /* ignore */ }
+    // (mem_01KSRJR43ZARPS9CPCYPB0DND3). MLS-into-broker (B3): the broker branch
+    // never built a node orchestrator (orchestrator stays null, mls is the
+    // broker client whose free() is a no-op), so there is nothing node-side to
+    // dispose — the broker owns its handle lifecycle and is stopped below.
+    if (!useBrokerMls) {
+      try { disposeOrchestrator(listenerCtx); } catch { /* ignore */ }
+    }
     // Stop the supervised signed broker (null when on the legacy node path).
     if (broker) { try { broker.stop(); } catch { /* ignore */ } }
     // Release the single-instance lock if it's still ours (a listener that

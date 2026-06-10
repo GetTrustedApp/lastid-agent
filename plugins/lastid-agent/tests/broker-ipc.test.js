@@ -33,6 +33,7 @@ import {
   brokerDeriveMlsStateKey,
   brokerEncryptContent,
   brokerSignAuditRecord,
+  brokerMlsCall,
 } from '../lib/broker-ipc.js';
 
 let _n = 0;
@@ -598,6 +599,71 @@ test('brokerProvisionPoll: wallet rejection (broker error) → throws', async ()
   } finally {
     await srv.close();
   }
+});
+
+// ── MLS-into-broker (B3): generic MLS-op IPC helper ─────────────────────────
+
+test('brokerMlsCall: sends {kind, ...fields} and returns the success body verbatim', async () => {
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: true,
+    status: 200,
+    body: { group_id_b64: 'GID', member_count: 2, epoch: 0 },
+  }));
+  try {
+    const body = await brokerMlsCall({
+      socketPath: srv.socketPath,
+      token: 't',
+      kind: 'mls_process_welcome',
+      fields: { welcome_b64: 'W', idp_group_id: 'uuid-1' },
+    });
+    assert.deepEqual(body, { group_id_b64: 'GID', member_count: 2, epoch: 0 });
+    const req = srv.received[0];
+    assert.equal(req.kind, 'mls_process_welcome');
+    assert.equal(req.welcome_b64, 'W');
+    assert.equal(req.idp_group_id, 'uuid-1');
+    assert.ok(!('method' in req), 'no idp_call fields leak in');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerMlsCall: empty success body → {} (void ops like forget/rollback/bind)', async () => {
+  const srv = await startServer((req) => ({ id: req.id, ok: true, status: 200 }));
+  try {
+    const body = await brokerMlsCall({
+      socketPath: srv.socketPath,
+      token: 't',
+      kind: 'mls_forget_group',
+      fields: { group_id_b64: 'GID' },
+    });
+    assert.deepEqual(body, {});
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerMlsCall: broker error (Response::err) → throws with kind + code', async () => {
+  const srv = await startServer((req) => ({
+    id: req.id,
+    ok: false,
+    error: { code: 'bad_request', message: 'NoMatchingKeyPackage' },
+  }));
+  try {
+    await assert.rejects(
+      brokerMlsCall({ socketPath: srv.socketPath, token: 't', kind: 'mls_process_welcome', fields: {} }),
+      /mls_process_welcome failed: broker bad_request.*NoMatchingKeyPackage/,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test('brokerMlsCall: a non-mls kind is rejected before any IPC (scoped helper)', async () => {
+  await assert.rejects(
+    brokerMlsCall({ socketPath: '/nope', token: 't', kind: 'idp_call' }),
+    /invalid kind/,
+  );
 });
 
 // ── op 3: BrokerWsTransport (broker-owns-WS streaming proxy) ─────────────────

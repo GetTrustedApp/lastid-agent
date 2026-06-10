@@ -552,6 +552,57 @@ export async function brokerDeriveMlsStateKey({
 }
 
 /**
+ * Generic MLS-op IPC call through the signed broker (MLS-into-broker, unit B3).
+ * The broker now SERVES the openmls primitives for a broker-native (P-256 zDn…)
+ * agent — no MLS key material ever enters node. Each MLS op is a single
+ * {kind, ...fields} request whose success body this helper RETURNS verbatim (the
+ * broker replies `Response::http(200, body)` → brokerIpcCall RESOLVES; a
+ * `Response::err` → brokerIpcCall RESOLVES a `{ok:false,error}` we re-throw, OR
+ * a transport failure REJECTS and propagates as-is). The per-op shapes are owned
+ * by the caller (lib/mls-broker-client.js), which is duck-typed to MlsClient.
+ *
+ * @param {object} a
+ * @param {string} [a.scope]
+ * @param {string} a.kind          - the broker MLS op kind, e.g. `mls_generate_key_package`
+ * @param {object} [a.fields]      - op-specific request fields merged into the request
+ * @param {string} [a.socketPath]  - test override
+ * @param {string} [a.token]       - test override (skips token file read)
+ * @param {typeof net.createConnection} [a.connect] - test override
+ * @param {number} [a.timeoutMs]
+ * @returns {Promise<object>} the broker success body
+ */
+export async function brokerMlsCall({
+  scope = 'main',
+  kind,
+  fields,
+  socketPath,
+  token,
+  connect,
+  timeoutMs,
+} = {}) {
+  if (typeof kind !== 'string' || !kind.startsWith('mls_')) {
+    throw new Error(`brokerMlsCall: invalid kind ${JSON.stringify(kind)}`);
+  }
+  const sp = socketPath ?? brokerSocketPath(scope);
+  const tok = token ?? (await readBrokerToken(scope));
+  const resp = await brokerIpcCall({
+    socketPath: sp,
+    token: tok,
+    kind,
+    fields: fields && typeof fields === 'object' ? fields : undefined,
+    connect,
+    timeoutMs,
+  });
+  if (resp.error) {
+    const code = resp.error.code ?? 'broker_error';
+    throw new Error(`${kind} failed: broker ${code}: ${resp.error.message ?? ''}`);
+  }
+  // The broker may legitimately return an empty body for void ops
+  // (forget/rollback/bind) — normalize to `{}` so callers can read it freely.
+  return resp.body ?? {};
+}
+
+/**
  * Derive the agent's operator-store MAC key via the signed broker (MLS-custody).
  * The broker holds the slot seed and returns the 32-byte HKDF key node uses to
  * integrity-MAC its at-rest operator-store (rules/memories) — byte-identical to
