@@ -15,6 +15,7 @@ process.env.HOME = HOME;
 process.env.USERPROFILE = HOME;
 
 const { recordRuleHit, readRuleHits, unshippedHits, shipRuleHits } = await import('../lib/rule-metrics.js');
+const { shipRuleMetrics, RULE_HITS_PATH } = await import('../lib/rule-metrics-ship.js');
 
 after(() => {
   try { rmSync(HOME, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -67,4 +68,59 @@ test('ship advances the cursor only on success; retries on failure', async () =>
   // A new hit is the only thing pending next time.
   recordRuleHit({ scope: 'd', ruleId: 'r3', severity: 'rewrite', tool: 'shell' });
   assert.deepEqual(unshippedHits('d').map((h) => h.rule_id), ['r3']);
+});
+
+// REGRESSION — broker-native (ES256) agent shipped nothing because the shipper
+// bailed on a null signingKey/slotSeed (no seed in node by custody design); the
+// broker covers auth/seal/sign. shipRuleMetrics must REACH authedIdpFetch with a
+// null signingKey, not bail.
+test('shipRuleMetrics: broker-native (null signingKey) reaches authedIdpFetch and ships', async () => {
+  recordRuleHit({ scope: 'bn', ruleId: 'r1', severity: 'deny', tool: 'shell' });
+  let reached = null;
+  const n = await shipRuleMetrics({
+    idpUrl: 'https://idp.test',
+    scope: 'bn',
+    agentDid: 'did:lastid:agent:zDn',
+    vcCompact: 'vc.jwt',
+    signingKey: null, // broker-native: no key in node
+    _authedIdpFetch: async (opts) => { reached = opts; return {}; },
+  });
+  assert.equal(n, 1, 'shipped the single pending hit via the broker path');
+  assert.ok(reached, 'authedIdpFetch WAS called (did not bail on null signingKey)');
+  assert.equal(reached.path, RULE_HITS_PATH);
+  assert.equal(reached.signingKey, null);
+  assert.equal(unshippedHits('bn').length, 0, 'cursor advanced on success');
+});
+
+test('shipRuleMetrics: missing vcCompact still bails WITHOUT calling authedIdpFetch (no regression)', async () => {
+  recordRuleHit({ scope: 'bn2', ruleId: 'r1', severity: 'deny', tool: 'shell' });
+  let called = false;
+  const n = await shipRuleMetrics({
+    idpUrl: 'https://idp.test',
+    scope: 'bn2',
+    agentDid: 'did:a',
+    vcCompact: '', // missing VC → bail
+    signingKey: null,
+    _authedIdpFetch: async () => { called = true; return {}; },
+  });
+  assert.equal(n, 0);
+  assert.equal(called, false, 'never reached the IdP call');
+  assert.equal(unshippedHits('bn2').length, 1, 'cursor untouched');
+});
+
+test('shipRuleMetrics: legacy path unchanged — a real signingKey still ships via authedIdpFetch', async () => {
+  const { generateKeyPairSync } = await import('node:crypto');
+  const { privateKey } = generateKeyPairSync('ed25519');
+  recordRuleHit({ scope: 'leg', ruleId: 'r1', severity: 'deny', tool: 'shell' });
+  let reached = null;
+  const n = await shipRuleMetrics({
+    idpUrl: 'https://idp.test',
+    scope: 'leg',
+    agentDid: 'did:a',
+    vcCompact: 'vc.jwt',
+    signingKey: privateKey,
+    _authedIdpFetch: async (opts) => { reached = opts; return {}; },
+  });
+  assert.equal(n, 1);
+  assert.equal(reached.signingKey, privateKey, 'legacy signingKey forwarded unchanged');
 });

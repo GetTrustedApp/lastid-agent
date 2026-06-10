@@ -24,9 +24,10 @@ export async function fetchWrappedVaultSecret({
   handlePubB64,
   handleId,
   fetchImpl = globalThis.fetch,
+  _authedIdpFetch = authedIdpFetch,
 }) {
   if (!vcCompact) throw new Error('no agent VC — cannot fetch vault secret');
-  if (!signingKey) throw new Error('no signingKey — cannot mint DPoP for vault secret');
+  // Broker-native null signingKey; broker covers DPoP via authedIdpFetch; the slot-unseal of the returned secret is already broker-wired in vault-cache.js decryptVaultEnvelope.
   if (!handlePubB64 || !handleId) throw new Error('handle pubkey + id required to wrap the secret');
   // Route through the shared, broker-aware authedIdpFetch (FORK1). Preserve the
   // 404 → null contract (revoked / never shared / wrong agent): authedIdpFetch
@@ -34,7 +35,7 @@ export async function fetchWrappedVaultSecret({
   // and any other non-2xx re-throws. Scope is ambient (getActiveScope).
   let json;
   try {
-    json = await authedIdpFetch({
+    json = await _authedIdpFetch({
       idpUrl,
       method: 'POST',
       path: `/v1/agent-state/vault/${encodeURIComponent(id)}/secret`,

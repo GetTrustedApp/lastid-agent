@@ -78,19 +78,61 @@ test('fetchWrappedVaultSecret signs DPoP ES256 for a P-256 signingKey', async ()
   assert.equal(decodeJwtHeader(captured.headers.DPoP).alg, 'ES256');
 });
 
-test('fetchWrappedVaultSecret throws a clear error when signingKey is missing', async () => {
+// REGRESSION — broker-native (ES256) agent's JIT secret fetch died because it
+// threw on a null signingKey (no seed in node by custody design); the broker
+// covers the DPoP via authedIdpFetch and the returned secret's slot-unseal is
+// already broker-wired in vault-cache.js decryptVaultEnvelope. The fetch must
+// REACH authedIdpFetch with a null signingKey, not throw at the guard.
+test('fetchWrappedVaultSecret: broker-native (null signingKey) reaches authedIdpFetch and returns the secret', async () => {
+  let reached = null;
+  const secret = await fetchWrappedVaultSecret({
+    idpUrl: 'https://idp.example.com',
+    agentDid: 'did:lastid:agent:zDnBrokerNative',
+    vcCompact: 'vc.compact.stub',
+    signingKey: null, // broker-native: no key in node
+    id: 'vault_1',
+    handlePubB64: 'PUBKEY',
+    handleId: 'h-1',
+    _authedIdpFetch: async (opts) => { reached = opts; return { wrapped_secret_b64: 'WRAP' }; },
+  });
+  assert.equal(secret, 'WRAP', 'returned the wrapped secret via the broker path');
+  assert.ok(reached, 'authedIdpFetch WAS called (did not bail on null signingKey)');
+  assert.equal(reached.signingKey, null);
+  assert.ok(reached.path.includes('/vault/'));
+});
+
+test('fetchWrappedVaultSecret: missing vcCompact still throws WITHOUT calling authedIdpFetch (no regression)', async () => {
+  let called = false;
   await assert.rejects(
     fetchWrappedVaultSecret({
       idpUrl: 'https://idp.example.com',
       agentDid: 'did:lastid:agent:zX',
-      vcCompact: 'vc.compact.stub',
+      vcCompact: '', // missing VC → throws before the fetch
+      signingKey: null,
       id: 'vault_1',
       handlePubB64: 'PUBKEY',
       handleId: 'h-1',
-      fetchImpl: fetchStub({}),
+      _authedIdpFetch: async () => { called = true; return {}; },
     }),
-    /no signingKey/,
+    /no agent VC/,
   );
+  assert.equal(called, false, 'never reached the IdP call');
+});
+
+test('fetchWrappedVaultSecret: legacy path unchanged — a real signingKey reaches authedIdpFetch', async () => {
+  const { privateKey } = generateKeyPairSync('ed25519');
+  let reached = null;
+  await fetchWrappedVaultSecret({
+    idpUrl: 'https://idp.example.com',
+    agentDid: 'did:lastid:agent:z6MkLegacy',
+    vcCompact: 'vc.compact.stub',
+    signingKey: privateKey,
+    id: 'vault_1',
+    handlePubB64: 'PUBKEY',
+    handleId: 'h-1',
+    _authedIdpFetch: async (opts) => { reached = opts; return { wrapped_secret_b64: 'WRAP' }; },
+  });
+  assert.equal(reached.signingKey, privateKey, 'legacy signingKey forwarded unchanged');
 });
 
 test('fetchWrappedVaultSecret returns null on 404 (revoked / not shared / wrong agent)', async () => {

@@ -18,7 +18,7 @@ import { deriveProjectRoutingId, encryptProjectContent } from './project-crypto.
 import { deriveAgentKeypair } from './agent-provisioning.js';
 import { signAgentRecordJws, sha256Hex } from './agent-sig-verify.js';
 import { authedIdpFetch } from './mls-groups-api.js';
-import { brokerAvailable, brokerSignAgentRecord } from './broker-ipc.js';
+import { brokerAvailable, brokerSignAgentRecord, brokerEncryptContent } from './broker-ipc.js';
 import { brokerIdpEnabled } from './broker-supervisor.js';
 import { getActiveScope } from './active-scope.js';
 
@@ -56,8 +56,23 @@ export function memorySyncContent(m) {
  * status: 'active' (write/update) carries the encrypted content; 'revoked'
  * (forget) is a content-less tombstone. Returns true on a 2xx.
  */
-export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'active', version, fetchImpl = globalThis.fetch }) {
-  if (typeof fetchImpl !== 'function' || !idpUrl || !loaded?.slotSeed) return false;
+export async function publishAgentMemory({
+  idpUrl,
+  loaded,
+  memory,
+  status = 'active',
+  version,
+  fetchImpl = globalThis.fetch,
+  _brokerEncryptContent = brokerEncryptContent,
+  _brokerSignAgentRecord = brokerSignAgentRecord,
+  _brokerAvailable = brokerAvailable,
+  _authedIdpFetch = authedIdpFetch,
+}) {
+  const brokerNative = loaded?.brokerNative === true;
+  // Broker-native (ES256/MLS-custody) agents hold NO slot seed in node: the signed
+  // broker seals content + signs the record + covers IdP auth. Legacy agents derive
+  // from the in-node seed below.
+  if (typeof fetchImpl !== 'function' || !idpUrl || !loaded || (!brokerNative && !loaded.slotSeed)) return false;
   const agentDid = loaded.agentDid;
   const ver = Number.isInteger(version) ? version : Number(memory.version) || 1;
 
@@ -69,10 +84,12 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
   // is for the ES256 record signature via the WASM signer.
   let signingKey;
   let signingSeed;
-  try {
-    ({ signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid));
-  } catch {
-    return false;
+  if (!brokerNative) {
+    try {
+      ({ signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid));
+    } catch {
+      return false;
+    }
   }
 
   const isRevoke = status === 'revoked';
@@ -97,9 +114,11 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
   // any no-broker (legacy) path keep the local dual-algo signer.
   const isEd25519 = signingKey?.asymmetricKeyType === 'ed25519';
   const recordScope = getActiveScope();
+  const brokerUp = !isEd25519 && brokerIdpEnabled() && (await _brokerAvailable(recordScope));
+  if (brokerNative && !brokerUp) return false; // no seed in node + no broker → can't sign; caller marks unsynced, retries
   let sig;
-  if (!isEd25519 && brokerIdpEnabled() && (await brokerAvailable(recordScope))) {
-    sig = await brokerSignAgentRecord({ scope: recordScope, claims });
+  if (brokerUp) {
+    sig = await _brokerSignAgentRecord({ scope: recordScope, claims });
   } else {
     sig = signAgentRecordJws(claims, { signingKey, signingSeed });
   }
@@ -112,6 +131,11 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
     // project_key. Without the seed (older agent), we can't publish → fail
     // (caller rolls back / keeps it local) rather than write an unreadable doc.
     // author_agent_did lets a PEER agent resolve our key to verify the sig.
+    // Broker-native can't derive the project routing_id node-side (the broker's
+    // EncryptAgentContent takes a derived routing_id, not the project_key), so
+    // project-tier write-through for broker-native is deferred to a future broker
+    // routing-derivation op; until then it stays local (returns false here — no
+    // regression).
     if (!Buffer.isBuffer(loaded.projectRootSeed) || typeof memory.project_key !== 'string' || !memory.project_key) {
       return false;
     }
@@ -129,6 +153,15 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
           author_agent_did: agentDid,
         };
   } else {
+    // Broker-aware content sealing: a broker-native agent has no slot seed in
+    // node, so the signed broker seals via EncryptAgentContent (slot/global tier
+    // when routingId is omitted); legacy agents seal node-side under their seed.
+    // brokerEncryptContent is async → compute enc_b64 before building the body.
+    const enc_b64 = isRevoke ? null : Buffer.from(
+      brokerNative
+        ? await _brokerEncryptContent({ scope: recordScope, plaintext: contentBytes })
+        : encryptContent(loaded.slotSeed, contentBytes),
+    ).toString('base64');
     body = isRevoke
       ? { id: memory.id, target, status: 'revoked', version: ver, copies: [{ agent_did: agentDid }], sig }
       : {
@@ -136,7 +169,7 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
           target,
           status: 'active',
           version: ver,
-          copies: [{ agent_did: agentDid, enc_b64: encryptContent(loaded.slotSeed, contentBytes).toString('base64') }],
+          copies: [{ agent_did: agentDid, enc_b64 }],
           sig,
         };
   }
@@ -146,7 +179,7 @@ export async function publishAgentMemory({ idpUrl, loaded, memory, status = 'act
   // + the 5s timeout (passed as `signal`). The record sig is still minted node-
   // side above (signAgentRecordJws); broker-side signing is a later phase.
   try {
-    await authedIdpFetch({
+    await _authedIdpFetch({
       idpUrl,
       method: 'POST',
       path: MEMORIES_PATH,

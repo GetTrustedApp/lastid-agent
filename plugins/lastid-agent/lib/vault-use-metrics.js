@@ -50,14 +50,16 @@ export async function publishCredentialedUse({
   handle,
   metrics,
   fetchImpl = globalThis.fetch,
+  _authedIdpFetch = authedIdpFetch,
 }) {
   try {
-    if (!vcCompact || !signingKey || !handle?.itemId) return;
+    // Broker-native agents have a null signingKey; auth is covered by the broker via authedIdpFetch.
+    if (!vcCompact || !handle?.itemId) return;
     const body = credentialedUseBody(kind, handle, metrics);
     // Route through the shared, broker-aware authedIdpFetch (FORK1). Fire-and-
     // forget: the outer try/catch swallows everything (a metrics failure must
     // NEVER disrupt the vault flow), and scope is ambient (getActiveScope).
-    await authedIdpFetch({
+    await _authedIdpFetch({
       idpUrl,
       method: 'POST',
       path: `/v2/agents/${encodeURIComponent(agentDid)}/credentialed-use`,

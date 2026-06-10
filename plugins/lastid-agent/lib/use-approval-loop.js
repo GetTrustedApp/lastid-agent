@@ -64,21 +64,18 @@ async function createApprovalRow({
   agentDid,
   vcCompact,
   signingKey,
+  _authedIdpFetch = authedIdpFetch,
 }) {
   if (!vcCompact) {
     throw new Error(
       'use-approval: no agent VC available — agent must be provisioned',
     );
   }
-  if (!signingKey) {
-    throw new Error(
-      'use-approval: no signingKey available — required to mint DPoP proof',
-    );
-  }
+  // Broker-native has null signingKey; the broker mints the DPoP via authedIdpFetch.
   // Shared, broker-aware authedIdpFetch (FORK1): same Bearer + DPoP legacy
   // shaping, broker resource-token when enabled. Throws on non-2xx (caller
   // surfaces it). Scope is ambient (getActiveScope).
-  return authedIdpFetch({
+  return _authedIdpFetch({
     idpUrl: IDP_BASE_URL,
     method: 'POST',
     path: '/v1/agent-use-approvals',
@@ -143,6 +140,7 @@ export async function runApprovalLoop({
   agentDid,
   vcCompact,
   signingKey,
+  _authedIdpFetch = authedIdpFetch,
 }) {
   const request = approvalBody.approval_request;
   let created;
@@ -152,6 +150,7 @@ export async function runApprovalLoop({
       agentDid,
       vcCompact,
       signingKey,
+      _authedIdpFetch,
     });
   } catch (err) {
     return {

@@ -6,7 +6,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { credentialedUseBody } from '../lib/vault-use-metrics.js';
+import { credentialedUseBody, publishCredentialedUse } from '../lib/vault-use-metrics.js';
+import { generateKeyPairSync } from 'node:crypto';
 
 const HANDLE = {
   itemId: 'vault_1',
@@ -46,4 +47,68 @@ test('an approved handle records decision_kind=approval + the approval_id', () =
   const b = credentialedUseBody('mint', { ...HANDLE, wasApproved: true, approvalId: 'ap_1' });
   assert.equal(b.decision_kind, 'approval');
   assert.equal(b.approval_id, 'ap_1');
+});
+
+// REGRESSION — broker-native (ES256) agent shipped nothing because the shipper
+// bailed on a null signingKey (no seed in node by custody design); the broker
+// covers auth/seal/sign. publishCredentialedUse must REACH authedIdpFetch with a
+// null signingKey, not bail.
+test('publishCredentialedUse: broker-native (null signingKey) reaches authedIdpFetch', async () => {
+  let reached = null;
+  await publishCredentialedUse({
+    idpUrl: 'https://idp.test',
+    agentDid: 'did:lastid:agent:zDn',
+    vcCompact: 'vc.jwt',
+    signingKey: null, // broker-native: no key in node
+    kind: 'mint',
+    handle: HANDLE,
+    _authedIdpFetch: async (opts) => { reached = opts; return {}; },
+  });
+  assert.ok(reached, 'authedIdpFetch WAS called (did not bail on null signingKey)');
+  assert.equal(reached.signingKey, null);
+  assert.ok(reached.path.includes('/credentialed-use'));
+  assert.equal(reached.body.item_id, 'vault_1');
+});
+
+test('publishCredentialedUse: missing vcCompact still bails WITHOUT calling authedIdpFetch (no regression)', async () => {
+  let called = false;
+  await publishCredentialedUse({
+    idpUrl: 'https://idp.test',
+    agentDid: 'did:a',
+    vcCompact: '', // missing VC → bail
+    signingKey: null,
+    kind: 'mint',
+    handle: HANDLE,
+    _authedIdpFetch: async () => { called = true; return {}; },
+  });
+  assert.equal(called, false, 'never reached the IdP call');
+});
+
+test('publishCredentialedUse: missing handle.itemId still bails WITHOUT calling authedIdpFetch (no regression)', async () => {
+  let called = false;
+  await publishCredentialedUse({
+    idpUrl: 'https://idp.test',
+    agentDid: 'did:a',
+    vcCompact: 'vc.jwt',
+    signingKey: null,
+    kind: 'mint',
+    handle: { itemId: '' }, // no item → bail
+    _authedIdpFetch: async () => { called = true; return {}; },
+  });
+  assert.equal(called, false, 'never reached the IdP call');
+});
+
+test('publishCredentialedUse: legacy path unchanged — a real signingKey still reaches authedIdpFetch', async () => {
+  const { privateKey } = generateKeyPairSync('ed25519');
+  let reached = null;
+  await publishCredentialedUse({
+    idpUrl: 'https://idp.test',
+    agentDid: 'did:a',
+    vcCompact: 'vc.jwt',
+    signingKey: privateKey,
+    kind: 'mint',
+    handle: HANDLE,
+    _authedIdpFetch: async (opts) => { reached = opts; return {}; },
+  });
+  assert.equal(reached.signingKey, privateKey, 'legacy signingKey forwarded unchanged');
 });

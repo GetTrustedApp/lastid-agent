@@ -254,6 +254,85 @@ test('runApprovalLoop signs DPoP ES256 for a P-256 signingKey', async () => {
   assert.equal(decodeJwtHeader(captured.getDpop).alg, 'ES256');
 });
 
+// REGRESSION — broker-native (ES256) agent's use-approval flow died because
+// createApprovalRow threw on a null signingKey (no seed in node by custody
+// design); the broker mints the DPoP via authedIdpFetch. The loop must REACH
+// authedIdpFetch with a null signingKey, not throw at the guard.
+test('runApprovalLoop: broker-native (null signingKey) reaches authedIdpFetch (no throw on null key)', async () => {
+  let calls = 0;
+  const reached = [];
+  const outcome = await runApprovalLoop({
+    approvalBody: {
+      approval_request: {
+        agent_did: 'did:lastid:agent:zDnBrokerNative',
+        parent_human_did: 'did:lastid:zHUMAN',
+        share_id: 'share::did:lastid:agent:zDnBrokerNative::item-1',
+      },
+    },
+    originalArgs: { item_id: 'item-1' },
+    agentDid: 'did:lastid:agent:zDnBrokerNative',
+    vcCompact: 'vc.compact.stub',
+    signingKey: null, // broker-native: no key in node
+    _authedIdpFetch: async (opts) => {
+      calls += 1;
+      reached.push(opts);
+      if (calls === 1) return { approval_id: 'appr-bn' }; // create row
+      return { status: 'denied' }; // poll → terminate cleanly
+    },
+  });
+  assert.ok(outcome.denied, 'loop ran to a clean denied outcome (no signingKey throw)');
+  assert.ok(reached.length >= 1, 'authedIdpFetch WAS called (did not bail on null signingKey)');
+  assert.equal(reached[0].signingKey, null);
+  assert.equal(reached[0].path, '/v1/agent-use-approvals');
+});
+
+test('runApprovalLoop: missing vcCompact still fails WITHOUT calling authedIdpFetch (no regression)', async () => {
+  let called = false;
+  const outcome = await runApprovalLoop({
+    approvalBody: {
+      approval_request: {
+        agent_did: 'did:a',
+        parent_human_did: 'did:lastid:zHUMAN',
+        share_id: 'share::did:a::item-1',
+      },
+    },
+    originalArgs: { item_id: 'item-1' },
+    agentDid: 'did:a',
+    vcCompact: '', // missing VC → createApprovalRow throws before the fetch
+    signingKey: null,
+    _authedIdpFetch: async () => { called = true; return {}; },
+  });
+  assert.ok(outcome.denied, 'surfaced as a create-failed denial');
+  assert.equal(outcome.body.error, 'policy_approval_create_failed');
+  assert.equal(called, false, 'never reached the IdP call');
+});
+
+test('runApprovalLoop: legacy path unchanged — a real signingKey reaches authedIdpFetch', async () => {
+  const { privateKey } = generateKeyPairSync('ed25519');
+  const reached = [];
+  let calls = 0;
+  await runApprovalLoop({
+    approvalBody: {
+      approval_request: {
+        agent_did: 'did:lastid:agent:z6MkLegacy',
+        parent_human_did: 'did:lastid:zHUMAN',
+        share_id: 'share::did:lastid:agent:z6MkLegacy::item-1',
+      },
+    },
+    originalArgs: { item_id: 'item-1' },
+    agentDid: 'did:lastid:agent:z6MkLegacy',
+    vcCompact: 'vc.compact.stub',
+    signingKey: privateKey,
+    _authedIdpFetch: async (opts) => {
+      calls += 1;
+      reached.push(opts);
+      if (calls === 1) return { approval_id: 'appr-leg' };
+      return { status: 'denied' };
+    },
+  });
+  assert.equal(reached[0].signingKey, privateKey, 'legacy signingKey forwarded unchanged');
+});
+
 test('verifyDecisionJws rejects a JWS whose share_id does not match', async () => {
   const { webcrypto } = await import('node:crypto');
   const keyPair = await webcrypto.subtle.generateKey(

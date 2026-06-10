@@ -17,15 +17,17 @@ export async function shipRuleMetrics({
   vcCompact,
   signingKey,
   fetchImpl = globalThis.fetch,
+  _authedIdpFetch = authedIdpFetch,
 }) {
-  if (typeof fetchImpl !== 'function' || !idpUrl || !vcCompact || !signingKey) return 0;
+  // Broker-native agents have a null signingKey; auth is covered by the broker via authedIdpFetch.
+  if (typeof fetchImpl !== 'function' || !idpUrl || !vcCompact) return 0;
   // Route through the shared, broker-aware authedIdpFetch (FORK1); preserve the
   // offline-safe BOOLEAN contract + the 5s timeout (passed as `signal`, which
   // authedIdpFetch forwards to the legacy fetch; the broker path has its own
   // IPC timeout). authedIdpFetch throws on non-2xx, so try/catch → false.
   return shipRuleHits(scope, async (records) => {
     try {
-      await authedIdpFetch({
+      await _authedIdpFetch({
         idpUrl,
         method: 'POST',
         path: RULE_HITS_PATH,
