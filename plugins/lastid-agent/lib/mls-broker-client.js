@@ -185,6 +185,24 @@ export class MlsBrokerClient {
   }
 
   /**
+   * Reconcile this group's device membership THROUGH THE BROKER (multi-device,
+   * unit B2). The broker drives the shared `lastid-mls-core` reconcile loop over
+   * its own IdP-call seam — discovering the operator's other devices (e.g. a
+   * newly-added phone) and adding/evicting leaves as needed — so a broker-native
+   * agent reconciles WITHOUT any node openmls handle.
+   *
+   * NOTE: `idpGroupId` is the IdP group UUID string (NOT the openmls base64 id);
+   * the broker reconcile reads the IdP group id.
+   *
+   * @param {string} idpGroupId The IdP group UUID to reconcile.
+   * @returns {Promise<boolean>} `true` iff a commit (add or evict) was made.
+   */
+  async reconcileGroup(idpGroupId) {
+    const body = await this.#mls('mls_reconcile_group', { group_id: idpGroupId });
+    return Boolean(body?.changed);
+  }
+
+  /**
    * No-op — the broker auto-persists after every state-mutating op, so node has
    * nothing to flush. Kept for MlsClient source compatibility.
    */

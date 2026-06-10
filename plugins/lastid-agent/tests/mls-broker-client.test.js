@@ -189,6 +189,40 @@ test('bindGroupIdMapping → undefined; kind mls_bind_group_id with both fields'
   assert.deepEqual(calls[0].fields, { idp_group_id: 'idp-uuid', openmls_b64: 'OPENMLS_B64' });
 });
 
+test('reconcileGroup → Boolean(body.changed); kind mls_reconcile_group with group_id (IdP uuid)', async () => {
+  const { client, calls } = clientWith({ changed: true });
+  const out = await client.reconcileGroup('idp-uuid-123');
+  assert.equal(out, true);
+  assert.equal(typeof out, 'boolean');
+  assert.equal(calls[0].kind, 'mls_reconcile_group');
+  // group_id is the IdP UUID string (NOT the openmls base64 id).
+  assert.deepEqual(calls[0].fields, { group_id: 'idp-uuid-123' });
+});
+
+test('reconcileGroup → returns false for a no-op (changed:false) and for a missing/empty body', async () => {
+  const noop = new MlsBrokerClient({
+    agentDid: AGENT_DID,
+    call: async () => ({ changed: false }),
+  });
+  assert.equal(await noop.reconcileGroup('g'), false);
+
+  const empty = new MlsBrokerClient({
+    agentDid: AGENT_DID,
+    call: async () => ({}),
+  });
+  assert.equal(await empty.reconcileGroup('g'), false, 'empty body coerces to false');
+});
+
+test('reconcileGroup → a broker rejection propagates', async () => {
+  const client = new MlsBrokerClient({
+    agentDid: AGENT_DID,
+    call: async () => {
+      throw new Error('mls_reconcile_group failed: broker bad_request: GroupDeviceMembershipStale');
+    },
+  });
+  await assert.rejects(client.reconcileGroup('g'), /GroupDeviceMembershipStale/);
+});
+
 test('persist() and free() are no-ops (broker owns durability + handle lifecycle)', async () => {
   let called = false;
   const client = new MlsBrokerClient({

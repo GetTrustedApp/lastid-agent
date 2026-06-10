@@ -1572,6 +1572,51 @@ async function cmdListen(flags) {
     );
   }
 
+  // Multi-device reconcile for a BROKER-NATIVE agent (unit B2): instead of the
+  // node-side wasm reconcile (which a broker agent never builds), drive the
+  // reconcile for EACH of the agent's operator groups THROUGH THE BROKER. The
+  // broker runs the shared lastid-mls-core reconcile loop over its own IdP-call
+  // seam — discovering the operator's other devices (e.g. a newly-added phone)
+  // and adding their leaves. Guarded by the same `reconciling` mutex + `wsOpen`
+  // as the legacy path; declared here (before the WS block) so the on-connect
+  // pass can call it. Best-effort: each group's result is logged; one group's
+  // error never blocks the others. Ed25519/legacy agents never reach this — they
+  // keep the node-side reconcile below.
+  let reconciling = false;
+  const reconcileBrokerGroups = async (trigger) => {
+    if (!useBrokerMls) return;
+    if (!wsOpen || reconciling || !operatorDid) return;
+    if (typeof mls.reconcileGroup !== 'function') return;
+    reconciling = true;
+    try {
+      const { listGroups } = await import('./agent-groups.js');
+      const groups = await listGroups({ scope });
+      // SECURITY: only the agent's OWN operator's groups (exact operator_did
+      // match) — never reconcile a group whose peer isn't the operator.
+      const operatorGroups = groups.filter(
+        (g) => g.operatorDid === operatorDid && g.idpGroupId,
+      );
+      for (const g of operatorGroups) {
+        try {
+          const changed = await mls.reconcileGroup(g.idpGroupId);
+          process.stderr.write(
+            `[lastid-agent] broker reconcile (${trigger}) ${g.idpGroupId}: ${changed ? 'changed' : 'no-op'}\n`,
+          );
+        } catch (err) {
+          process.stderr.write(
+            `[lastid-agent] broker reconcile (${trigger}) ${g.idpGroupId} failed: ${err?.message ?? err}\n`,
+          );
+        }
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[lastid-agent] broker reconcile (${trigger}) enumerate failed: ${err?.message ?? err}\n`,
+      );
+    } finally {
+      reconciling = false;
+    }
+  };
+
   if (flags['publish-keypackage'] || flags['publish-keypackage'] === undefined) {
     // Maintenance pass — fetch current inventory, top up only if
     // below the threshold. Avoids re-publishing on every session
@@ -1710,6 +1755,12 @@ async function cmdListen(flags) {
           `[lastid-agent] fetchQueues on connect failed: ${err?.message ?? err}\n`,
         ),
       );
+      // Multi-device reconcile on (re)connect (unit B2): a broker-native agent
+      // reconciles its operator groups through the broker the moment the socket
+      // comes up, so a newly-added device (e.g. the operator's phone) is welcomed
+      // PROMPTLY rather than waiting up to 5 minutes for the next timer tick.
+      // No-op for Ed25519/legacy agents (reconcileBrokerGroups self-skips).
+      void reconcileBrokerGroups('on-connect');
       // Catch-up: pull current operator rules/memories on (re)connect, so
       // a freshly-provisioned or long-offline agent gets up to date.
       void runAgentStateSync(loaded, scope)
@@ -2096,14 +2147,17 @@ async function cmdListen(flags) {
   // there's no group yet (ensureConversation owns creation). The DECISION runs
   // the shared planner — the same logic native uses.
   const RECONCILE_INTERVAL_MS = 5 * 60_000;
-  let reconciling = false;
+  // `reconciling` + `reconcileBrokerGroups` are declared earlier (before the WS
+  // block) so the on-connect pass can reuse the same mutex.
   const reconcileTimer = setInterval(() => {
-    // MLS-into-broker (B3): node-side reconcile drives the NODE wasm orchestrator
-    // (reconcileConversationDevices → getOrchestrator), which the broker branch
-    // never builds. Those orchestration duties move to the broker in a later
-    // unit; for now the broker branch simply doesn't run node-side reconcile, so
-    // skip the tick rather than fault into a node openmls instance.
-    if (useBrokerMls) return;
+    // Multi-device reconcile for a BROKER-NATIVE agent (unit B2): the node-side
+    // reconcile drives a NODE wasm orchestrator the broker branch never builds,
+    // so for broker agents we reconcile EACH operator group THROUGH THE BROKER
+    // instead of skipping the tick. Ed25519/legacy agents keep the node path.
+    if (useBrokerMls) {
+      void reconcileBrokerGroups('timer');
+      return;
+    }
     if (!wsOpen || reconciling || !operatorDid) return;
     reconciling = true;
     void reconcileConversationDevices({
