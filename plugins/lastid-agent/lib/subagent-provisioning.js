@@ -533,15 +533,37 @@ function readCapabilitiesFromVc(vcCompact) {
 }
 
 /**
- * Byte-compare two capability lists (deep equality). Capabilities are
- * small JSON arrays of {resource, actions[], constraints?[]} — a
- * canonical-JSON comparison is sufficient and avoids the order-sensitivity
- * of deep-equal libraries.
+ * Order-insensitive equality of two capability lists. Capabilities are small
+ * JSON arrays of `{resource, actions[], constraints?[]}`.
+ *
+ * MUST canonicalize first: the two sides come from DIFFERENT sources with
+ * DIFFERENT object key order — `readCapabilitiesFromVc` yields the issuer's
+ * `{actions, resource}` shape while the desired list is the config's
+ * `{resource, actions}` shape — and `JSON.stringify` is sensitive to BOTH
+ * object-key order AND array order. The old `stringify(a) === stringify(b)`
+ * therefore reported drift on every restart for identical caps → the agent
+ * re-minted the sub-agent VC every load (accumulating duplicate sub-agents).
+ * Canonicalize each cap to a fixed key order with sorted actions/constraints,
+ * sort the list by resource, then compare.
  */
-function capabilitiesEqual(a, b) {
-  const A = Array.isArray(a) ? a : [];
-  const B = Array.isArray(b) ? b : [];
-  return JSON.stringify(A) === JSON.stringify(B);
+function canonicalizeCapability(cap) {
+  return {
+    resource: String(cap?.resource ?? ''),
+    actions: (Array.isArray(cap?.actions) ? cap.actions : []).map(String).sort(),
+    constraints: (Array.isArray(cap?.constraints) ? cap.constraints : [])
+      .map((c) => JSON.stringify(c))
+      .sort(),
+  };
+}
+
+export function capabilitiesEqual(a, b) {
+  const norm = (caps) =>
+    (Array.isArray(caps) ? caps : [])
+      .map(canonicalizeCapability)
+      .sort((x, y) =>
+        x.resource < y.resource ? -1 : x.resource > y.resource ? 1 : 0,
+      );
+  return JSON.stringify(norm(a)) === JSON.stringify(norm(b));
 }
 
 /**

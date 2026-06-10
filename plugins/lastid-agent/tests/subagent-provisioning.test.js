@@ -8,7 +8,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 
-import { provisionSubagent, subagentNextIndexUrls } from '../lib/subagent-provisioning.js';
+import {
+  provisionSubagent,
+  subagentNextIndexUrls,
+  capabilitiesEqual,
+} from '../lib/subagent-provisioning.js';
 
 test('provisionSubagent: NEGATIVE — parentSlotSeed must be a 32-byte Buffer', async () => {
   await assert.rejects(
@@ -139,4 +143,60 @@ test('subagentNextIndexUrls: slugs with reserved characters are URL-encoded', ()
     url,
     'https://human.lastid.co/v1/oid4vci/agent-provision/sub/next-index?sub_agent_class=sweep%3Av2.beta',
   );
+});
+
+// ── capabilitiesEqual: order-insensitive (regression for duplicate sub-agents) ──
+// The agent re-minted the sub-agent VC on EVERY broker/listener load — and so
+// accumulated duplicate sub-agents (operator saw 5x "logdiver slot #0") —
+// because capabilitiesEqual was `JSON.stringify(a) === JSON.stringify(b)`,
+// which is sensitive to object-KEY order. The VC-parsed caps are
+// `{actions, resource}`; the desired (config) caps are `{resource, actions}`.
+// Identical capabilities, different key order → reported "drift" → re-mint.
+
+test('capabilitiesEqual: POSITIVE — identical caps with different object KEY order are equal (the dup-subagent bug)', () => {
+  // Exactly the two shapes from the live caps-drift log.
+  const existingFromVc = [
+    { actions: ['Read'], resource: 'memory:read:global' },
+    { actions: ['Draft'], resource: 'memory:draft:global' },
+    { actions: ['Use'], resource: 'vault:use' },
+  ];
+  const desiredFromConfig = [
+    { resource: 'memory:read:global', actions: ['Read'] },
+    { resource: 'memory:draft:global', actions: ['Draft'] },
+    { resource: 'vault:use', actions: ['Use'] },
+  ];
+  assert.equal(capabilitiesEqual(existingFromVc, desiredFromConfig), true);
+});
+
+test('capabilitiesEqual: POSITIVE — same caps in different ARRAY order are equal', () => {
+  const a = [
+    { resource: 'vault:use', actions: ['Use'] },
+    { resource: 'memory:read:global', actions: ['Read'] },
+  ];
+  const b = [
+    { resource: 'memory:read:global', actions: ['Read'] },
+    { resource: 'vault:use', actions: ['Use'] },
+  ];
+  assert.equal(capabilitiesEqual(a, b), true);
+});
+
+test('capabilitiesEqual: POSITIVE — same cap with ACTIONS in different order are equal', () => {
+  const a = [{ resource: 'r', actions: ['Read', 'Draft'] }];
+  const b = [{ resource: 'r', actions: ['Draft', 'Read'] }];
+  assert.equal(capabilitiesEqual(a, b), true);
+});
+
+test('capabilitiesEqual: NEGATIVE — a missing capability is NOT equal', () => {
+  const a = [
+    { resource: 'memory:read:global', actions: ['Read'] },
+    { resource: 'vault:use', actions: ['Use'] },
+  ];
+  const b = [{ resource: 'memory:read:global', actions: ['Read'] }];
+  assert.equal(capabilitiesEqual(a, b), false);
+});
+
+test('capabilitiesEqual: NEGATIVE — a different action is NOT equal', () => {
+  const a = [{ resource: 'vault:use', actions: ['Use'] }];
+  const b = [{ resource: 'vault:use', actions: ['Read'] }];
+  assert.equal(capabilitiesEqual(a, b), false);
 });
