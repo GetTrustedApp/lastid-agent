@@ -567,29 +567,40 @@ async function cmdProvision(flags) {
   // it immediately. Runs AFTER the reissue reset above so the persisted keystore
   // (mls-state.b64, holding the KeyPackage private keys) survives. Non-fatal —
   // if this fails the operator can still chat once the runtime is up and retries.
-  try {
-    await publishAgentKeyPackage({
-      idpUrl,
-      agentDid: provisioned.agentDid,
-      vcCompact: provisioned.vcCompact,
-      slotSeed: provisioned.slotSeed,
-      scope,
-      // The device_id pinned at provisioning (`md-…` when machine-bound) so the
-      // first KeyPackages publish under the machine device, matching the
-      // credential the throwaway client stamps. null for a legacy agent → the
-      // client derives the legacy `ad-…`.
-      deviceId: provisioned.deviceId,
-    });
-    console.log('   mls keypkg: published');
-  } catch (err) {
-    console.error(
-      `   mls keypkg: publish failed (${
-        err instanceof Error ? err.message : String(err)
-      })`,
-    );
-    console.error(
-      '   You can retry later — the chat dock will fall back to a retry attempt.',
-    );
+  //
+  // CUSTODY (mem_01KTQK1E): only a legacy Ed25519 agent holds a node seed to mint
+  // the throwaway publish client here. A P-256 agent has NO seed in node — its
+  // KeyPackage publish runs in the listener (started moments below) via the shared
+  // MLS handle + broker-authed IdP POST, where no seed is needed. So we DEFER
+  // rather than call publishAgentKeyPackage seedless (which would throw the
+  // "slotSeed or shared mls handle required" error and read as a scary failure).
+  if (Buffer.isBuffer(provisioned.slotSeed) && provisioned.slotSeed.length === 32) {
+    try {
+      await publishAgentKeyPackage({
+        idpUrl,
+        agentDid: provisioned.agentDid,
+        vcCompact: provisioned.vcCompact,
+        slotSeed: provisioned.slotSeed,
+        scope,
+        // The device_id pinned at provisioning (`md-…` when machine-bound) so the
+        // first KeyPackages publish under the machine device, matching the
+        // credential the throwaway client stamps. null for a legacy agent → the
+        // client derives the legacy `ad-…`.
+        deviceId: provisioned.deviceId,
+      });
+      console.log('   mls keypkg: published');
+    } catch (err) {
+      console.error(
+        `   mls keypkg: publish failed (${
+          err instanceof Error ? err.message : String(err)
+        })`,
+      );
+      console.error(
+        '   You can retry later — the chat dock will fall back to a retry attempt.',
+      );
+    }
+  } else {
+    console.log('   mls keypkg: deferred to listener (broker-native, no node seed)');
   }
 
   // Bring the listener up — it loads the keystore the publish just persisted and

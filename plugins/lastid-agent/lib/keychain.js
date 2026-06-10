@@ -50,6 +50,64 @@ const SERVICE_SUB_SLOT_SEED = 'lastid.co/sub-agent-slot-seed';
 const SERVICE_SUB_VC = 'lastid.co/sub-agent-vc';
 
 /**
+ * Dual-algo seed-custody discriminator. The agent DID's multibase prefix encodes
+ * its key algo: `z6Mk…` = Ed25519 (legacy), anything else (`zDn…`) = P-256/ES256.
+ *
+ * CUSTODY INVARIANT (operator, mem_01KTQK1E): node may hold/use slot-seed material
+ * ONLY for Ed25519 agents. EVERY P-256/ES256 agent is broker-sole custody — node
+ * never uses its seed, even if a (stale) copy is physically present in the
+ * keychain. We therefore key custody off the ALGO, not off whether a seed byte
+ * happens to be present (the old `slotSeed === null` heuristic mis-classified a
+ * P-256 agent that still had a leftover keychain seed as a legacy node agent,
+ * routing vault/content decrypt into the node path with a STALE key → AEAD auth
+ * failure "Unsupported state or unable to authenticate data").
+ *
+ * Mirrors `agentKeyTypeFromDid` in agent-provisioning.js — kept inline so this
+ * low-level keychain module takes no dependency on the heavy provisioning module;
+ * a unit test asserts the two never drift.
+ *
+ * @returns {'ed25519'|'p256'}
+ */
+export function seedAlgoFromDid(agentDid) {
+  const PREFIX = 'did:lastid:agent:';
+  const multibase =
+    typeof agentDid === 'string' && agentDid.startsWith(PREFIX)
+      ? agentDid.slice(PREFIX.length)
+      : '';
+  return multibase.startsWith('z6Mk') ? 'ed25519' : 'p256';
+}
+
+/**
+ * Pure custody decision for a loaded keychain bundle — the load-bearing half of
+ * loadAgentVc, factored out so it can be tested without a keychain mock.
+ *
+ * Applies the custody invariant (mem_01KTQK1E): node keeps seed material ONLY for
+ * an Ed25519 agent. For a P-256/ES256 agent the raw seed bytes (which MAY be
+ * physically present in the keychain as a stale dual-read copy) are dropped — node
+ * never uses them — and the agent is marked broker-native so every downstream
+ * consumer routes seed-derived work to the broker.
+ *
+ * When the DID is absent (very old bundle), fall back to seed-presence so a legacy
+ * node agent without a stored DID still loads its seed.
+ *
+ * @param {string|null} agentDid
+ * @param {Buffer|null} rawSlotSeed         seed bytes physically in the keychain
+ * @param {Buffer|null} rawProjectRootSeed
+ * @returns {{ slotSeed: Buffer|null, projectRootSeed: Buffer|null, brokerNative: boolean, algo: 'ed25519'|'p256' }}
+ */
+export function deriveSeedCustody(agentDid, rawSlotSeed, rawProjectRootSeed) {
+  const algo = agentDid ? seedAlgoFromDid(agentDid) : rawSlotSeed ? 'ed25519' : 'p256';
+  const seedCustodyInNode = algo === 'ed25519';
+  const slotSeed = seedCustodyInNode ? rawSlotSeed ?? null : null;
+  return {
+    algo,
+    slotSeed,
+    projectRootSeed: seedCustodyInNode ? rawProjectRootSeed ?? null : null,
+    brokerNative: slotSeed === null,
+  };
+}
+
+/**
  * Load the top-level agent's identity bundle from keychain. Returns null when
  * UNPROVISIONED (no VC).
  *
@@ -71,16 +129,27 @@ export async function loadAgentVc(scope = 'main') {
   const deviceId = await readSecret(`${SERVICE_DEVICE_ID}:${scope}`);
   const idpUrl = await readSecret(`${SERVICE_IDP_URL}:${scope}`);
   const projectRootSeedB64 = await readSecret(`${SERVICE_PROJECT_ROOT_SEED}:${scope}`);
-  const slotSeed = seedB64 ? Buffer.from(seedB64, 'base64url') : null;
+  const rawSlotSeed = seedB64 ? Buffer.from(seedB64, 'base64url') : null;
+  const rawProjectRootSeed = projectRootSeedB64
+    ? Buffer.from(projectRootSeedB64, 'base64url')
+    : null;
+  // Seed custody by ALGO (mem_01KTQK1E): drop any physically-present P-256 keychain
+  // seed so nothing downstream can route into a node seed path with a stale key —
+  // every consumer already falls back to the broker when slotSeed is null.
+  const { slotSeed, projectRootSeed, brokerNative } = deriveSeedCustody(
+    agentDid,
+    rawSlotSeed,
+    rawProjectRootSeed,
+  );
   return {
-    // Buffer for a legacy agent; null for broker-native (seed in the broker).
+    // Buffer for a legacy Ed25519 agent; null for every P-256 agent (broker holds
+    // the seed) AND for a seedless legacy bundle.
     slotSeed,
-    brokerNative: slotSeed === null,
+    brokerNative,
     // Optional — null for agents provisioned before project memories existed,
-    // AND for broker-native agents (their project seed is in the broker).
-    projectRootSeed: projectRootSeedB64
-      ? Buffer.from(projectRootSeedB64, 'base64url')
-      : null,
+    // for broker-native agents (project seed in the broker), AND always null for
+    // a P-256 agent (no node seed material, period).
+    projectRootSeed,
     slotIndex: slotIndexStr ? Number.parseInt(slotIndexStr, 10) : null,
     agentDid: agentDid ?? null,
     // Optional — null for agents provisioned before machine-binding (L5).
