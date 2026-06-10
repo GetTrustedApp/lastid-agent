@@ -197,4 +197,117 @@ flow works broker-only. Dual-read during migration → broker-only after (mem_01
 - Device model md-, L2 (IdP, deployed), L4 wallet device_authorization, L5 MLS
   device_id, L5a/b reissue+revoke cleanup, dual-algo Ed25519/P-256 (committed across
   the 3 repos: sdk `agents` 5385c87, idp keystone, plugin `main` b360de3).
+
+---
+
+## RESOLVED DESIGN — MLS-into-broker for P-256 (2026-06-09 session 2)
+
+Governing: [[mem_01KTQNCQ]] (architecture) + [[mem_01KTQK1E]] (custody invariant) +
+HANDOFF-mls-into-broker-es256.md. This section resolves handoff step 4 (the
+state-ownership boundary) and pins the build shape after a full read-only map of
+both sides (two Explore passes + the orchestrator trace, all cited below).
+
+### Decision 1 — Hosting model: broker hosts the FULL native orchestrator (not just the bot client)
+The reconcile/ensure control-flow already exists as **pure, port-based async
+functions** in `lastid-mls-core` — NO wasm/JS entanglement:
+- `reconcile_group_device_membership_once(client, transport, directory, store, host, group_id)` — `lastid-mls-core/src/reconcile.rs:59`
+- `maybe_rotate_direct_group_for_device_inventory(...)` — `lastid-mls-core/src/rotation.rs:83`
+- `add_member_devices_to_group` / `evict_member_devices_from_group` / `create_and_register_direct_group_shell` / `add_first_member_to_direct_group` — `lastid-mls-core/src/commit_ops.rs`
+
+They drive openmls only through FIVE port traits (`lastid-mls-core/src/ports.rs`):
+`MlsClientPort` (+ `MlsGroupHandle`), `DeviceDirectoryPort`, `GroupTransportPort`,
+`OrchestrationHostPort`, `MlsGroupStore`. The wasm side (`WasmMlsClient` /
+`WasmMlsOrchestrator`, `lastid-mls-wasm/src/{core_adapter,orchestrator}.rs`) is just
+ONE set of impls. **The broker supplies its OWN impls** backed by its existing seams:
+- `GroupTransportPort` → broker `IdpDispatch` / `Op::IdpCall` (POST /v1/groups, members, reconcile, evict; GET resolutions).
+- `DeviceDirectoryPort` → broker IdpCall (device lists + keypackage fetch).
+- `OrchestrationHostPort::bearer_credential` → broker `AgentKeypair` / resource-token; `emit_*_event` → reverse IPC channel to node; `spawn`/`schedule_reconcile_retry` → broker tokio runtime.
+- `MlsClientPort` + `MlsGroupHandle` → broker-hosted `PersistentBotMlsClient<R>` (`lastid-mls-wasm/src/persistent_bot_client.rs:88`, native struct, all 19 methods present).
+- `MlsGroupStore` → broker KV (group metadata).
+
+Rejected alternative: bot-client-only in broker + orchestration stays in node.
+That re-introduces a node openmls instance (split-brain, violates §3.1) OR forces
+reimplementing the Rust reconcile logic in JS (drift, anti-reuse). Not acceptable.
+
+### Decision 2 — State ownership: broker OWNS the openmls state outright (Phase C is the default for P-256)
+ONE openmls owner: a broker-side `Arc<Mutex<PersistentBotMlsClient<BrokerRawKv>>>`
+that BOTH the dispatcher path (proxied `MlsClient.fromBroker`) and the orchestrator
+core-fns share — exactly the wasm `Arc<Mutex<>>` shape (`core_adapter.rs`). Node
+never opens `mls-state.b64` for P-256; it holds zero MLS key material. No migration
+of existing P-256 MLS state — fresh provision only (handoff §4; corrupted scopes
+abandoned). Sealing reuses the **KAT-verified** `SeedDerivedKeys::derive_mls_state_key()`
+(`lastid-agent-broker/src/mls_state.rs:41`, byte-identical to node `deriveWrapKey`).
+Storage backing: a broker `BrokerRawKv` (impl `lastid-mls-storage::RawKv`,
+`lastid-mls-storage/src/lib.rs:92`) — simplest correct = in-memory map flushed to a
+single AES-256-GCM-sealed file in the broker runtime dir (mirrors node's proven
+whole-blob seal; MLS state is tiny). No SQLite dep.
+
+### Decision 3 — Node↔broker wire: `kind`-tagged MLS ops mirroring BrokerWsTransport
+Node `MlsClient.fromBroker(...)` = third backend alongside `open`/`fromOrchestrator`
+(`lib/mls-client.js`), selected at `lib/cli.js:1525` for `brokerNative && zDn`.
+Each state-mutating MlsClient method → one `kind` (e.g. `mls_generate_key_package`,
+`mls_process_welcome`, `mls_create_group`, `mls_add_members`, `mls_remove_member`,
+`mls_process_inbound`, `mls_encrypt_app_message`, `mls_commit_pending`,
+`mls_rollback_pending`, `mls_forget_group`) over the existing NDJSON IPC
+(`lib/broker-ipc.js`, `{id, auth_token, kind, ...fields}` → `{id, ok, body|error}`).
+Broker op pattern = 3 edit sites: `protocol.rs` Op enum + `ipc.rs` dispatch arm +
+`IdpDispatch` trait method (default NotImplemented) overridden in the real dispatch
+(`idp.rs`). For P-256, node ALSO stops building the wasm orchestrator — the listener
+triggers broker-side ensure/reconcile via IPC ops instead. Ed25519 path unchanged
+(discriminate by `seedAlgoFromDid`; no flag).
+
+### OPEN FORK for operator — the broker's MLS crate dependency
+`PersistentBotMlsClient` + the port adapters live in **`lastid-mls-wasm`**
+(`crate-type=["cdylib","rlib"]`, native build documented-clean, but
+`wasm-bindgen` is an UNCONDITIONAL dep and the crate header says "no native
+consumer"). Two ways to give the broker the native client:
+- **(A) Reuse-direct:** broker depends on `lastid-mls-wasm` as an rlib. Fastest,
+  zero SDK refactor; cost = signed broker pulls a "wasm"-named crate + wasm-bindgen
+  into its tree (compiles native, harmless at runtime, but cosmetically odd and
+  makes the broker the crate's first native consumer → its native surface must stay
+  stable).
+- **(B) Extract-clean:** lift the native pieces (`PersistentBotMlsClient`,
+  `PersistentProvider`, `WasmMlsClient`/`WasmMlsOrchestrator` adapters) into a new
+  non-wasm crate (e.g. `lastid-mls-client`) shared by `lastid-mls-wasm` + broker.
+  Cleaner long-term boundary, no wasm-bindgen in the broker; cost = SDK crate
+  refactor that touches the wasm build/recopy path (`build-and-copy-mls-wasm.sh`).
+DE-RISK before committing either: `cargo check -p lastid-agent-broker --features
+secure-enclave` with the MLS dep added, to confirm native compile (the unconditional
+wasm-bindgen + libcrux native build is documented-OK but must be proven in-tree).
+NOTE clippy under `secure-enclave` is already blocked transitively by ~102
+pre-existing workspace clippy errors ([[mem_01KT0FDQ]]) — compile is the gate, not clippy.
+
+### Build sequence (A+B merged per §3.1 — one coherent "broker is the MLS engine for P-256")
+1. Wire MLS dep + de-risk cargo check (resolve the fork above).
+2. Broker `BrokerRawKv` (sealed file KV) + host `Arc<Mutex<PersistentBotMlsClient>>`.
+3. Broker port impls (5 traits) over IdpDispatch + AgentKeypair; wire core reconcile/ensure fns.
+4. Broker IPC ops (protocol/ipc/IdpDispatch) for the MlsClient method set + high-level ensure/reconcile triggers; reverse event channel for emit_*_event.
+5. Plugin `MlsClient.fromBroker` + cli.js selection; P-256 skips wasm-orchestrator build.
+6. pos/neg tests both sides; rebuild/notarize/ship (`build-sign-ship-broker.sh`); live e2e: publish KPs (md-) → operator adds to group → welcome → owner↔agent chat round-trips.
+
+### CORRECTION (operator steer 2026-06-09) — adopt existing state, do NOT reprovision
+Operator: "nothing is wrong with provisioned states and until it fucking works i
+won't just keep reprovisioning slots." So the broker MUST **adopt the existing
+node `~/.lastid-agent/<scope>/mls-state.b64`** for already-provisioned P-256
+agents rather than start a fresh MLS store — else it orphans their group
+memberships + shared creds. This is safe because the broker derives the SAME wrap
+key (`SeedDerivedKeys::derive_mls_state_key`, KAT-identical to node `deriveWrapKey`),
+so it can unseal node's existing blob. Implication for `BrokerRawKv`: it must
+read/write the SAME sealed-blob FORMAT node uses (node seal = base64(1-byte ver ||
+12-nonce || 16-tag || ciphertext) over the wasm callback-backend's KV-cache blob
+serialization). OPEN: confirm the exact cache→blob serialization the wasm
+callback backend uses (lastid-mls-wasm `callback_kv.rs`/`persistent_provider`) so
+the broker round-trips node's existing `mls-state.b64` byte-for-byte. Live e2e
+therefore runs against the EXISTING provisioned agent, not a fresh slot — find the
+bug on disk ([[mem_f0e4e9a4a9714281ae629f254c48194d]]), don't wipe state.
+
+### Crate boundary RESOLVED (operator steer 2026-06-09): native `lastid-mls-bot`, not the wasm crate
+Operator: "there is already a whole rust mls tree that the wasm was extracted
+from, not sure why we would need to use the wasm at all." FINDING: the bot client
++ the ONLY `lastid-mls-core` port impls were authored IN `lastid-mls-wasm` (NOT in
+`lastid-mls`, which is the separate sqlx/phone path whose orchestration is now
+dead-code) and are already plain native Rust. RESOLUTION: extracted them into a
+new wasm-bindgen-free crate **`lastid-mls-bot`**; `lastid-mls-wasm` is now a thin
+shim re-exporting it; the broker depends on `lastid-mls-bot`. Native compile of
+bot+wasm+broker green; wasm-pack rebuild verified separately.
 </content>
