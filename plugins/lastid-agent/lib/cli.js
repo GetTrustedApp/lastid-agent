@@ -1536,6 +1536,12 @@ async function cmdListen(flags) {
     brokerNative: loaded.brokerNative === true,
     agentDid: loaded.agentDid,
   });
+  // Thread the discriminator into the listener ctx so a self-heal
+  // ensureConversation (from the outbox drain) routes the broker-native
+  // direct-chat setup THROUGH THE BROKER instead of building a node wasm
+  // orchestrator (a second openmls instance over the same sealed keystore =
+  // state corruption). The Ed25519/legacy path leaves this falsy → unchanged.
+  listenerCtx.useBrokerMls = useBrokerMls;
   let orchestrator = null;
   let mls;
   if (useBrokerMls) {

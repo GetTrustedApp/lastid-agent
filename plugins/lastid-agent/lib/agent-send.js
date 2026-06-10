@@ -257,10 +257,19 @@ async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, sig
   });
   if (!resolved) {
     // Self-heal: no conversation yet → the agent creates one and invites
-    // the operator's device(s), then sends. Only attempted when the
-    // listener handed us the auth material (idpUrl + VC + signing key);
-    // without it we keep the message queued for the next tick.
-    if (idpUrl && vcCompact && signingKey) {
+    // the operator's device(s), then sends. Two cases gate the auth material:
+    //  - Legacy/Ed25519: needs idpUrl + VC + the node signing key (DPoP). The
+    //    node wasm orchestrator makes the IdP calls.
+    //  - Broker-native (ctx.useBrokerMls): the SIGNING KEY IS NULL by design
+    //    (the broker injects auth itself), so we gate on idpUrl + VC only and
+    //    route the setup THROUGH THE BROKER (ensureConversation's broker branch
+    //    calls mls.ensureDirectGroup — never the node orchestrator, which would
+    //    build a second openmls instance and corrupt MLS state).
+    const brokerNative = ctx?.useBrokerMls === true;
+    const selfHealReady = brokerNative
+      ? Boolean(idpUrl && vcCompact)
+      : Boolean(idpUrl && vcCompact && signingKey);
+    if (selfHealReady) {
       const { ensureConversation } = await import('./ensure-conversation.js');
       resolved = await ensureConversation({
         scope,
@@ -271,9 +280,10 @@ async function sendOne({ scope, mls, agentDid, send, req, idpUrl, vcCompact, sig
         vcCompact,
         signingKey,
         log,
-        // Reuse the listener's ONE cached orchestrator (B1 convergence). When
-        // ctx is absent (a caller that hasn't been migrated), ensureConversation
-        // synthesizes a local ctx as before.
+        // Reuse the listener's ONE cached orchestrator (B1 convergence) and
+        // carry the broker discriminator (ctx.useBrokerMls). When ctx is absent
+        // (a caller that hasn't been migrated), ensureConversation synthesizes a
+        // local ctx as before (legacy path only).
         ctx,
       });
     }

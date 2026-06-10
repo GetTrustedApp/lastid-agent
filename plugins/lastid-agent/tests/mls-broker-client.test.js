@@ -223,6 +223,32 @@ test('reconcileGroup → a broker rejection propagates', async () => {
   await assert.rejects(client.reconcileGroup('g'), /GroupDeviceMembershipStale/);
 });
 
+test('ensureDirectGroup → returns the broker body; kind mls_ensure_direct_group with peer_did', async () => {
+  const body = { idp_group_id: 'idp-uuid-77', local_group_id: 'GID_B64', existing: false };
+  const { client, calls } = clientWith(body);
+  const out = await client.ensureDirectGroup('did:lastid:zOperator');
+  assert.deepEqual(out, body, 'returns the broker body verbatim');
+  assert.equal(calls[0].kind, 'mls_ensure_direct_group');
+  assert.deepEqual(calls[0].fields, { peer_did: 'did:lastid:zOperator' });
+  assert.equal(calls[0].scope, 'main');
+});
+
+test('ensureDirectGroup → surfaces the existing flag when the broker adopts a canonical group', async () => {
+  const { client } = clientWith({ idp_group_id: 'idp-uuid-9', local_group_id: 'GID', existing: true });
+  const out = await client.ensureDirectGroup('did:lastid:zOperator');
+  assert.equal(out.existing, true);
+});
+
+test('ensureDirectGroup → a broker rejection propagates', async () => {
+  const client = new MlsBrokerClient({
+    agentDid: AGENT_DID,
+    call: async () => {
+      throw new Error('mls_ensure_direct_group failed: broker bad_request: No key packages available');
+    },
+  });
+  await assert.rejects(client.ensureDirectGroup('did:lastid:zOperator'), /No key packages available/);
+});
+
 test('persist() and free() are no-ops (broker owns durability + handle lifecycle)', async () => {
   let called = false;
   const client = new MlsBrokerClient({

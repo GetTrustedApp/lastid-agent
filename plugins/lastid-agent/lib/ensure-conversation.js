@@ -19,6 +19,18 @@
  * map, which the wasm doesn't (and shouldn't) know about.
  *
  * Public signature is unchanged: callers (agent-send.js) don't move.
+ *
+ * BROKER-NATIVE (P-256 `zDn…`) agents take a SEPARATE path. cli.js never
+ * builds a node wasm orchestrator for them (MLS is served by the signed
+ * broker), so calling `getOrchestrator(...).startDirectChat(...)` here
+ * would spin up a SECOND node openmls instance over the same sealed
+ * keystore — state corruption (the multi-instance class). Instead we
+ * route the direct-chat setup THROUGH THE BROKER via
+ * `mls.ensureDirectGroup(operatorDid)` (a broker op composing the SAME
+ * `lastid-mls-core` direct-chat kernels), then record the mapping the
+ * identical way. The broker case is detected from `ctx.useBrokerMls`,
+ * the same discriminator cli.js computes (`brokerWsEligible`). The
+ * Ed25519/legacy path below is byte-identical to before.
  */
 
 import { resolveActiveGroupForOperator, recordGroup } from './agent-groups.js';
@@ -33,22 +45,24 @@ const DEFAULT_DEPS = {
 /**
  * @param {object} a
  * @param {string} a.scope
- * @param {import('./mls-client.js').MlsClient} [a.mls]  Live listener-owned client (unused post-C2; kept for backward-compat with callers).
+ * @param {import('./mls-client.js').MlsClient|import('./mls-broker-client.js').MlsBrokerClient} [a.mls]  Live listener-owned client. UNUSED on the legacy wasm path (post-C2); REQUIRED on the broker-native path (we drive `mls.ensureDirectGroup` through it).
  * @param {string} a.agentDid
  * @param {string} a.operatorDid    - the agent's parent human (its only peer).
  * @param {string} a.idpUrl
  * @param {string} a.vcCompact      - agent VC SD-JWT (bearer).
- * @param {import('node:crypto').KeyObject} a.signingKey - agent Ed25519 (DPoP).
+ * @param {import('node:crypto').KeyObject} a.signingKey - agent Ed25519 (DPoP). NULL for a broker-native agent (the broker injects auth).
  * @param {(line: string) => void} [a.log]
  * @param {object} [a.ctx]          - listener context for orchestrator caching;
  *                                    when omitted we synthesize a local one (so
  *                                    callers that haven't been migrated still work).
+ *                                    `ctx.useBrokerMls === true` routes the
+ *                                    broker-native path (no node orchestrator).
  * @param {Partial<typeof DEFAULT_DEPS>} [a.deps]
  * @returns {Promise<{ idpGroupId: string, groupIdB64: string, operatorDid: string }>}
  */
 export async function ensureConversation({
   scope,
-  mls: _mls,
+  mls,
   agentDid,
   operatorDid,
   idpUrl,
@@ -70,6 +84,47 @@ export async function ensureConversation({
   //    first so a known-good conversation is never silently re-created.
   const existing = await d.resolveActiveGroupForOperator({ scope, operatorDid });
   if (existing) return existing;
+
+  // 1b. BROKER-NATIVE branch + GUARD. A broker-native agent has NO node wasm
+  //     orchestrator (cli.js builds an MlsBrokerClient instead), so we MUST NOT
+  //     call getOrchestrator here — a second node openmls instance over the same
+  //     sealed keystore corrupts MLS state (the multi-instance class). Route the
+  //     direct-chat setup THROUGH THE BROKER (which composes the same
+  //     lastid-mls-core kernels), then record the mapping identically. Detected
+  //     via ctx.useBrokerMls — the SAME discriminator cli.js computes
+  //     (brokerWsEligible: brokerNative && did starts with did:lastid:agent:zDn).
+  if (ctx?.useBrokerMls === true) {
+    if (!mls || typeof mls.ensureDirectGroup !== 'function') {
+      throw new Error(
+        'ensureConversation: broker-native path requires an MlsBrokerClient with ensureDirectGroup',
+      );
+    }
+    // Broker op → { idp_group_id, local_group_id, existing }.
+    const result = await mls.ensureDirectGroup(operatorDid);
+    const idpGroupId = result?.idp_group_id;
+    const groupIdB64 = result?.local_group_id;
+    if (!idpGroupId || !groupIdB64) {
+      throw new Error('ensureConversation: broker returned no group ids');
+    }
+    // Record the IdP UUID ↔ openmls id mapping the SAME way the node path does
+    // (groups.json + the idp→openmls mapping the send path resolves against).
+    // The broker bookkeeps the peer device → leaf map internally, so node
+    // records no device leaves (parity with the orchestrator path's empty
+    // deviceLeaves). deviceIds stays empty: the broker owns device membership.
+    await d.recordGroup({
+      scope,
+      idpGroupId,
+      groupIdB64,
+      operatorDid,
+      deviceIds: [],
+      deviceLeaves: {},
+    });
+    logLine(
+      `[lastid-agent] established a conversation with the operator THROUGH THE BROKER → group ${idpGroupId}` +
+        (result?.existing ? ' (adopted existing canonical group)' : ''),
+    );
+    return { idpGroupId, groupIdB64, operatorDid };
+  }
 
   // 2. Delegate to the shared wasm orchestrator. It runs:
   //      lastid_mls_core::commit_ops::create_and_register_direct_group_shell

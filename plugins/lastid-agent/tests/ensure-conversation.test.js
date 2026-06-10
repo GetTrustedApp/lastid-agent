@@ -118,3 +118,109 @@ test('requires an operatorDid', async () => {
     /operatorDid required/,
   );
 });
+
+// ── Broker-native branch (G2): the agent-initiated self-heal for a
+//    brokerNative && zDn agent routes THROUGH THE BROKER and NEVER builds a
+//    node wasm orchestrator (a second openmls instance over the same sealed
+//    keystore = state corruption). Detected via ctx.useBrokerMls. ──────────────
+
+/** A fake broker MLS client recording ensureDirectGroup calls. */
+function fakeBrokerMls(result, calls = {}) {
+  return {
+    async ensureDirectGroup(peerDid) {
+      calls.ensureDirectGroup = { peerDid };
+      if (result instanceof Error) throw result;
+      return result;
+    },
+  };
+}
+
+test('broker-native: calls mls.ensureDirectGroup + recordGroup, NEVER getOrchestrator', async () => {
+  const brokerCalls = {};
+  let recordArgs;
+  const out = await ensureConversation({
+    ...BASE,
+    // Broker-native: the signing key is null by design (broker injects auth).
+    signingKey: null,
+    mls: fakeBrokerMls(
+      { idp_group_id: 'idp-broker-1', local_group_id: 'BROKERGID', existing: false },
+      brokerCalls,
+    ),
+    ctx: { useBrokerMls: true },
+    deps: {
+      resolveActiveGroupForOperator: async () => null,
+      // The GUARD: getOrchestrator must NEVER be reached on the broker path.
+      getOrchestrator: async () => assert.fail('getOrchestrator must not be called for a broker agent'),
+      recordGroup: async (a) => {
+        recordArgs = a;
+      },
+    },
+  });
+
+  assert.deepEqual(out, {
+    idpGroupId: 'idp-broker-1',
+    groupIdB64: 'BROKERGID',
+    operatorDid: BASE.operatorDid,
+  });
+  // The broker direct-chat setup was driven once, with the operator did.
+  assert.deepEqual(brokerCalls.ensureDirectGroup, { peerDid: BASE.operatorDid });
+  // The mapping was persisted the same way the node path does (operator-scoped).
+  assert.equal(recordArgs.idpGroupId, 'idp-broker-1');
+  assert.equal(recordArgs.groupIdB64, 'BROKERGID');
+  assert.equal(recordArgs.operatorDid, BASE.operatorDid);
+  assert.deepEqual(recordArgs.deviceIds, [], 'broker owns device membership → node records no device ids');
+});
+
+test('broker-native: reuse path still honored (existing group, no broker call)', async () => {
+  const existing = { idpGroupId: 'g-existing', groupIdB64: 'gid', operatorDid: BASE.operatorDid };
+  const brokerCalls = {};
+  const out = await ensureConversation({
+    ...BASE,
+    signingKey: null,
+    mls: fakeBrokerMls({}, brokerCalls),
+    ctx: { useBrokerMls: true },
+    deps: {
+      resolveActiveGroupForOperator: async () => existing,
+      getOrchestrator: async () => assert.fail('should not orchestrate'),
+      recordGroup: async () => assert.fail('should not record on reuse'),
+    },
+  });
+  assert.deepEqual(out, existing);
+  assert.deepEqual(brokerCalls, {}, 'reuse short-circuits before the broker call');
+});
+
+test('broker-native: throws when the broker returns no group ids', async () => {
+  await assert.rejects(
+    () =>
+      ensureConversation({
+        ...BASE,
+        signingKey: null,
+        mls: fakeBrokerMls({ /* no ids */ }),
+        ctx: { useBrokerMls: true },
+        deps: {
+          resolveActiveGroupForOperator: async () => null,
+          getOrchestrator: async () => assert.fail('must not orchestrate'),
+          recordGroup: async () => assert.fail('must not record without ids'),
+        },
+      }),
+    /no group ids/,
+  );
+});
+
+test('broker-native: throws when mls lacks ensureDirectGroup (misconfigured client)', async () => {
+  await assert.rejects(
+    () =>
+      ensureConversation({
+        ...BASE,
+        signingKey: null,
+        mls: {}, // not a broker client
+        ctx: { useBrokerMls: true },
+        deps: {
+          resolveActiveGroupForOperator: async () => null,
+          getOrchestrator: async () => assert.fail('must not orchestrate'),
+          recordGroup: async () => assert.fail('must not record'),
+        },
+      }),
+    /requires an MlsBrokerClient/,
+  );
+});

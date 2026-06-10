@@ -203,6 +203,24 @@ export class MlsBrokerClient {
   }
 
   /**
+   * Set up (or adopt) the direct MLS group with `peerDid` THROUGH THE BROKER —
+   * the broker-native equivalent of the node orchestrator's `startDirectChat`.
+   * The broker composes the shared `lastid-mls-core` direct-chat-setup kernels
+   * (`create_and_register_direct_group_shell` + `add_first_member_to_direct_group`)
+   * over its own IdP-call seam, so a broker-native agent can self-heal a missing
+   * conversation WITHOUT building a node openmls handle (which would split MLS
+   * state with the broker's — the multi-instance corruption class).
+   *
+   * @param {string} peerDid The operator DID to open the direct chat with.
+   * @returns {Promise<{ idp_group_id: string, local_group_id: string, existing: boolean }>}
+   *   The IdP group UUID, the openmls group id, and whether an existing canonical
+   *   group was adopted (get-or-create).
+   */
+  async ensureDirectGroup(peerDid) {
+    return this.#mls('mls_ensure_direct_group', { peer_did: peerDid });
+  }
+
+  /**
    * No-op — the broker auto-persists after every state-mutating op, so node has
    * nothing to flush. Kept for MlsClient source compatibility.
    */
