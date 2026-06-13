@@ -57,6 +57,7 @@ import {
   provisionAgent,
   provisionAgentViaBroker,
   resolveAgentDeviceId,
+  agentKeyTypeFromDid,
 } from '../lib/agent-provisioning.js';
 import { recordGroup } from '../lib/agent-groups.js';
 import { resolveScope } from '../lib/scope.js';
@@ -1218,6 +1219,19 @@ async function runAgentStateSync(loaded, scope, opts = {}) {
     ({ signingKey } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid));
     macKey = deriveOperatorStateMacKey(loaded.slotSeed);
   }
+  // Custody (mem_01KTQK1E): a P-256 (zDn) agent — or ANY agent a signed broker is
+  // serving, even one stuck on a stale pre-migration `ad-` device + leftover node
+  // seed (so loaded.brokerNative read false) — is broker-sole-custody. Node must
+  // NOT node-sign its IdP auth: an Ed25519 proof against its P-256 cnf.jwk 401s
+  // (`invalid_dpop_proof`), silently breaking the agent-state sync (rules/memories).
+  // Null the signingKey so authedIdpFetch routes through the broker. macKey is
+  // seed-derived local anti-tamper, not IdP auth — leave it.
+  if (signingKey) {
+    const { brokerSocketExistsSync } = await import('./broker-ipc.js');
+    if (brokerSocketExistsSync(scope) || agentKeyTypeFromDid(loaded.agentDid) === 'p256') {
+      signingKey = null;
+    }
+  }
   // The listener is the SINGLE writer of operator-state — key it so every save
   // stamps the anti-tamper MAC (off the slot_seed, which isn't in the file).
   const store = new OperatorStore(scope, undefined, { macKey });
@@ -1301,7 +1315,7 @@ async function cmdListen(flags) {
     { MlsDispatcher },
     { drainOutbox },
     { makeDoorbellHandler },
-    { acquireListenerLock, releaseListenerLock },
+    { acquireListenerLock, releaseListenerLock, runListenerStandby },
     { reconcileConversationDevices },
     { PresenceEmitter },
     { readActivityTs, readSignalTs },
@@ -1325,15 +1339,44 @@ async function cmdListen(flags) {
   // The agent's operator (parent human) — the only peer it reconciles against.
   const operatorDid = decodeVcClaims(loaded.vcCompact)?.parent_human_did ?? null;
 
-  // Single-instance enforcement. The listener is the single MLS-state writer
-  // and the sole owner of the agent-state sync cursor for this scope; a second
-  // listener races the shared cursor and silently drops rules/memories (see
-  // acquireListenerLock). Become the sole listener before opening MLS state —
-  // evict any other live listener (manual or daemon-spawned) and claim the lock.
-  const lock = await acquireListenerLock({ scope });
+  // Single-instance enforcement (FIRST-WINS). The listener is the single MLS-state
+  // writer + sole audit-chain writer + agent-state sync-cursor owner for this
+  // scope. A healthy SAME-BUILD listener already on the scope is NOT evicted — a
+  // second Claude session stealing the first's channel and racing its chain drain
+  // into a fork was exactly the bug. We stand by (no WS, no drain) until that
+  // primary exits, then promote. A different/older build is still superseded
+  // (cleanly). The owning primary meanwhile drains the SHARED spool — including
+  // this session's tool events — and ships every chain, so standing by loses
+  // nothing. The parent-session watchdog (below) also governs the standby.
+  const parentPidFlag = Number.parseInt(String(flags['parent-pid'] ?? ''), 10);
+  let lock = await acquireListenerLock({ scope });
+  while (lock.role === 'standby') {
+    process.stderr.write(
+      `[lastid-agent] another listener (pid ${lock.primaryPid}) owns scope=${scope}; standing by (no WS/drain) — will promote if it exits\n`,
+    );
+    const promote = await runListenerStandby({
+      scope,
+      primaryPid: lock.primaryPid,
+      parentPid: parentPidFlag,
+    });
+    if (!promote) {
+      // Our owning session ended while we were standing by — nothing to promote
+      // into. Exit cleanly; the live primary keeps serving the scope.
+      process.stderr.write(
+        `[lastid-agent] owning session gone while standing by on scope=${scope} — exiting (primary still owns it)\n`,
+      );
+      exit(0);
+    }
+    // Primary exited — try to take over. If another standby beat us to it,
+    // acquire returns standby again and we loop back to watch the new primary.
+    lock = await acquireListenerLock({ scope });
+    if (lock.role === 'primary') {
+      process.stderr.write(`[lastid-agent] promoted to primary listener on scope=${scope}\n`);
+    }
+  }
   if (lock.evicted) {
     process.stderr.write(
-      `[lastid-agent] evicted a pre-existing listener (pid ${lock.evicted}) on scope=${scope} — single MLS writer enforced\n`,
+      `[lastid-agent] superseded a stale-build listener (pid ${lock.evicted}) on scope=${scope} — single MLS writer enforced\n`,
     );
   }
 
@@ -1395,6 +1438,24 @@ async function cmdListen(flags) {
     );
   } else {
     ({ signingKey, signingSeed } = deriveAgentKeypair(loaded.slotSeed, loaded.agentDid));
+  }
+  // Custody (mem_01KTQK1E): a P-256 (zDn) agent — or ANY agent a signed broker is
+  // serving, even one stuck on a stale pre-migration `ad-` device + leftover node
+  // seed (loaded.brokerNative read false) — is broker-sole-custody. Node must NOT
+  // node-sign its IdP auth: an Ed25519 proof against its P-256 cnf.jwk 401s
+  // (`invalid_dpop_proof`), silently breaking keypackage publish + vault + every
+  // authedIdpFetch consumer below. Null the IdP-auth signingKey so they route
+  // through the broker — exactly as a fully-broker-native agent already does
+  // (null is the established broker path here). signingSeed stays for the node
+  // MLS path (not IdP auth).
+  if (signingKey) {
+    const { brokerSocketExistsSync } = await import('./broker-ipc.js');
+    if (brokerSocketExistsSync(scope) || agentKeyTypeFromDid(loaded.agentDid) === 'p256') {
+      signingKey = null;
+      process.stderr.write(
+        '[lastid-agent] custody: P-256/broker-served agent — IdP auth routes through the broker (node will not sign)\n',
+      );
+    }
   }
   // The audit-chain signer: the legacy in-process key (a node KeyObject) for a
   // legacy agent, or an async broker signer (raw-ES256 over the record core,

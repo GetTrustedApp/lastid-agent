@@ -602,3 +602,45 @@ test('agentIdpAuthSigningKey: no device id + legacy seed → still node-signs (m
   });
   assert.ok(key, 'absent device id is treated as legacy (node-signs), not broker-bound');
 });
+
+// REGRESSION (the EdDSA agent_pop 401 that silently broke rules/memories/keypackages/
+// vault for broker-served P-256 agents): a zDn agent that — from a STALE pre-migration
+// device record — carries an `ad-` device id AND a leftover node seed must STILL route
+// IdP auth through the broker. Keying on `md-` alone node-signed it: a P-256 agent
+// signed via the legacy Ed25519 path → an `EdDSA` proof against its P-256 `cnf.jwk` →
+// 401 `invalid_dpop_proof`. Discriminating on the AGENT KEY TYPE fixes it.
+test('agentIdpAuthSigningKey: P-256 (zDn) agent with a stale ad- device + seed → null (never node-sign a P-256 agent)', () => {
+  const key = agentIdpAuthSigningKey({
+    slotSeed: Buffer.alloc(32, 7),
+    agentDid: 'did:lastid:agent:zDnaeRcFtCiJ8s9iE6kJMXCUWuoiMZjtTBtdVZoP5F9MnzmLR',
+    deviceId: 'ad-bea0stalepremigrationdevice',
+  });
+  assert.equal(key, null, 'a P-256 agent is broker-sole-custody — node must never sign its IdP auth');
+});
+
+// brokerNative (a signed broker is up for this scope) is the authoritative signal:
+// force the broker path even for an agent whose key type + device id LOOK legacy
+// (covers a hybrid migration state where node still holds an Ed25519 seed but the
+// broker now owns the identity the IdP VC was provisioned with).
+test('agentIdpAuthSigningKey: brokerNative=true → null even for an ad- + seeded legacy-looking agent', () => {
+  const key = agentIdpAuthSigningKey({
+    slotSeed: Buffer.alloc(32, 4),
+    agentDid: 'did:lastid:agent:z6MkLegacyEd25519Agent',
+    deviceId: 'ad-legacydevice',
+    brokerNative: true,
+  });
+  assert.equal(key, null, 'a broker serving this scope ⇒ broker-sole-custody; node must not sign');
+});
+
+// A GENUINE legacy Ed25519 agent with NO broker still node-signs (dual-algo intact) —
+// the fix must not over-reach and break the legacy path.
+test('agentIdpAuthSigningKey: legacy z6Mk, no broker (brokerNative=false) → still node-signs EdDSA', () => {
+  const key = agentIdpAuthSigningKey({
+    slotSeed: Buffer.alloc(32, 3),
+    agentDid: 'did:lastid:agent:z6MkLegacyEd25519Agent',
+    deviceId: 'ad-legacydevice',
+    brokerNative: false,
+  });
+  assert.ok(key, 'a true legacy agent with no broker keeps node-signing');
+  assert.equal(key.asymmetricKeyType, 'ed25519', 'dual-algo: z6Mk signs EdDSA');
+});

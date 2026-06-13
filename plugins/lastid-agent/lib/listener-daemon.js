@@ -31,6 +31,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { promisify } from 'node:util';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 const execFileAsync = promisify(execFile);
 
@@ -317,26 +318,50 @@ export function shouldEvictListener({ existingPid, selfPid, alive }) {
 }
 
 /**
- * Single-instance enforcement for the listener process itself — independent
- * of how it was launched (daemon-supervised OR a manual `lastid-agent listen`
- * for dev/testing).
+ * Poll until every pid in `pids` is gone, or `timeoutMs` elapses. Best-effort:
+ * a pid still alive at the deadline just falls through (we tried). Used for a
+ * CLEAN listener handoff — when a starting listener supersedes an older-build
+ * one, it waits for the outgoing process to actually exit before it claims the
+ * lock and starts draining, so the outgoing writer's final audit-chain drain
+ * can't race the incoming one and fork the chain. `isAliveImpl`/`sleepImpl`
+ * injectable for tests.
+ */
+export async function waitForExit(pids, { timeoutMs = 3000, stepMs = 50, isAliveImpl = isAlive, sleepImpl = sleep } = {}) {
+  const targets = (pids ?? []).filter((p) => Number.isInteger(p) && p > 0);
+  if (targets.length === 0) return { exited: true, stillAlive: [] };
+  let waited = 0;
+  for (;;) {
+    const live = targets.filter((p) => isAliveImpl(p));
+    if (live.length === 0) return { exited: true, stillAlive: [] };
+    if (waited >= timeoutMs) return { exited: false, stillAlive: live };
+    await sleepImpl(stepMs);
+    waited += stepMs;
+  }
+}
+
+/**
+ * Single-instance enforcement for the listener process itself — independent of
+ * how it was launched (daemon-supervised OR a manual `lastid-agent listen`).
  *
- * Why this is load-bearing: the listener is the SINGLE MLS-state writer AND
- * the sole owner of the agent-state sync cursor for its scope. Two listeners
- * on one scope race on shared on-disk state — both receive a `rules.changed`/
- * `memory.changed` doorbell, both pull `?since=<cursor>`, and whichever wins
- * advances the shared cursor so the other applies nothing. Worse, a listener
- * from an OLDER build (e.g. a stray dev run that predates memory sync) eats
- * the cursor advance while dropping the memory records entirely — so published
- * memories silently never reach the agent. (Root-caused live: a manual dev
- * listener coexisting with the installed daemon listener did exactly this.)
+ * Why this is load-bearing: the listener is the SINGLE MLS-state writer AND the
+ * sole audit-chain writer + agent-state sync-cursor owner for its scope. Two
+ * listeners on one scope race that shared on-disk state — both drain the audit
+ * spool and append the per-agent chain (forking its hash links), both pull
+ * `?since=<cursor>` and one advances the cursor so the other applies nothing,
+ * and the most-recent one steals the operator's MLS channel.
  *
- * `ensureListenerRunning` only tracks listeners IT spawned; a manually-run
- * listener was invisible to it and coexisted. So enforce the invariant in the
- * listener itself: on startup become the sole listener for the scope by
- * evicting any OTHER live listener holding the pid file (takeover — the
- * most-recently-started listener wins, matching the human's intent when they
- * run `listen`) and claiming the pid file + meta for ourselves.
+ * FIRST-WINS (not most-recent-wins). The previous policy was "the starting
+ * listener evicts the incumbent" — which meant a second Claude session on the
+ * same scope stole the channel from the first AND raced its chain drain into a
+ * fork. Now a healthy SAME-BUILD incumbent is left alone: the starting listener
+ * returns role:'standby' and the caller stands by (no WS, no drain) until the
+ * incumbent exits, then re-acquires. A DIFFERENT-BUILD incumbent (a stale older
+ * version — the channel-desync stray this guard originally existed for, or a
+ * `/plugin update`) is still superseded, but with a CLEAN handoff: SIGTERM it,
+ * reap strays, and WAIT for them to exit before claiming + draining.
+ *
+ * Returns role:'primary' ({ pid, evicted, reaped }) when we own the scope, or
+ * role:'standby' ({ primaryPid }) when a healthy same-build incumbent holds it.
  */
 export async function acquireListenerLock({
   scope = 'main',
@@ -345,12 +370,30 @@ export async function acquireListenerLock({
   parentPid = null,
   psImpl,
   killImpl,
+  waitForExitImpl = waitForExit,
 } = {}) {
   const dir = dataDirFor(scope);
   await mkdir(dir, { recursive: true });
   const existing = await readPid(scope);
+  const existingAlive = isAlive(existing);
+
+  // FIRST-WINS: a healthy listener from the SAME build already owns this scope —
+  // defer to it as a standby instead of stealing the channel + forking the chain.
+  // `existing !== selfPid` skips the daemon-pre-wrote-our-own-pid case (that's us,
+  // not a foreign primary). Same-build is decided by the recorded cliPath: a
+  // different/older build is NOT a peer to defer to (it may be the buggy stray
+  // this guard exists to supersede), so it falls through to the takeover below.
+  if (existing && existing !== selfPid && existingAlive) {
+    const meta = await readMeta(scope);
+    const sameBuild = !!meta && typeof meta.cliPath === 'string' && meta.cliPath === selfPath;
+    if (sameBuild) {
+      return { role: 'standby', primaryPid: existing, pid: existing, evicted: null, reaped: [] };
+    }
+  }
+
+  // Become PRIMARY: no incumbent, a DEAD incumbent, or a DIFFERENT-build one.
   let evicted = null;
-  if (shouldEvictListener({ existingPid: existing, selfPid, alive: isAlive(existing) })) {
+  if (shouldEvictListener({ existingPid: existing, selfPid, alive: existingAlive })) {
     try {
       process.kill(existing); // SIGTERM — let it release cleanly
       evicted = existing;
@@ -360,9 +403,13 @@ export async function acquireListenerLock({
   }
   // Defense in depth: the lock holds ONE pid, but other `listen --scope <scope>`
   // strays (a previous plugin version, a manual dev run) won't be in it. Reap
-  // every other listener for THIS scope so we truly become the sole MLS-state
-  // writer — the lock-holder eviction above only covers the recorded pid.
+  // every other listener for THIS scope so we truly become the sole writer.
   const { reaped } = await reapScopeListeners({ scope, keep: selfPid, psImpl, killImpl });
+  // CLEAN HANDOFF: wait for the evicted/reaped listeners to actually exit before
+  // we claim + (the caller) starts draining — otherwise the outgoing writer's
+  // last audit drain races ours and forks the chain (the corruption we're fixing).
+  const outgoing = [evicted, ...reaped].filter((p) => Number.isInteger(p) && p !== selfPid);
+  if (outgoing.length > 0) await waitForExitImpl(outgoing);
   await writeFile(listenerPidPath(scope), String(selfPid), 'utf-8');
   await writeMeta(scope, {
     pid: selfPid,
@@ -370,7 +417,36 @@ export async function acquireListenerLock({
     startedAt: new Date().toISOString(),
     ...(Number.isInteger(parentPid) && parentPid > 0 ? { parentPid } : {}),
   });
-  return { pid: selfPid, evicted, reaped };
+  return { role: 'primary', pid: selfPid, evicted, reaped };
+}
+
+/**
+ * Stand by while a healthy same-build primary owns the scope (the role:'standby'
+ * outcome of acquireListenerLock). A standby holds NO websocket, NO MLS state,
+ * and is NOT a chain writer — so it can never steal the operator channel or fork
+ * the audit chain; it only watches. Resolves:
+ *   - true  → the primary exited; the caller should re-acquire and PROMOTE.
+ *   - false → our OWN owning session (parentPid) exited first; the caller should
+ *             shut down (nothing to promote into).
+ * The primary meanwhile drains the SHARED per-scope spool — including this
+ * session's tool events — and ships every chain, so standing by loses nothing.
+ * `isAliveImpl`/`sleepImpl` injectable for tests.
+ */
+export async function runListenerStandby({
+  scope = 'main',
+  primaryPid,
+  parentPid = null,
+  pollMs = 3000,
+  isAliveImpl = isAlive,
+  sleepImpl = sleep,
+} = {}) {
+  void scope; // reserved for future per-scope standby telemetry; keeps the call self-documenting
+  const watchParent = Number.isInteger(parentPid) && parentPid > 1;
+  for (;;) {
+    if (!isAliveImpl(primaryPid)) return true; // primary gone → promote
+    if (watchParent && !isAliveImpl(parentPid)) return false; // our session gone → exit
+    await sleepImpl(pollMs);
+  }
 }
 
 /**

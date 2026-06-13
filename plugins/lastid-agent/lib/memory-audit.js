@@ -230,32 +230,73 @@ export async function maybeCheckpoint({ scope = 'main', signingKey, agentDid = n
 }
 
 /**
- * Verify THIS agent's chain: each record's integrity_hash matches blake3(core),
- * prev_hash links correctly (seq 0 ⇒ prev_hash null = genesis), and (when
- * publicKey given) the ES256 (P-256) signature verifies. Returns { intact, total,
- * firstFailure? }.
+ * Verify ONE already-ordered run of records as a single linked chain: each
+ * record's integrity_hash matches blake3(core), prev_hash links to its
+ * predecessor (the first record must be a genesis: prev_hash null), and (when
+ * publicKey given) the ES256 (P-256) signature verifies. Shared by the
+ * whole-file verify and the current-generation self-check so both can never
+ * drift on the per-record rules. Returns { intact, total, firstFailure? }.
  */
-export function verifyMemoryAudit(scope = 'main', agentDid = null, publicKey = null) {
-  const all = readMemoryAudit(scope, agentDid);
+function verifyLinked(records, publicKey = null) {
   let prevHash = null;
-  for (let i = 0; i < all.length; i++) {
-    const r = all[i];
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
     const bytes = Buffer.from(canonicalJson(coreFromRecord(r)), 'utf-8');
     if (blake3Hex(bytes) !== r.integrity_hash) {
-      return { intact: false, total: all.length, firstFailure: { seq: r.seq, kind: 'integrity_hash_mismatch' } };
+      return { intact: false, total: records.length, firstFailure: { seq: r.seq, kind: 'integrity_hash_mismatch' } };
     }
     if ((r.prev_hash ?? null) !== prevHash) {
-      return { intact: false, total: all.length, firstFailure: { seq: r.seq, kind: 'hash_link_mismatch' } };
+      return { intact: false, total: records.length, firstFailure: { seq: r.seq, kind: 'hash_link_mismatch' } };
     }
     if (publicKey && r.signature) {
       const ok = ecVerify('sha256', bytes, { key: publicKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(r.signature, 'base64'));
       if (!ok) {
-        return { intact: false, total: all.length, firstFailure: { seq: r.seq, kind: 'signature_invalid' } };
+        return { intact: false, total: records.length, firstFailure: { seq: r.seq, kind: 'signature_invalid' } };
       }
     }
     prevHash = r.integrity_hash;
   }
-  return { intact: true, total: all.length };
+  return { intact: true, total: records.length };
+}
+
+/**
+ * Verify THIS agent's chain in FILE ORDER, end to end (every record, across all
+ * generations). A re-rooted file (an on-break self-heal or re-provision wrote a
+ * new genesis mid-file) therefore reports "broken" at the first generation
+ * boundary — that's the correct answer for a WHOLE-file integrity question (the
+ * file does contain a historical break). Display + self-heal use the
+ * generation-scoped views below; the console segments by chain_id the same way.
+ */
+export function verifyMemoryAudit(scope = 'main', agentDid = null, publicKey = null) {
+  return verifyLinked(readMemoryAudit(scope, agentDid), publicKey);
+}
+
+/**
+ * The CURRENT (newest) generation of this agent's chain: the records sharing the
+ * head (last) record's chain_id. appendMemoryAudit always links onto the file's
+ * last record, so its chain_id is the live generation the next event extends.
+ * Mirrors the console's `segmentAgentChain` notion that "the newest segment is
+ * the live chain" — null chain_id (legacy pre-chain_id records) is one implicit
+ * generation. Returned seq-sorted (genesis first).
+ */
+function currentGeneration(all) {
+  if (all.length === 0) return [];
+  const headChainId = all[all.length - 1].chain_id ?? null;
+  return all
+    .filter((r) => (r.chain_id ?? null) === headChainId)
+    .sort((a, b) => Number(a.seq) - Number(b.seq));
+}
+
+/**
+ * Verify only the CURRENT generation (what new appends extend) — the same view
+ * the console shows as the live chain. This is what the self-heal must use: a
+ * whole-file verify keeps reporting "broken" at every healed boundary forever
+ * (so the heal would re-genesis on every pass and never converge), whereas a
+ * current-generation verify goes "intact" the moment a clean generation is
+ * rooted. Returns { intact, total, firstFailure? }.
+ */
+export function verifyCurrentGeneration(scope = 'main', agentDid = null, publicKey = null) {
+  return verifyLinked(currentGeneration(readMemoryAudit(scope, agentDid)), publicKey);
 }
 
 /** Public-key (for verify) derived from the agent signing KeyObject. */
@@ -270,18 +311,27 @@ export function publicKeyFor(signingKey) {
 /**
  * Self-check THIS agent's chain and HEAL a deep break. The append-time self-heal
  * only catches a broken TAIL; a break in the MIDDLE leaves an intact tail, so a
- * plain append keeps extending the broken generation. This verifies the whole
- * chain and, on ANY break, stamps a genesis-rooted ChainCheckpoint (new
- * chain_id, seq 0, prev_hash null) flagging the break — so the chain
- * "checkpoints and starts chaining again" from a clean root (the console shows
- * the broken generation as history + this reset as a red divider + new genesis).
- * The listener runs this RANDOMLY (not only on demand). Returns the report
- * (with healed:true when a reset was written). Best-effort; never throws.
+ * plain append keeps extending the broken generation. This verifies the CURRENT
+ * generation (the records new events extend — the same live chain the console
+ * shows) and, on a break, stamps a genesis-rooted ChainCheckpoint (new chain_id,
+ * seq 0, prev_hash null) flagging the break — so the chain "checkpoints and
+ * starts chaining again" from a clean root (the console shows the broken
+ * generation as history + this reset as a new genesis).
+ *
+ * CONVERGENCE: this MUST scope to the current generation, not the whole file. A
+ * whole-file verify reports "broken" at every PAST healed boundary forever, so
+ * the heal would re-genesis on every single pass and the chain would never
+ * settle (and the plugin would disagree with the console's per-generation view).
+ * Scoped to the current generation, a heal lands exactly once: the next pass
+ * sees a clean lone genesis (intact) and is a no-op.
+ *
+ * The listener runs this RANDOMLY (not only on demand). Returns the report (with
+ * healed:true when a reset was written). Best-effort; never throws.
  */
 export async function auditSelfCheck({ scope = 'main', signingKey, agentDid = null, publicKey = null } = {}) {
   let report;
   try {
-    report = verifyMemoryAudit(scope, agentDid, publicKey);
+    report = verifyCurrentGeneration(scope, agentDid, publicKey);
   } catch (err) {
     process.stderr.write(`[lastid-agent] audit self-check failed to read: ${err?.message ?? err}\n`);
     return { intact: true, total: 0 };

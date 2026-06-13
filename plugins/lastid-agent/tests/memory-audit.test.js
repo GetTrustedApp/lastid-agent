@@ -263,6 +263,75 @@ test('auditSelfCheck: a deep (middle) break → checkpoint + re-genesis reset', 
   }
 });
 
+// THE CONVERGENCE REGRESSION (operator's "console just ALWAYS shows broken / we
+// never repair the chain"): once a generation has been re-rooted, a SECOND
+// self-check must be a NO-OP. The old self-check verified the whole file
+// linearly, so it saw the PAST healed boundary as a break on every pass and
+// re-genesised forever — the chain never settled and the plugin disagreed with
+// the console's per-generation view. Scoped to the CURRENT generation, the heal
+// lands exactly once.
+test('auditSelfCheck CONVERGES: a re-rooted chain is a no-op on the next check', async () => {  const { scope, dir } = freshScope();
+  try {
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm0' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm2' });
+    // Break the MIDDLE (seq 1); the tail still verifies, so only a self-check catches it.
+    const path = memoryAuditPath(scope, AGENT);
+    const lines = readMemoryAudit(scope, AGENT);
+    lines[1].memory_id = 'm1_TAMPERED';
+    writeFileSync(path, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+
+    // Pass 1 heals (adds ONE genesis-rooted reset).
+    const r1 = await auditSelfCheck({ scope, signingKey: privateKey, agentDid: AGENT, publicKey });
+    assert.equal(r1.healed, true);
+    const afterHeal = readMemoryAudit(scope, AGENT).length;
+
+    // Pass 2 must be a NO-OP — the current generation is now a clean lone genesis.
+    const r2 = await auditSelfCheck({ scope, signingKey: privateKey, agentDid: AGENT, publicKey });
+    assert.equal(r2.intact, true, 'current generation is intact after the re-root');
+    assert.equal(r2.healed, undefined, 'no second re-genesis');
+    assert.equal(readMemoryAudit(scope, AGENT).length, afterHeal, 'no record added on the second pass');
+
+    // And it keeps converging even as the new generation grows: extend it, then
+    // a third check is still a no-op (the OLD broken generation never re-triggers).
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm3' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm4' });
+    const beforeThird = readMemoryAudit(scope, AGENT).length;
+    const r3 = await auditSelfCheck({ scope, signingKey: privateKey, agentDid: AGENT, publicKey });
+    assert.equal(r3.intact, true);
+    assert.equal(r3.healed, undefined);
+    assert.equal(readMemoryAudit(scope, AGENT).length, beforeThird, 'mature clean generation is a no-op too');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// verifyCurrentGeneration ignores OLD broken generations (mirrors the console's
+// segmentAgentChain "newest segment is the live chain"), while the whole-file
+// verifyMemoryAudit still reports the historical break — both are correct for
+// their question.
+test('verifyCurrentGeneration: clean current gen is intact despite a broken older gen', async () => {  const { scope, dir } = freshScope();
+  try {
+    const { verifyCurrentGeneration } = await import('../lib/memory-audit.js');
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm0' });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm1' });
+    // Break the middle and heal → an old broken generation + a clean new one.
+    const path = memoryAuditPath(scope, AGENT);
+    const lines = readMemoryAudit(scope, AGENT);
+    lines[0].memory_id = 'm0_TAMPERED';
+    writeFileSync(path, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+    await auditSelfCheck({ scope, signingKey: privateKey, agentDid: AGENT, publicKey });
+    await appendMemoryAudit({ scope, signingKey: privateKey, agentDid: AGENT, eventType: 'AgentMemoryWritten', memoryId: 'm2' });
+
+    // Current generation (newest chain_id) verifies clean...
+    assert.equal(verifyCurrentGeneration(scope, AGENT, publicKey).intact, true, 'live chain is intact');
+    // ...while the whole-file check still surfaces the historical break.
+    assert.equal(verifyMemoryAudit(scope, AGENT, publicKey).intact, false, 'whole-file view still shows the old break');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── checkpoints ────────────────────────────────────────────────────
 
 test('maybeCheckpoint: anchors the head with a signed, linked ChainCheckpoint', async () => {  const { scope, dir } = freshScope();

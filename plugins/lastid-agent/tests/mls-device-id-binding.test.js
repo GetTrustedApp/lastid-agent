@@ -99,24 +99,22 @@ test('GATE: publishAgentKeyPackage stamps the KP device_id from the handle, not 
     generateKeyPackage: async () => 'kp-b64',
     persist: async () => {},
   };
+  // A P-256 agent authenticates the publish through the broker (never node-signs),
+  // so inject the broker-aware IdP-call seam and capture its body — no node DPoP
+  // (and no broker) needed to verify the device_id binding.
   let capturedBody = null;
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = async (_url, init) => {
-    capturedBody = JSON.parse(init.body);
-    return { ok: true, json: async () => ({ refs: ['r1'] }), text: async () => '' };
-  };
-  try {
-    await publishAgentKeyPackage({
-      idpUrl: 'http://idp.test',
-      agentDid: P256_KAT_DID,
-      vcCompact: 'vc-compact',
-      slotSeed,
-      scope: 'main',
-      mls: fakeMls,
-    });
-  } finally {
-    globalThis.fetch = realFetch;
-  }
+  await publishAgentKeyPackage({
+    idpUrl: 'http://idp.test',
+    agentDid: P256_KAT_DID,
+    vcCompact: 'vc-compact',
+    slotSeed,
+    scope: 'main',
+    mls: fakeMls,
+    _authedIdpFetch: async ({ body }) => {
+      capturedBody = body;
+      return { refs: ['r1'] };
+    },
+  });
   const kps = capturedBody?.key_packages ?? [];
   assert.ok(kps.length >= 2, 'expected regular + last-resort KeyPackages');
   for (const kp of kps) {

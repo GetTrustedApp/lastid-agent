@@ -38,6 +38,8 @@ const {
   listenerPidPath,
   parseScopeListenerPids,
   reapScopeListeners,
+  waitForExit,
+  runListenerStandby,
 } = await import('../lib/listener-daemon.js');
 
 after(() => {
@@ -49,6 +51,14 @@ after(() => {
 });
 
 const pidOf = (scope) => readFileSync(listenerPidPath(scope), 'utf-8').trim();
+const isChildAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 // ── shouldEvictListener (pure decision) ────────────────────────────
 
@@ -234,4 +244,121 @@ test('reapScopeListeners: ps failure → no reap (best-effort; pid-lock stays th
   });
   assert.deepEqual(r.found, []);
   assert.deepEqual(killed, []);
+});
+
+// ── FIRST-WINS ownership (the WS-steal / chain-fork fix) ───────────
+//
+// THE BUG (operator-reported): two Claude sessions on the SAME scope — the
+// most-recently-started listener evicted the first, stealing its operator MLS
+// channel AND racing its audit-chain drain into a fork (every top-level chain
+// read "broken"). The fix: a healthy SAME-BUILD incumbent is left alone; the
+// starting listener stands by. Only a DIFFERENT/older build is superseded.
+
+test('REGRESSION: a healthy SAME-build listener is NOT evicted — we stand by', async () => {
+  const scope = 'firstwins';
+  const BUILD = '/v/0.16.0/bin/lastid-agent.js';
+  // A real long-lived child stands in for the first session's live listener.
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], { stdio: 'ignore' });
+  child.unref();
+  try {
+    // First session claims the scope (records its build path in the meta).
+    const first = await acquireListenerLock({ scope, selfPid: child.pid, selfPath: BUILD });
+    assert.equal(first.role, 'primary');
+    assert.equal(pidOf(scope), String(child.pid));
+
+    // Second session, SAME build, starts up: must DEFER (standby), not steal.
+    const second = await acquireListenerLock({ scope, selfPid: process.pid, selfPath: BUILD });
+    assert.equal(second.role, 'standby', 'same-build incumbent → stand by');
+    assert.equal(second.primaryPid, child.pid, 'reports the primary to watch');
+    assert.equal(second.evicted, null, 'nothing evicted');
+    assert.equal(pidOf(scope), String(child.pid), 'the first listener still owns the lock');
+
+    // And the incumbent is still alive — we did not kill it.
+    assert.ok(isChildAlive(child.pid), 'the same-build primary keeps running');
+  } finally {
+    try { process.kill(child.pid); } catch { /* already gone */ }
+  }
+});
+
+test('a DIFFERENT/older build IS superseded, with a clean handoff (waits for exit)', async () => {
+  const scope = 'supersede';
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], { stdio: 'ignore' });
+  child.unref();
+  // Incumbent recorded under an OLD build path.
+  await acquireListenerLock({ scope, selfPid: child.pid, selfPath: '/v/0.15.0/bin/lastid-agent.js' });
+  assert.equal(pidOf(scope), String(child.pid));
+
+  let waited = null;
+  // NEW build supersedes; the clean-handoff await is injected so we can assert
+  // the outgoing pid is waited on BEFORE we claim the lock.
+  const r = await acquireListenerLock({
+    scope,
+    selfPid: process.pid,
+    selfPath: '/v/0.16.0/bin/lastid-agent.js',
+    waitForExitImpl: async (pids) => { waited = pids; return { exited: true, stillAlive: [] }; },
+  });
+  assert.equal(r.role, 'primary');
+  assert.equal(r.evicted, child.pid, 'older build evicted');
+  assert.deepEqual(waited, [child.pid], 'waited for the outgoing listener to exit before claiming');
+  assert.equal(pidOf(scope), String(process.pid), 'we own the lock now');
+  try { process.kill(child.pid); } catch { /* SIGTERM already sent by the lock */ }
+});
+
+// ── waitForExit (injected isAlive/sleep — no real waiting) ─────────
+
+test('waitForExit: resolves exited once every pid is gone', async () => {
+  const r = await waitForExit([10, 11], { isAliveImpl: () => false, sleepImpl: async () => {} });
+  assert.deepEqual(r, { exited: true, stillAlive: [] });
+});
+
+test('waitForExit: empty / invalid pid list is an immediate no-op', async () => {
+  assert.deepEqual(await waitForExit([]), { exited: true, stillAlive: [] });
+  assert.deepEqual(await waitForExit([0, -1, null]), { exited: true, stillAlive: [] });
+});
+
+test('waitForExit: times out (best-effort) when a pid never exits', async () => {
+  const r = await waitForExit([42], {
+    timeoutMs: 100,
+    stepMs: 50,
+    isAliveImpl: () => true,
+    sleepImpl: async () => {},
+  });
+  assert.equal(r.exited, false);
+  assert.deepEqual(r.stillAlive, [42]);
+});
+
+// ── runListenerStandby (promotion vs. exit) ────────────────────────
+
+test('runListenerStandby: promotes (true) when the primary exits', async () => {
+  let polls = 0;
+  const promote = await runListenerStandby({
+    primaryPid: 500,
+    // Alive on the first probe, gone on the second → exercises the poll loop.
+    isAliveImpl: (pid) => (pid === 500 ? (++polls < 2) : true),
+    sleepImpl: async () => {},
+  });
+  assert.equal(promote, true);
+  assert.ok(polls >= 2, 'polled until the primary died');
+});
+
+test('runListenerStandby: exits (false) when our owning session dies first', async () => {
+  const promote = await runListenerStandby({
+    primaryPid: 500,
+    parentPid: 600,
+    // Primary stays alive; our parent session is gone → stand-down, don't promote.
+    isAliveImpl: (pid) => pid === 500,
+    sleepImpl: async () => {},
+  });
+  assert.equal(promote, false);
+});
+
+test('runListenerStandby: with no parentPid, only the primary governs', async () => {
+  let polls = 0;
+  const promote = await runListenerStandby({
+    primaryPid: 700,
+    parentPid: NaN, // not armed
+    isAliveImpl: () => (++polls < 3),
+    sleepImpl: async () => {},
+  });
+  assert.equal(promote, true, 'still promotes on primary exit without a parent watchdog');
 });

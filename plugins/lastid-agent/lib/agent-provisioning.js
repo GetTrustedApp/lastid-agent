@@ -531,10 +531,31 @@ export function agentKeyTypeFromDid(agentDid) {
  * @param {Buffer|null} a.slotSeed   32-byte slot seed, or null (broker-native).
  * @param {string} a.agentDid        selects the derivation algo for legacy agents.
  * @param {string|null} [a.deviceId] the PINNED device id (`md-…` ⇒ broker-bound).
+ * @param {boolean} [a.brokerNative] a signed broker is up for this scope
+ *   (`brokerSocketExistsSync(scope)`) ⇒ broker-sole-custody, force the broker path
+ *   even if node-side device-id/seed are in a stale pre-migration state.
  * @returns {import('node:crypto').KeyObject|null} the node signing key, or
  *   `null` to force the broker path.
  */
-export function agentIdpAuthSigningKey({ slotSeed, agentDid, deviceId }) {
+export function agentIdpAuthSigningKey({ slotSeed, agentDid, deviceId, brokerNative = false }) {
+  // Custody invariant (mem_01KTQK1E): node may node-sign IdP auth ONLY for a
+  // LEGACY Ed25519 (z6Mk) agent. EVERY P-256/ES256 (zDn) agent — and any agent a
+  // signed broker is actively serving — is broker-sole-custody; node must NEVER
+  // sign for it. Return null so `authedIdpFetch` routes the proof through the
+  // broker that holds the seed the VC was provisioned with (and, when the broker
+  // is momentarily down, FAILS LOUD rather than node-signing a stale key).
+  //
+  // Discriminate on AUTHORITATIVE signals, not the device-id prefix alone:
+  //   - brokerNative: a signed broker is up for this scope. This is the signal
+  //     that catches an agent whose node-side device-id/seed are in a stale
+  //     pre-migration state (e.g. a leftover `ad-` device + slot seed) but which
+  //     IS broker-served — keying on `md-` alone node-signed it with the legacy
+  //     Ed25519 key, yielding an `EdDSA` proof against its P-256 `cnf.jwk` → 401
+  //     `invalid_dpop_proof`, silently breaking rules/memories/keypackages/vault.
+  //   - P-256 key type (zDn): broker-sole-custody by invariant.
+  //   - `md-` device or no seed in node: the original broker-bound signals.
+  if (brokerNative) return null;
+  if (agentKeyTypeFromDid(agentDid) === 'p256') return null;
   const brokerBound = typeof deviceId === 'string' && deviceId.startsWith('md-');
   const haveSeed = Buffer.isBuffer(slotSeed) && slotSeed.length === 32;
   if (brokerBound || !haveSeed) return null;

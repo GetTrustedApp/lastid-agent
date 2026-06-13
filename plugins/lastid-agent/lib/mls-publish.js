@@ -27,6 +27,7 @@
 import { MlsClient } from './mls-client.js';
 import { authedIdpFetch } from './mls-groups-api.js';
 import { agentIdpAuthSigningKey, resolveAgentDeviceId } from './agent-provisioning.js';
+import { brokerSocketExistsSync } from './broker-ipc.js';
 
 /** How many regular (consumable) KeyPackages to keep on file. */
 const REGULAR_COUNT = 5;
@@ -77,6 +78,10 @@ export async function publishAgentKeyPackage({
   // listener passes `mls` and the device_id rides on that shared handle.
   deviceId: persistedDeviceId,
   mls: sharedMls,
+  // Injectable IdP-call seam (broker-aware in prod). Tests stub it to assert the
+  // POST body without a broker — a P-256 agent's auth is broker-only now, so node
+  // can't sign the real call in a hermetic test.
+  _authedIdpFetch = authedIdpFetch,
 }) {
   const trimmed = String(idpUrl ?? '').replace(/\/$/, '');
   if (!trimmed) throw new Error('publishAgentKeyPackage: idpUrl required');
@@ -93,7 +98,14 @@ export async function publishAgentKeyPackage({
   }
   // Broker-bound (`md-…`) agents authenticate the IdP POST through the broker
   // (signingKey null); only legacy agents node-sign. See agentIdpAuthSigningKey.
-  const signingKey = agentIdpAuthSigningKey({ slotSeed, agentDid, deviceId: persistedDeviceId });
+  const signingKey = agentIdpAuthSigningKey({
+    slotSeed,
+    agentDid,
+    deviceId: persistedDeviceId,
+    // A signed broker up for this scope ⇒ broker-sole-custody: never node-sign
+    // (catches a broker-served agent stuck on a pre-migration `ad-` device).
+    brokerNative: brokerSocketExistsSync(scope ?? 'main'),
+  });
 
   // Reuse the listener's shared handle when given (B1 convergence — see the
   // `mls` param doc). Only fall back to a throwaway client at provision time,
@@ -151,7 +163,7 @@ export async function publishAgentKeyPackage({
 
   // Route through the shared, broker-aware authedIdpFetch (FORK1): same legacy
   // Bearer + DPoP shaping, and the signed broker makes the call when enabled.
-  const body = await authedIdpFetch({
+  const body = await _authedIdpFetch({
     idpUrl: trimmed,
     method: 'POST',
     path: '/v1/mls/keypackages/batch',
@@ -191,7 +203,14 @@ export async function maintainAgentKeyPackages({
     throw new Error('maintainAgentKeyPackages: slotSeed (32 bytes) or a shared mls handle is required');
   }
   // Broker-bound agents authenticate through the broker (signingKey null).
-  const signingKey = agentIdpAuthSigningKey({ slotSeed, agentDid, deviceId: persistedDeviceId });
+  const signingKey = agentIdpAuthSigningKey({
+    slotSeed,
+    agentDid,
+    deviceId: persistedDeviceId,
+    // A signed broker up for this scope ⇒ broker-sole-custody: never node-sign
+    // (catches a broker-served agent stuck on a pre-migration `ad-` device).
+    brokerNative: brokerSocketExistsSync(scope ?? 'main'),
+  });
 
   let available = 0;
   try {
