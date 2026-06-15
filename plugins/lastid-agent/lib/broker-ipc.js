@@ -239,6 +239,7 @@ export async function brokerIdpFetch({
           : JSON.stringify(resp.body);
     const err = new Error(`${method} ${path} failed: HTTP ${status} ${text}`);
     err.status = status; // parity with authedIdpFetch so 404-branch callers work either path
+    err.body = text; // raw body so authedIdpFetch's revocation classifier can read it
     throw err;
   }
   return resp.body ?? {};

@@ -17,6 +17,7 @@ import {
   createGroupOnIdp,
   addGroupMember,
   revokeAgentDevice,
+  setRevocationHandler,
 } from '../lib/mls-groups-api.js';
 
 const { privateKey: signingKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
@@ -444,4 +445,97 @@ test('authedIdpFetch: signingKey null + broker UP → routes through the broker 
   assert.deepEqual(out, { ok: true });
   assert.equal(brokerCall.path, '/v1/mls/keypackages/batch');
   assert.equal(fetchImpl.calls.length, 0, 'broker-bound publish must not node-sign');
+});
+
+// ── REST-path revocation → listener teardown ───────────────────────────────
+//
+// THE BUG: revocation was only detected on the WS upgrade, but the ALB in front
+// of the IdP turns a non-101 WS-upgrade 401 into a 502, so a revoked agent
+// reconnected forever. The REST path (authedIdpFetch) gets a CLEAN 401 + revoked
+// body, so it's the reliable trigger for `cleanupRevokedScope` + listener exit.
+// These lock: a revoked 401 fires the registered handler on BOTH the node and
+// broker paths; a transient 401 or a 502 does NOT (so a blip never wipes a scope).
+
+const REVOKED = { error: 'invalid_token', error_description: 'Credential has been revoked' };
+
+test('authedIdpFetch (node path): a revoked 401 fires the revocation handler, then rethrows', async () => {
+  const fired = [];
+  setRevocationHandler((d) => fired.push(d));
+  try {
+    const fetchImpl = recordingFetch(res(REVOKED, { ok: false, status: 401 }));
+    await assert.rejects(
+      authedIdpFetch({ ...AUTH, method: 'GET', path: '/v1/agent-state/rules', fetchImpl }),
+    );
+    assert.equal(fired.length, 1, 'handler fired once');
+    assert.equal(fired[0].httpStatus, 401);
+    assert.equal(fired[0].path, '/v1/agent-state/rules');
+  } finally {
+    setRevocationHandler(null);
+  }
+});
+
+test('authedIdpFetch (broker path): a revoked 401 (err.status+err.body) fires the handler, then rethrows', async () => {
+  const fired = [];
+  setRevocationHandler((d) => fired.push(d));
+  try {
+    // The broker forwards the IdP's structured 401 → brokerIdpFetch throws with
+    // err.status + err.body. Inject that shape.
+    const _brokerIdpFetch = async () => {
+      const e = new Error(`POST /v1/mls/keypackages/batch failed: HTTP 401 ${JSON.stringify(REVOKED)}`);
+      e.status = 401;
+      e.body = JSON.stringify(REVOKED);
+      throw e;
+    };
+    await assert.rejects(
+      authedIdpFetch({
+        ...AUTH,
+        method: 'POST',
+        path: '/v1/mls/keypackages/batch',
+        body: {},
+        _brokerEnabled: () => true,
+        _brokerAvailable: async () => true,
+        _brokerIdpFetch,
+      }),
+    );
+    assert.equal(fired.length, 1, 'broker-path revoked 401 fires teardown');
+    assert.equal(fired[0].httpStatus, 401);
+  } finally {
+    setRevocationHandler(null);
+  }
+});
+
+test('authedIdpFetch: a TRANSIENT 401 (not revocation) does NOT fire the handler', async () => {
+  const fired = [];
+  setRevocationHandler((d) => fired.push(d));
+  try {
+    // invalid_dpop_proof / jti replay — a 401, but NOT a revocation.
+    const fetchImpl = recordingFetch(
+      res({ error: 'invalid_dpop_proof', error_description: 'jti replay' }, { ok: false, status: 401 }),
+    );
+    await assert.rejects(authedIdpFetch({ ...AUTH, method: 'GET', path: '/v1/x', fetchImpl }));
+    assert.equal(fired.length, 0, 'a transient 401 must not wipe the scope');
+  } finally {
+    setRevocationHandler(null);
+  }
+});
+
+test('authedIdpFetch: a 502 (ALB-masked / gateway) does NOT fire the handler', async () => {
+  const fired = [];
+  setRevocationHandler((d) => fired.push(d));
+  try {
+    const fetchImpl = recordingFetch(res({ error: 'bad gateway' }, { ok: false, status: 502 }));
+    await assert.rejects(authedIdpFetch({ ...AUTH, method: 'GET', path: '/v1/x', fetchImpl }));
+    assert.equal(fired.length, 0, 'a 502 could be transient — must not wipe the scope');
+  } finally {
+    setRevocationHandler(null);
+  }
+});
+
+test('setRevocationHandler(null) clears the handler — a revoked 401 then fires nothing', async () => {
+  const fired = [];
+  setRevocationHandler((d) => fired.push(d));
+  setRevocationHandler(null);
+  const fetchImpl = recordingFetch(res(REVOKED, { ok: false, status: 401 }));
+  await assert.rejects(authedIdpFetch({ ...AUTH, method: 'GET', path: '/v1/x', fetchImpl }));
+  assert.equal(fired.length, 0, 'a cleared handler must not fire');
 });

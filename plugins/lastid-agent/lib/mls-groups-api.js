@@ -15,6 +15,37 @@ import { mintDpopJwt } from './dpop.js';
 import { brokerIdpFetch, brokerAvailable } from './broker-ipc.js';
 import { brokerIdpEnabled } from './broker-supervisor.js';
 import { getActiveScope } from './active-scope.js';
+import { isRevocationResponse } from './ws-client.js';
+
+// REST-path revocation handler. The WS-upgrade revocation signal is unreliable:
+// the ALB in front of the IdP turns a non-101 WS-upgrade 401 into a 502, so the
+// WS classifier (which needs a 401) never fires and a revoked agent reconnects
+// forever. The REST path — this module is the shared IdP-call chokepoint — DOES
+// get a clean 401 + "credential has been revoked" body, so it's the reliable
+// place to detect revocation and tear the listener down. The listener registers
+// a handler here (cleanup scope + exit); one-shot contexts (provision / CLI)
+// register none, so authedIdpFetch just throws the failure normally for them.
+let _onRevoked = null;
+
+/**
+ * Register the process-level revocation handler (the listener sets it to
+ * cleanup-scope-and-exit). Pass null to clear. The teardown's idempotency is the
+ * handler's responsibility (the listener guards a double fire).
+ * @param {((detail: { httpStatus: number, errorDescription: string, path: string }) => void | Promise<void>) | null} fn
+ */
+export function setRevocationHandler(fn) {
+  _onRevoked = typeof fn === 'function' ? fn : null;
+}
+
+/** Fire the registered revocation handler (best-effort; never throws). */
+async function fireRevoked(detail) {
+  if (!_onRevoked) return;
+  try {
+    await _onRevoked(detail);
+  } catch {
+    /* the handler logs its own failures; never let it break the caller path */
+  }
+}
 
 /**
  * One authenticated IdP call. Returns parsed JSON ({} on empty body).
@@ -57,7 +88,19 @@ export async function authedIdpFetch({
   // seed-in-keychain agent has no broker up and falls through to the node path.
   const routeScope = scope ?? getActiveScope();
   if (_brokerEnabled() && (await _brokerAvailable(routeScope))) {
-    return _brokerIdpFetch({ method, path, body, scope: routeScope });
+    try {
+      return await _brokerIdpFetch({ method, path, body, scope: routeScope });
+    } catch (err) {
+      // A revoked credential surfaces here as a clean 401 + revoked body (the
+      // broker forwards the IdP's REST/exchange 401 structured via Response::http,
+      // so brokerIdpFetch attaches err.status + err.body). This is the RELIABLE
+      // revocation signal — fire the listener's teardown — then rethrow so the
+      // immediate caller still sees the failure.
+      if (err?.status === 401 && isRevocationResponse(401, err.body ?? '')) {
+        await fireRevoked({ httpStatus: 401, errorDescription: 'Credential has been revoked', path });
+      }
+      throw err;
+    }
   }
 
   // A null signingKey means the caller delegated IdP auth to the broker (a
@@ -93,8 +136,14 @@ export async function authedIdpFetch({
   const res = await fetchImpl(url, init);
   if (!res.ok) {
     const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
+    // Node-direct path revocation (legacy seed-in-keychain agent): same reliable
+    // 401 + revoked body. Fire the listener teardown before throwing.
+    if (res.status === 401 && isRevocationResponse(401, text)) {
+      await fireRevoked({ httpStatus: 401, errorDescription: 'Credential has been revoked', path });
+    }
     const err = new Error(`${method} ${path} failed: HTTP ${res.status} ${text}`);
     err.status = res.status; // let callers branch (e.g. 404 → null) without string-matching
+    err.body = text; // parity with brokerIdpFetch so revocation detection has the body
     throw err;
   }
   if (typeof res.json === 'function') {
