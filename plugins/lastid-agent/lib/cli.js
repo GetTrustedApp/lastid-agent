@@ -1684,6 +1684,38 @@ async function cmdListen(flags) {
     }
   };
 
+  // Credential-revocation teardown — registered BEFORE any IdP call so the very
+  // first REST 401 tears the listener down. Shared by the REST classifier
+  // (mls-groups-api setRevocationHandler) AND the WS-upgrade classifier
+  // (onAuthRevoked, below). The WS-upgrade signal is unreliable — the ALB masks
+  // the non-101 401 as a 502 — so for a broker-native agent the REST path is what
+  // fires, and the FIRST REST call is keypackage maintenance right below (the
+  // periodic ships are wsOpen-gated and never run while the WS is down). Runs ONCE
+  // (a revoked VC can't be un-revoked): wipe the scope + exit; nothing restarts it.
+  let revoking = false;
+  const handleRevocation = async (detail = {}) => {
+    if (revoking) return;
+    revoking = true;
+    const where = detail.path ? `REST ${detail.path}` : 'WS upgrade';
+    process.stderr.write(
+      `[lastid-agent] credential REVOKED (${where}, ${detail.httpStatus ?? 401}): ${detail.errorDescription ?? 'Credential has been revoked'} — wiping scope ${scope} + shutting down\n`,
+    );
+    try {
+      const { cleanupRevokedScope } = await import('./scope-cleanup.js');
+      const summary = await cleanupRevokedScope(scope);
+      process.stderr.write(`[lastid-agent] scope-cleanup summary: ${JSON.stringify(summary)}\n`);
+    } catch (err) {
+      process.stderr.write(`[lastid-agent] scope-cleanup orchestration failed: ${err?.message ?? err}\n`);
+    }
+    process.exit(0);
+  };
+  try {
+    const { setRevocationHandler } = await import('./mls-groups-api.js');
+    setRevocationHandler(handleRevocation);
+  } catch (err) {
+    process.stderr.write(`[lastid-agent] could not wire REST revocation handler: ${err?.message ?? err}\n`);
+  }
+
   if (flags['publish-keypackage'] || flags['publish-keypackage'] === undefined) {
     // Maintenance pass — fetch current inventory, top up only if
     // below the threshold. Avoids re-publishing on every session
@@ -1803,32 +1835,6 @@ async function cmdListen(flags) {
     brokerNative: loaded.brokerNative === true,
     agentDid: loaded.agentDid,
   });
-  // Credential-revocation teardown — shared by the WS-upgrade classifier
-  // (onAuthRevoked, below) AND the REST-path classifier (mls-groups-api's
-  // setRevocationHandler, wired after ws.start()). The WS-upgrade signal is
-  // UNRELIABLE — the ALB in front of the IdP turns a non-101 WS-upgrade 401 into
-  // a 502, so the WS classifier can't see the revocation for a broker-native
-  // agent; the REST path (agent-state/keypackage/vault calls) is the one that
-  // actually fires. Both route here. Runs ONCE (a revoked VC can't be
-  // un-revoked): wipe the scope's local state + exit so the listener stops
-  // hammering the IdP. Nothing restarts it — there's no scope dir left to bind to.
-  let revoking = false;
-  const handleRevocation = async (detail = {}) => {
-    if (revoking) return;
-    revoking = true;
-    const where = detail.path ? `REST ${detail.path}` : 'WS upgrade';
-    process.stderr.write(
-      `[lastid-agent] credential REVOKED (${where}, ${detail.httpStatus ?? 401}): ${detail.errorDescription ?? 'Credential has been revoked'} — wiping scope ${scope} + shutting down\n`,
-    );
-    try {
-      const { cleanupRevokedScope } = await import('./scope-cleanup.js');
-      const summary = await cleanupRevokedScope(scope);
-      process.stderr.write(`[lastid-agent] scope-cleanup summary: ${JSON.stringify(summary)}\n`);
-    } catch (err) {
-      process.stderr.write(`[lastid-agent] scope-cleanup orchestration failed: ${err?.message ?? err}\n`);
-    }
-    process.exit(0);
-  };
   const ws = new LastIdWsClient({
     idpUrl,
     agentDid: loaded.agentDid,
@@ -1937,21 +1943,6 @@ async function cmdListen(flags) {
     onAuthRevoked: handleRevocation,
   });
   wsRef = ws;
-  // Wire the REST-path revocation classifier (mls-groups-api) to the SAME
-  // teardown. This is the path that reliably fires for a broker-native agent —
-  // the WS-upgrade 401 is ALB-masked as a 502, but the agent's REST calls
-  // (agent-state sync, keypackage maintenance, vault) get a clean 401 + revoked
-  // body. Without this, a revoked agent's listener never tears down and spams
-  // /v1/ws forever.
-  try {
-    const { setRevocationHandler } = await import('./mls-groups-api.js');
-    setRevocationHandler(handleRevocation);
-  } catch (err) {
-    process.stderr.write(
-      `[lastid-agent] could not wire REST revocation handler: ${err?.message ?? err}\n`,
-    );
-  }
-
   process.stderr.write(`[lastid-agent] listening as ${loaded.agentDid} on ${idpUrl}\n`);
   ws.start();
 
